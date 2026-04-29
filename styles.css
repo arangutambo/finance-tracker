@@ -130,6 +130,12 @@
   gap: 12px;
 }
 
+.finance-tracker-planned-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
 .finance-tracker-budget-card {
   padding: 12px 14px;
 }
@@ -184,11 +190,52 @@
   display: flex;
   gap: 8px;
   margin: 10px 0 14px;
+  flex-wrap: wrap;
 }
 
 .finance-tracker-settings-textarea {
   width: 100%;
   min-height: 180px;
+}
+
+.finance-tracker-holiday-input {
+  width: 100%;
+  margin: 8px 0 12px;
+}
+
+.finance-tracker-holiday-results {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.finance-tracker-holiday-create-panel {
+  margin-top: 16px;
+  padding-top: 6px;
+}
+
+.finance-tracker-holiday-result {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  cursor: pointer;
+  background: var(--background-primary);
+}
+
+.finance-tracker-holiday-result:hover {
+  border-color: var(--interactive-accent);
+  background: var(--background-secondary);
+}
+
+.finance-tracker-holiday-result-title {
+  font-weight: 600;
+}
+
+.finance-tracker-holiday-result-path {
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-size: 0.9em;
+  overflow-wrap: anywhere;
 }
 
 .finance-tracker-settings-help p {

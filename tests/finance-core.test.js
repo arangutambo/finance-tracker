@@ -36,6 +36,24 @@ test("parses lowercase travel spending tags like japan trip notes", () => {
   assert.equal(entries[0].category, "food/snacks");
 });
 
+test("parses holiday spending tags without polluting the category path", () => {
+  const content = `
+## Spending
+- [ ] #log/spending
+\t- $41.50 #log/spending/2026/japan/food/restaurants
+\t\t- Ichiran
+`.trim();
+
+  const entries = core.parseTransactionsFromNoteContent(content, "Journal/Periodics/1. Daily/2026/04/2026-04-30.md", {
+    defaultCurrency: "AUD",
+  });
+
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].category, "food/restaurants");
+  assert.equal(entries[0].holidayKey, "2026/japan");
+  assert.equal(entries[0].merchant, "Ichiran");
+});
+
 test("inserts a new transaction and updates the daily spending total", () => {
   const initial = `---\ndate: 2026-04-29\n---\n\n## Spending\n- [ ] #log/spending 0\n`;
   const next = core.insertTransactionIntoDailyNote(
@@ -96,4 +114,21 @@ test("builds CSV output with stable headers", () => {
 
   assert.match(csv, /^date,amount,currency,category,/);
   assert.match(csv, /2026-04-29,14\.95,AUD,food\/groceries/);
+});
+
+test("writes holiday-tagged captures when a holiday key is supplied", () => {
+  const block = core.buildTransactionBlock(
+    {
+      amount: 32,
+      category: "shopping",
+      currency: "AUD",
+      holidayKey: "2026/japan",
+      merchant: "Loft",
+    },
+    {
+      defaultCurrency: "AUD",
+    }
+  );
+
+  assert.equal(block[0], "\t- $32.00 #log/spending/2026/japan/shopping");
 });

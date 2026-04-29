@@ -1,6 +1,6 @@
 "use strict";
 
-const { Notice, Plugin, PluginSettingTab, Setting, TFile, normalizePath } = require("obsidian");
+const { Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, normalizePath } = require("obsidian");
 
 const core = (() => {
   function splitLines(text) {
@@ -126,9 +126,41 @@ const core = (() => {
     return normalized ? normalized.split("/")[0] : "uncategorized";
   }
 
-  function buildCategoryTag(categoryPath) {
+  function normalizeHolidayKey(value) {
+    const raw = String(value || "").replace(/^#/, "");
+    const normalized = normalizeCategoryPath(raw);
+    const spendingMatch = normalized.match(/(?:^|\/)spending\/(.+)$/i);
+    const candidate = spendingMatch ? spendingMatch[1] : normalized;
+    const segments = candidate.split("/").filter(Boolean);
+    if (segments.length < 2) return "";
+    return `${segments[0]}/${segments[1]}`;
+  }
+
+  function parseHolidayTagContext(value) {
+    const normalized = normalizeCategoryPath(value);
+    const segments = normalized.split("/").filter(Boolean);
+    if (segments.length >= 3 && /^(?:\d{2}|\d{4})$/.test(segments[0])) {
+      return {
+        holidayCategory: segments.slice(2).join("/") || "uncategorized",
+        holidayKey: `${segments[0]}/${segments[1]}`,
+        holidayName: segments[1],
+        holidayYear: segments[0],
+      };
+    }
+    return {
+      holidayCategory: normalized || "uncategorized",
+      holidayKey: "",
+      holidayName: "",
+      holidayYear: "",
+    };
+  }
+
+  function buildCategoryTag(categoryPath, holidayKey = "") {
     const normalizedCategory = normalizeCategoryPath(categoryPath) || "uncategorized";
-    return `#log/spending/${normalizedCategory}`;
+    const normalizedHolidayKey = normalizeHolidayKey(holidayKey);
+    return normalizedHolidayKey
+      ? `#log/spending/${normalizedHolidayKey}/${normalizedCategory}`
+      : `#log/spending/${normalizedCategory}`;
   }
 
   function stripFirstTag(value) {
@@ -191,7 +223,9 @@ const core = (() => {
     const amount = extractVisibleAmount(text);
     if (!Number.isFinite(amount)) return null;
 
-    const category = extractCategoryFromLogSpendingTag(text) || "uncategorized";
+    const tagPath = extractCategoryFromLogSpendingTag(text) || "uncategorized";
+    const holidayContext = parseHolidayTagContext(tagPath);
+    const category = holidayContext.holidayCategory || "uncategorized";
 
     const currency = normalizeCurrency(options.defaultCurrency || "AUD");
     const merchant = normalizeWhitespace(childLines[0] || "");
@@ -206,6 +240,9 @@ const core = (() => {
       currency,
       date: transactionDate,
       filePath,
+      holidayKey: holidayContext.holidayKey,
+      holidayName: holidayContext.holidayName,
+      holidayYear: holidayContext.holidayYear,
       merchant,
       name: merchant,
       note,
@@ -264,7 +301,7 @@ const core = (() => {
     const date = parseIsoDate(expense.date) || todayIsoLocal();
     const amount = Number(Number(expense.amount || 0).toFixed(2));
 
-    const tag = buildCategoryTag(category);
+    const tag = buildCategoryTag(category, expense.holidayKey || "");
     const visibleLabel = formatCurrency(amount, currency);
     const lines = [`\t- ${visibleLabel} ${tag}`.trimEnd()];
 
@@ -360,6 +397,14 @@ const core = (() => {
     const normalizedDate = parseIsoDate(date);
     if (!normalizedDate) return false;
     return normalizedDate >= range.start && normalizedDate <= range.end;
+  }
+
+  function daysBetweenInclusive(start, end) {
+    const startDate = isoToDate(start);
+    const endDate = isoToDate(end);
+    if (!startDate || !endDate) return 1;
+    const diff = Math.round((endDate.getTime() - startDate.getTime()) / (24 * 60 * 60 * 1000));
+    return Math.max(1, diff + 1);
   }
 
   function groupTransactionsByCategory(entries, groupBy = "primary") {
@@ -498,6 +543,7 @@ const core = (() => {
     buildCategoryTag,
     buildCsv,
     calculateSpendingSectionTotal,
+    daysBetweenInclusive,
     displayCategoryPath,
     extractCategoryFromLogSpendingTag,
     extractNoteDate,
@@ -508,7 +554,10 @@ const core = (() => {
     isDateInRange,
     normalizeCategoryPath,
     normalizeCurrency,
+    normalizeHolidayKey,
     parseBudgets,
+    parseHolidayTagContext,
+    parseMarkdownTable,
     parseIsoDate,
     parseNumber,
     parseTransactionsFromNoteContent,
@@ -523,8 +572,11 @@ const DEFAULT_SETTINGS = {
   spendingHeading: "## Spending",
   spendingRootTag: "#log/spending",
   defaultCurrency: "AUD",
-  budgetNotePath: "Utility/Finance/Budgets.md",
-  csvExportFolder: "Utility/Exports",
+  budgetsFolderPath: "Utility/Budgets",
+  budgetArchiveFolderPath: "Utility/Budgets/Archive",
+  defaultBudgetNoteName: "💸 Budgets.md",
+  holidayModeEnabled: false,
+  activeHolidayBudgetPath: "",
   categoryOptions: [
     "food/groceries",
     "food/restaurants",
@@ -543,6 +595,7 @@ const DEFAULT_SETTINGS = {
 
 const FINANCE_CAPTURE_ACTION = "finance-capture";
 const DASHBOARD_BLOCK = "finance-dashboard";
+const HOLIDAY_DASHBOARD_BLOCK = "holiday-dashboard";
 const PIE_COLORS = [
   "#2B6CB0",
   "#2F855A",
@@ -583,6 +636,61 @@ function parseConfigBlock(source) {
     config[match[1].toLowerCase()] = match[2].trim();
   }
   return config;
+}
+
+function parseFrontmatter(content) {
+  const match = String(content || "").match(/^---\n([\s\S]*?)\n---/);
+  if (!match) return {};
+  const data = {};
+  for (const rawLine of match[1].split("\n")) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const parsed = line.match(/^([A-Za-z0-9_-]+)\s*:\s*(.+)$/);
+    if (!parsed) continue;
+    data[parsed[1].toLowerCase()] = parsed[2].trim();
+  }
+  return data;
+}
+
+function toTitleFromHolidayKey(holidayKey) {
+  const normalized = core.normalizeHolidayKey(holidayKey);
+  if (!normalized) return "Holiday";
+  const [year, name] = normalized.split("/");
+  return `${String(name || "")
+    .split(/[-_ ]+/)
+    .filter(Boolean)
+    .map((segment) => segment.charAt(0).toUpperCase() + segment.slice(1))
+    .join(" ")} ${year}`.trim();
+}
+
+function guessHolidayTagFromName(name, referenceDate = core.todayIsoLocal()) {
+  const raw = String(name || "").trim();
+  const yearMatch = raw.match(/\b(20\d{2}|\d{2})\b/);
+  const year = yearMatch ? yearMatch[1] : referenceDate.slice(0, 4);
+  const holidayName = core
+    .normalizeCategoryPath(raw.replace(/\b(20\d{2}|\d{2})\b/g, " "))
+    .split("/")
+    .filter(Boolean)
+    .join("-");
+  return core.normalizeHolidayKey(`${year}/${holidayName || "holiday"}`);
+}
+
+function sumBy(entries, predicate) {
+  return Number(
+    entries
+      .filter(predicate)
+      .reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
+      .toFixed(2)
+  );
+}
+
+function stripBudgetSuffix(value) {
+  return String(value || "").replace(/\s+budget$/i, "").trim();
+}
+
+function appendBudgetSuffix(value) {
+  const base = stripBudgetSuffix(value) || "Holiday";
+  return `${base} Budget`;
 }
 
 function normalizeCategoryOptions(value) {
@@ -671,15 +779,43 @@ class FinanceTrackerPlugin extends Plugin {
     this.registerMarkdownCodeBlockProcessor(DASHBOARD_BLOCK, async (source, el, ctx) => {
       await this.renderDashboard(source, el, ctx);
     });
+
+    this.registerMarkdownCodeBlockProcessor(HOLIDAY_DASHBOARD_BLOCK, async (source, el, ctx) => {
+      await this.renderHolidayDashboard(source, el, ctx);
+    });
   }
 
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
     this.settings.categoryOptions = normalizeCategoryOptions(this.settings.categoryOptions || DEFAULT_SETTINGS.categoryOptions);
+    const coreDailyNotesConfig = await this.readCoreDailyNotesConfig();
+    if (coreDailyNotesConfig?.folder) {
+      const currentFolder = (this.settings.dailyNotesFolder || "").trim();
+      if (!currentFolder || currentFolder === DEFAULT_SETTINGS.dailyNotesFolder) {
+        this.settings.dailyNotesFolder = coreDailyNotesConfig.folder;
+      }
+    }
+    this.settings.budgetsFolderPath = this.settings.budgetsFolderPath || DEFAULT_SETTINGS.budgetsFolderPath;
+    this.settings.budgetArchiveFolderPath = this.settings.budgetArchiveFolderPath || DEFAULT_SETTINGS.budgetArchiveFolderPath;
+    this.settings.defaultBudgetNoteName = this.settings.defaultBudgetNoteName || DEFAULT_SETTINGS.defaultBudgetNoteName;
+    if (this.settings.defaultBudgetNoteName === "Budget.md") {
+      this.settings.defaultBudgetNoteName = DEFAULT_SETTINGS.defaultBudgetNoteName;
+    }
+    this.settings.activeHolidayBudgetPath = this.settings.activeHolidayBudgetPath || "";
   }
 
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+
+  async readCoreDailyNotesConfig() {
+    try {
+      const raw = await this.app.vault.adapter.read(normalizePath(".obsidian/daily-notes.json"));
+      const parsed = JSON.parse(raw);
+      return typeof parsed === "object" && parsed ? parsed : null;
+    } catch (_error) {
+      return null;
+    }
   }
 
   async ensureFolder(folderPath) {
@@ -694,10 +830,35 @@ class FinanceTrackerPlugin extends Plugin {
     }
   }
 
-  getDailyNotePath(date) {
+  findExistingDailyNoteFile(date) {
+    const iso = core.parseIsoDate(date) || core.todayIsoLocal();
+    const prefix = normalizePath(`${this.settings.dailyNotesFolder}/`);
+    return (
+      this.app.vault
+        .getMarkdownFiles()
+        .find((file) => file.path.startsWith(prefix) && file.name === `${iso}.md`) || null
+    );
+  }
+
+  inferDailyNoteDirectory(date) {
     const iso = core.parseIsoDate(date) || core.todayIsoLocal();
     const [year, month] = iso.split("-");
-    return normalizePath(`${this.settings.dailyNotesFolder}/${year}/${month}/${iso}.md`);
+    const prefix = normalizePath(`${this.settings.dailyNotesFolder}/`);
+    const example = this.app.vault
+      .getMarkdownFiles()
+      .find((file) => file.path.startsWith(prefix) && /\/\d{4}\/\d{2}\/\d{4}-\d{2}-\d{2}\.md$/i.test(file.path));
+    if (example) {
+      return normalizePath(`${this.settings.dailyNotesFolder}/${year}/${month}`);
+    }
+    return normalizePath(this.settings.dailyNotesFolder);
+  }
+
+  getDailyNotePath(date) {
+    const iso = core.parseIsoDate(date) || core.todayIsoLocal();
+    const existing = this.findExistingDailyNoteFile(iso);
+    if (existing) return existing.path;
+    const directory = this.inferDailyNoteDirectory(iso);
+    return normalizePath(`${directory}/${iso}.md`);
   }
 
   buildMinimalDailyNote(date) {
@@ -753,6 +914,12 @@ class FinanceTrackerPlugin extends Plugin {
   async handleCapture(params) {
     try {
       const expense = this.parseCaptureParams(params);
+      if (this.settings.holidayModeEnabled) {
+        const holidayContext = await this.getActiveHolidayContext();
+        if (holidayContext?.holidayKey) {
+          expense.holidayKey = holidayContext.holidayKey;
+        }
+      }
       const notePath = this.getDailyNotePath(expense.date);
       const file =
         this.app.vault.getAbstractFileByPath(notePath) instanceof TFile
@@ -800,28 +967,165 @@ class FinanceTrackerPlugin extends Plugin {
     });
   }
 
+  async collectTransactionsForHoliday(holidayKey, range = {}) {
+    const normalizedHolidayKey = core.normalizeHolidayKey(holidayKey);
+    if (!normalizedHolidayKey) return [];
+    const allEntries = await this.collectTransactionsForRange({
+      period: "all",
+      start: range.start || "1900-01-01",
+      end: range.end || "2999-12-31",
+    });
+    return allEntries.filter((entry) => entry.holidayKey === normalizedHolidayKey);
+  }
+
   async exportEntriesToCsv(entries, label) {
-    await this.ensureFolder(this.settings.csvExportFolder);
+    const exportFolder = await this.promptForExportFolder();
+    if (!exportFolder) return null;
+    await this.ensureFolder(exportFolder);
     const fileName = `${sanitizeFilePart(label)}.csv`;
-    const outputPath = normalizePath(`${this.settings.csvExportFolder}/${fileName}`);
+    const outputPath = normalizePath(`${exportFolder}/${fileName}`);
     const csv = core.buildCsv(entries);
     const file = await this.upsertFile(outputPath, csv);
     new Notice(`Exported ${entries.length} transactions to ${file.path}`);
     return file;
   }
 
+  async promptForExportFolder() {
+    return new Promise((resolve) => {
+      new ExportFolderModal(this.app, this, "Utility/Exports", async (folder) => {
+        resolve(folder);
+      }).open();
+    });
+  }
+
+  getDefaultBudgetNotePath() {
+    return normalizePath(`${this.settings.budgetsFolderPath}/${this.settings.defaultBudgetNoteName}`);
+  }
+
+  getActiveBudgetNotePath() {
+    if (this.settings.holidayModeEnabled && this.settings.activeHolidayBudgetPath) {
+      return normalizePath(this.settings.activeHolidayBudgetPath);
+    }
+    return this.getDefaultBudgetNotePath();
+  }
+
+  async ensureBudgetInfrastructure() {
+    await this.ensureFolder(this.settings.budgetsFolderPath);
+    await this.ensureFolder(this.settings.budgetArchiveFolderPath);
+  }
+
   async ensureBudgetNote() {
-    return this.ensureTextFile(this.settings.budgetNotePath, () => this.buildBudgetNoteContent());
+    await this.ensureBudgetInfrastructure();
+    return this.ensureTextFile(this.getDefaultBudgetNotePath(), () => this.buildBudgetNoteContent());
   }
 
   async openBudgetNote() {
-    const file = await this.ensureBudgetNote();
+    const file = await this.ensureActiveBudgetNote();
     await this.app.workspace.getLeaf(true).openFile(file);
   }
 
-  buildBudgetNoteContent() {
+  async ensureActiveBudgetNote() {
+    await this.ensureBudgetInfrastructure();
+    const activePath = this.getActiveBudgetNotePath();
+    if (activePath === this.getDefaultBudgetNotePath()) {
+      return this.ensureBudgetNote();
+    }
+    return this.ensureTextFile(activePath, () =>
+      this.buildHolidayBudgetNoteContent(this.getHolidayBudgetNameFromPath(activePath), guessHolidayTagFromName(this.getHolidayBudgetNameFromPath(activePath)))
+    );
+  }
+
+  parseHolidayBudgetContent(content, filePath = "") {
+    const frontmatter = parseFrontmatter(content);
+    const inferredHolidayKey = guessHolidayTagFromName(this.getHolidayBudgetNameFromPath(filePath || frontmatter.holiday_name || "Holiday"));
+    const holidayKey = core.normalizeHolidayKey(frontmatter.holiday_tag || frontmatter.holiday || frontmatter.tag || inferredHolidayKey);
+    const tables = core.parseMarkdownTable(content);
+    const plannedExpenses = [];
+
+    for (const rows of tables) {
+      for (const row of rows) {
+        const hasPlanningColumns =
+          "planned" in row || "estimate" in row || "estimated" in row || "booked" in row || "paid" in row || "item" in row || "expense" in row;
+        if (!hasPlanningColumns) continue;
+        const planned = core.parseNumber(row.planned || row.estimate || row.estimated);
+        const booked = core.parseNumber(row.booked || row.committed || row.deposit);
+        const paid = core.parseNumber(row.paid || row.actual || row.spent);
+        const item = String(row.item || row.name || row.expense || "").trim();
+        const category = core.normalizeCategoryPath(row.category || row.group || "");
+        if (!item && !category && !Number.isFinite(planned) && !Number.isFinite(booked) && !Number.isFinite(paid)) continue;
+        plannedExpenses.push({
+          item: item || core.displayCategoryPath(category || "uncategorized"),
+          category: category || "uncategorized",
+          booked: Number.isFinite(booked) ? Number(booked.toFixed(2)) : 0,
+          paid: Number.isFinite(paid) ? Number(paid.toFixed(2)) : 0,
+          planned: Number.isFinite(planned) ? Number(planned.toFixed(2)) : 0,
+          notes: String(row.notes || row.note || "").trim(),
+        });
+      }
+    }
+
+    const totals = plannedExpenses.reduce(
+      (summary, item) => {
+        summary.planned += Number(item.planned || 0);
+        summary.booked += Number(item.booked || 0);
+        summary.paid += Number(item.paid || 0);
+        return summary;
+      },
+      { booked: 0, paid: 0, planned: 0 }
+    );
+
+    return {
+      currency: core.normalizeCurrency(frontmatter.currency || this.settings.defaultCurrency),
+      endDate: core.parseIsoDate(frontmatter.end_date || frontmatter.end || frontmatter.return_date || ""),
+      filePath,
+      holidayKey,
+      holidayName: String(frontmatter.holiday_name || frontmatter.name || toTitleFromHolidayKey(holidayKey || guessHolidayTagFromName(this.getHolidayBudgetNameFromPath(filePath)))).trim(),
+      plannedExpenses,
+      startDate: core.parseIsoDate(frontmatter.start_date || frontmatter.start || frontmatter.departure_date || ""),
+      totalBudget: core.parseNumber(frontmatter.total_budget || frontmatter.budget || frontmatter.total || ""),
+      totals: {
+        booked: Number(totals.booked.toFixed(2)),
+        paid: Number(totals.paid.toFixed(2)),
+        planned: Number(totals.planned.toFixed(2)),
+      },
+    };
+  }
+
+  async readHolidayBudgetFile(file) {
+    if (!(file instanceof TFile)) return null;
+    const content = await this.app.vault.cachedRead(file);
+    return this.parseHolidayBudgetContent(content, file.path);
+  }
+
+  async findHolidayBudgetByKey(holidayKey) {
+    const normalizedHolidayKey = core.normalizeHolidayKey(holidayKey);
+    if (!normalizedHolidayKey) return null;
+
+    const candidates = [];
+    const active = this.app.vault.getAbstractFileByPath(this.settings.activeHolidayBudgetPath || "");
+    if (active instanceof TFile) {
+      candidates.push(active);
+    }
+    candidates.push(...this.getHolidayBudgetFiles());
+
+    for (const file of candidates) {
+      const parsed = await this.readHolidayBudgetFile(file);
+      if (parsed?.holidayKey === normalizedHolidayKey) {
+        return { file, meta: parsed };
+      }
+    }
+    return null;
+  }
+
+  async getActiveHolidayContext() {
+    const active = this.app.vault.getAbstractFileByPath(this.settings.activeHolidayBudgetPath || "");
+    if (!(active instanceof TFile)) return null;
+    return this.readHolidayBudgetFile(active);
+  }
+
+  buildBudgetNoteContent(title = "Finance Budgets") {
     return [
-      "# Finance Budgets",
+      `# ${title}`,
       "",
       "Use the `Category` column for the category paths you want the dashboard and budgets to track.",
       "",
@@ -842,10 +1146,121 @@ class FinanceTrackerPlugin extends Plugin {
     ].join("\n");
   }
 
+  buildHolidayBudgetNoteContent(title, holidayKey, options = {}) {
+    const normalizedHolidayKey = core.normalizeHolidayKey(holidayKey) || guessHolidayTagFromName(title);
+    const holidayTitle = stripBudgetSuffix(title || toTitleFromHolidayKey(normalizedHolidayKey)) || toTitleFromHolidayKey(normalizedHolidayKey);
+    const startDate = core.parseIsoDate(options.startDate) || core.todayIsoLocal();
+    const parsedEndDate = core.parseIsoDate(options.endDate) || startDate;
+    const endDate = parsedEndDate < startDate ? startDate : parsedEndDate;
+    const currency = core.normalizeCurrency(options.currency || this.settings.defaultCurrency);
+    return [
+      "---",
+      `holiday_name: ${holidayTitle}`,
+      `holiday_tag: ${normalizedHolidayKey}`,
+      "total_budget: 0",
+      `currency: ${currency}`,
+      `start_date: ${startDate}`,
+      `end_date: ${endDate}`,
+      "---",
+      "",
+      `# ${appendBudgetSuffix(holidayTitle)}`,
+      "",
+      "Set your whole-trip budget in the frontmatter above, then use the tables below to plan expected costs before you travel.",
+      "",
+      "## Daily Holiday Dashboard",
+      "",
+      "```holiday-dashboard",
+      `holiday: ${normalizedHolidayKey}`,
+      "```",
+      "",
+      "## Planned Expenses",
+      "",
+      "| Item | Category | Planned | Booked | Paid | Notes |",
+      "| --- | --- | ---: | ---: | ---: | --- |",
+      "| Flights | flights | 0 | 0 | 0 | |",
+      "| Accommodation | accommodation | 0 | 0 | 0 | |",
+      "| Recreation | recreation | 0 | 0 | 0 | |",
+      "",
+      "## Holiday Category Budgets",
+      "",
+      "| Name | Category | Limit | Period | Currency |",
+      "| --- | --- | ---: | --- | --- |",
+      `| Accommodation | accommodation | 0 | week | ${currency} |`,
+      `| Recreation | recreation | 0 | week | ${currency} |`,
+      `| Flights | flights | 0 | week | ${currency} |`,
+      `| Whole Holiday | all | 0 | month | ${currency} |`,
+      "",
+    ].join("\n");
+  }
+
   async loadBudgets() {
-    const file = await this.ensureBudgetNote();
+    const file = await this.ensureActiveBudgetNote();
     const content = await this.app.vault.cachedRead(file);
     return core.parseBudgets(content, this.settings.defaultCurrency);
+  }
+
+  getHolidayBudgetNameFromPath(path) {
+    return stripBudgetSuffix(String(path || "").split("/").pop()?.replace(/\.md$/i, "")) || "Holiday";
+  }
+
+  getHolidayBudgetFiles() {
+    const budgetsPrefix = normalizePath(`${this.settings.budgetsFolderPath}/`);
+    const archivePrefix = normalizePath(`${this.settings.budgetArchiveFolderPath}/`);
+    const defaultBudgetPath = this.getDefaultBudgetNotePath();
+    return this.app.vault
+      .getMarkdownFiles()
+      .filter((file) => file.path.startsWith(budgetsPrefix))
+      .filter((file) => !file.path.startsWith(archivePrefix))
+      .filter((file) => file.path !== defaultBudgetPath);
+  }
+
+  async createOrOpenHolidayBudget(definition) {
+    const holidayName = String(definition?.name || definition || "").trim();
+    if (!holidayName) return null;
+    await this.ensureBudgetInfrastructure();
+    const safeName =
+      holidayName
+        .replace(/[\\/:*?"<>|]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim() || "Holiday";
+    const holidayKey = core.normalizeHolidayKey(definition?.holidayKey || "") || guessHolidayTagFromName(holidayName);
+    const fileName = appendBudgetSuffix(safeName);
+    const budgetPath = normalizePath(`${this.settings.budgetsFolderPath}/${fileName}.md`);
+    const file = await this.ensureTextFile(budgetPath, () =>
+      this.buildHolidayBudgetNoteContent(`${safeName}`, holidayKey, {
+        currency: definition?.currency || this.settings.defaultCurrency,
+        endDate: definition?.endDate,
+        startDate: definition?.startDate,
+      })
+    );
+    this.settings.holidayModeEnabled = true;
+    this.settings.activeHolidayBudgetPath = file.path;
+    await this.saveSettings();
+    return file;
+  }
+
+  async archiveActiveHolidayBudget() {
+    const activePath = this.settings.activeHolidayBudgetPath;
+    const activeFile = this.app.vault.getAbstractFileByPath(activePath);
+    if (!(activeFile instanceof TFile)) {
+      this.settings.activeHolidayBudgetPath = "";
+      this.settings.holidayModeEnabled = false;
+      await this.saveSettings();
+      new Notice("No active holiday budget to archive.");
+      return;
+    }
+    await this.ensureBudgetInfrastructure();
+    const fileName = activeFile.name;
+    let archivePath = normalizePath(`${this.settings.budgetArchiveFolderPath}/${fileName}`);
+    if (this.app.vault.getAbstractFileByPath(archivePath)) {
+      const stamp = core.todayIsoLocal().replace(/-/g, "");
+      archivePath = normalizePath(`${this.settings.budgetArchiveFolderPath}/${activeFile.basename}-${stamp}.md`);
+    }
+    await this.app.vault.rename(activeFile, archivePath);
+    this.settings.activeHolidayBudgetPath = "";
+    this.settings.holidayModeEnabled = false;
+    await this.saveSettings();
+    new Notice(`Archived holiday budget to ${archivePath}`);
   }
 
   getReferenceDateForSource(sourcePath) {
@@ -1013,6 +1428,174 @@ class FinanceTrackerPlugin extends Plugin {
     }
   }
 
+  renderHolidaySummary(wrapper, metrics, currency) {
+    const cards = wrapper.createDiv({ cls: "finance-tracker-summary" });
+    const cardData = [
+      { label: "Holiday Budget", value: metrics.totalBudget > 0 ? core.formatCurrency(metrics.totalBudget, currency) : "Not set" },
+      { label: "Total Spent", value: core.formatCurrency(metrics.totalSpent, currency) },
+      {
+        label: "Remaining",
+        value:
+          metrics.totalBudget > 0
+            ? core.formatCurrency(metrics.totalBudget - metrics.totalSpent, currency)
+            : "Not set",
+      },
+      { label: "Trip Days So Far", value: String(metrics.tripDays) },
+      { label: "Avg / Day Excl. Accommodation", value: core.formatCurrency(metrics.averageExcludingAccommodation, currency) },
+      { label: "Avg Food / Day", value: core.formatCurrency(metrics.averageFoodPerDay, currency) },
+      { label: "Avg Shopping / Day", value: core.formatCurrency(metrics.averageShoppingPerDay, currency) },
+      { label: "Planned So Far", value: core.formatCurrency(metrics.plannedTotal, currency) },
+      { label: "Booked", value: core.formatCurrency(metrics.bookedTotal, currency) },
+      { label: "Prepaid / Paid", value: core.formatCurrency(metrics.paidTotal, currency) },
+    ];
+
+    for (const card of cardData) {
+      const element = cards.createDiv({ cls: "finance-tracker-summary-card" });
+      element.createDiv({ cls: "finance-tracker-summary-label", text: card.label });
+      element.createDiv({ cls: "finance-tracker-summary-value", text: card.value });
+    }
+  }
+
+  renderPlannedExpenses(wrapper, plannedExpenses, currency) {
+    const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
+    section.createEl("h4", { text: "Planned Trip Costs" });
+
+    if (!plannedExpenses.length) {
+      section.createDiv({
+        cls: "finance-tracker-empty",
+        text: "No planned trip costs found yet. Add rows to the Planned Expenses table in the holiday budget note.",
+      });
+      return;
+    }
+
+    const list = section.createDiv({ cls: "finance-tracker-planned-list" });
+    for (const item of plannedExpenses) {
+      const card = list.createDiv({ cls: "finance-tracker-budget-card" });
+      card.createDiv({
+        cls: "finance-tracker-budget-title",
+        text: `${item.item} - ${core.displayCategoryPath(item.category)}`,
+      });
+      card.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: `Planned ${core.formatCurrency(item.planned, currency)} · Booked ${core.formatCurrency(item.booked, currency)} · Paid ${core.formatCurrency(item.paid, currency)}`,
+      });
+      if (item.notes) {
+        card.createDiv({ cls: "finance-tracker-budget-meta", text: item.notes });
+      }
+    }
+  }
+
+  async renderHolidayDashboard(source, el, ctx) {
+    if (typeof el.empty === "function") {
+      el.empty();
+    } else {
+      el.innerHTML = "";
+    }
+
+    const config = parseConfigBlock(source);
+    const referenceDate = this.getReferenceDateForSource(ctx.sourcePath);
+    const explicitHoliday = core.normalizeHolidayKey(config.holiday || config.tag || config.track || "");
+    const budgetTarget = String(config.budget || "").trim();
+
+    let holidayMeta = null;
+    let budgetFile = null;
+
+    if (budgetTarget) {
+      const targetFile = this.app.vault.getAbstractFileByPath(normalizePath(budgetTarget));
+      if (targetFile instanceof TFile) {
+        budgetFile = targetFile;
+        holidayMeta = await this.readHolidayBudgetFile(targetFile);
+      }
+    }
+
+    if (!holidayMeta && explicitHoliday) {
+      const found = await this.findHolidayBudgetByKey(explicitHoliday);
+      holidayMeta = found?.meta || null;
+      budgetFile = found?.file || null;
+    }
+
+    if (!holidayMeta && this.settings.holidayModeEnabled) {
+      const active = await this.getActiveHolidayContext();
+      if (active) {
+        holidayMeta = active;
+        const activeFile = this.app.vault.getAbstractFileByPath(active.filePath || this.settings.activeHolidayBudgetPath);
+        if (activeFile instanceof TFile) {
+          budgetFile = activeFile;
+        }
+      }
+    }
+
+    const holidayKey = explicitHoliday || holidayMeta?.holidayKey || "";
+    const wrapper = el.createDiv({ cls: "finance-tracker-dashboard" });
+
+    if (!holidayKey) {
+      wrapper.createDiv({
+        cls: "finance-tracker-empty",
+        text: "Set `holiday: 2026/japan` in this code block, or select an active holiday budget with a holiday_tag in its frontmatter.",
+      });
+      return;
+    }
+
+    const startDate = core.parseIsoDate(config.start || holidayMeta?.startDate || "") || "";
+    const cappedEnd = core.parseIsoDate(config.end || holidayMeta?.endDate || "") || "";
+    const effectiveEnd = cappedEnd && cappedEnd < referenceDate ? cappedEnd : referenceDate;
+    const entries = await this.collectTransactionsForHoliday(holidayKey, {
+      start: startDate || "1900-01-01",
+      end: effectiveEnd || "2999-12-31",
+    });
+    const currency = core.normalizeCurrency(config.currency || holidayMeta?.currency || this.settings.defaultCurrency);
+    const groupBy = String(config.groupby || this.settings.dashboardDefaultGroupBy || "primary").toLowerCase();
+    const entryDates = entries.map((entry) => entry.date).filter(Boolean).sort();
+    const tripStart = startDate || entryDates[0] || referenceDate;
+    const tripEnd = effectiveEnd || entryDates[entryDates.length - 1] || referenceDate;
+    const tripDays = core.daysBetweenInclusive(tripStart, tripEnd);
+    const totalSpent = sumBy(entries, () => true);
+    const accommodationAliases = new Set(["accommodation", "accomodation"]);
+    const averageExcludingAccommodation = Number(
+      (sumBy(entries, (entry) => !accommodationAliases.has(core.primaryCategory(entry.category))) / tripDays).toFixed(2)
+    );
+    const averageFoodPerDay = Number((sumBy(entries, (entry) => core.primaryCategory(entry.category) === "food") / tripDays).toFixed(2));
+    const averageShoppingPerDay = Number((sumBy(entries, (entry) => core.primaryCategory(entry.category) === "shopping") / tripDays).toFixed(2));
+    const totalBudget = Number(core.parseNumber(config.total_budget || config.totalbudget || holidayMeta?.totalBudget) || 0);
+
+    const header = wrapper.createDiv({ cls: "finance-tracker-header" });
+    header.createEl("h3", {
+      text: config.title || `${toTitleFromHolidayKey(holidayKey)} Holiday Dashboard`,
+    });
+
+    const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
+    const exportButton = headerActions.createEl("button", { text: "Export Holiday CSV" });
+    exportButton.addEventListener("click", async () => {
+      await this.exportEntriesToCsv(entries, `holiday-${holidayKey.replace(/\//g, "-")}-${tripEnd}`);
+    });
+    if (budgetFile instanceof TFile) {
+      const budgetButton = headerActions.createEl("button", { text: "Open Holiday Budget" });
+      budgetButton.addEventListener("click", async () => {
+        await this.app.workspace.getLeaf(true).openFile(budgetFile);
+      });
+    }
+
+    this.renderHolidaySummary(
+      wrapper,
+      {
+        averageExcludingAccommodation,
+        averageFoodPerDay,
+        averageShoppingPerDay,
+        bookedTotal: holidayMeta?.totals?.booked || 0,
+        paidTotal: holidayMeta?.totals?.paid || 0,
+        plannedTotal: holidayMeta?.totals?.planned || 0,
+        totalBudget,
+        totalSpent,
+        tripDays,
+      },
+      currency
+    );
+
+    const grouped = core.groupTransactionsByCategory(entries, groupBy);
+    this.renderPieChart(wrapper, grouped, currency, Number(this.settings.dashboardSliceLabelThreshold || 0.08));
+    this.renderPlannedExpenses(wrapper, holidayMeta?.plannedExpenses || [], currency);
+  }
+
   async renderDashboard(source, el, ctx) {
     if (typeof el.empty === "function") {
       el.empty();
@@ -1061,6 +1644,247 @@ class FinanceTrackerPlugin extends Plugin {
   }
 }
 
+class HolidayBudgetModal extends Modal {
+  constructor(app, plugin, onComplete) {
+    super(app);
+    this.plugin = plugin;
+    this.onComplete = onComplete;
+    this.query = "";
+    this.createForm = {
+      endDate: core.addDays(core.todayIsoLocal(), 7) || core.todayIsoLocal(),
+      holidayKey: "",
+      name: "",
+      startDate: core.todayIsoLocal(),
+    };
+  }
+
+  getMatchingFiles() {
+    const query = this.query.trim().toLowerCase();
+    const files = this.plugin.getHolidayBudgetFiles();
+    if (!query) return files;
+    return files.filter((file) => file.basename.toLowerCase().includes(query));
+  }
+
+  async chooseFile(file) {
+    this.plugin.settings.holidayModeEnabled = true;
+    this.plugin.settings.activeHolidayBudgetPath = file.path;
+    await this.plugin.saveSettings();
+    await this.app.workspace.getLeaf(true).openFile(file);
+    if (typeof this.onComplete === "function") {
+      await this.onComplete();
+    }
+    this.close();
+  }
+
+  updateCreateDefaults() {
+    const name = this.query.trim();
+    this.createForm.name = name;
+    this.createForm.holidayKey = core.normalizeHolidayKey(this.createForm.holidayKey || "") || guessHolidayTagFromName(name || "Holiday");
+  }
+
+  async createFromForm() {
+    this.updateCreateDefaults();
+    const holidayName = String(this.createForm.name || "").trim();
+    if (!holidayName) return;
+    const file = await this.plugin.createOrOpenHolidayBudget({
+      endDate: this.createForm.endDate,
+      holidayKey: this.createForm.holidayKey,
+      name: holidayName,
+      startDate: this.createForm.startDate,
+    });
+    if (file) {
+      await this.app.workspace.getLeaf(true).openFile(file);
+      if (typeof this.onComplete === "function") {
+        await this.onComplete();
+      }
+    }
+    this.close();
+  }
+
+  renderResults() {
+    this.resultsEl.empty();
+    const matches = this.getMatchingFiles();
+
+    if (matches.length) {
+      for (const file of matches) {
+        const row = this.resultsEl.createDiv({ cls: "finance-tracker-holiday-result" });
+        row.createDiv({ cls: "finance-tracker-holiday-result-title", text: file.basename });
+        row.createDiv({ cls: "finance-tracker-holiday-result-path", text: file.path });
+        row.addEventListener("click", async () => {
+          await this.chooseFile(file);
+        });
+      }
+      return;
+    }
+
+    const trimmed = this.query.trim();
+    if (!trimmed) {
+      this.resultsEl.createDiv({
+        cls: "finance-tracker-empty",
+        text: "Search for an existing holiday budget, or type a new holiday name to create one.",
+      });
+      if (this.createPanelEl) {
+        this.createPanelEl.empty();
+      }
+      return;
+    }
+
+    this.updateCreateDefaults();
+    const createRow = this.resultsEl.createDiv({ cls: "finance-tracker-holiday-result is-create" });
+    createRow.createDiv({ cls: "finance-tracker-holiday-result-title", text: `Create "${trimmed}"` });
+    createRow.createDiv({
+      cls: "finance-tracker-holiday-result-path",
+      text: normalizePath(`${this.plugin.settings.budgetsFolderPath}/${appendBudgetSuffix(trimmed)}.md`),
+    });
+    createRow.addEventListener("click", async () => {
+      await this.createFromForm();
+    });
+
+    if (this.createPanelEl) {
+      this.renderCreatePanel();
+    }
+  }
+
+  renderCreatePanel() {
+    if (!this.createPanelEl) return;
+    this.createPanelEl.empty();
+    if (!this.query.trim()) return;
+
+    this.updateCreateDefaults();
+    this.createPanelEl.createEl("h3", { text: "New Holiday Details" });
+    this.createPanelEl.createEl("p", {
+      cls: "finance-tracker-settings-section-copy",
+      text: "Set the tracking tag and trip dates now so the holiday budget note is ready to use immediately.",
+    });
+
+    const nameSetting = new Setting(this.createPanelEl).setName("Holiday name").setDesc("This is the budget note title and file name.");
+    nameSetting.addText((text) => {
+      text.setPlaceholder("Japan 2026").setValue(this.createForm.name).onChange((value) => {
+        this.createForm.name = value;
+      });
+    });
+
+    const tagSetting = new Setting(this.createPanelEl)
+      .setName("Holiday tracking tag")
+      .setDesc("Used by the holiday dashboard to match tags like #log/spending/2026/japan/flights.");
+    tagSetting.addText((text) => {
+      text.setPlaceholder("2026/japan").setValue(this.createForm.holidayKey).onChange((value) => {
+        this.createForm.holidayKey = core.normalizeHolidayKey(value) || guessHolidayTagFromName(this.createForm.name || this.query);
+      });
+    });
+
+    const startSetting = new Setting(this.createPanelEl).setName("Start date").setDesc("Saved as a date property in the holiday budget note.");
+    startSetting.addText((text) => {
+      text.inputEl.type = "date";
+      text.setValue(this.createForm.startDate).onChange((value) => {
+        this.createForm.startDate = core.parseIsoDate(value) || core.todayIsoLocal();
+      });
+    });
+
+    const endSetting = new Setting(this.createPanelEl).setName("End date").setDesc("Saved as a date property in the holiday budget note.");
+    endSetting.addText((text) => {
+      text.inputEl.type = "date";
+      text.setValue(this.createForm.endDate).onChange((value) => {
+        this.createForm.endDate = core.parseIsoDate(value) || this.createForm.startDate;
+      });
+    });
+
+    const actions = this.createPanelEl.createDiv({ cls: "finance-tracker-settings-actions" });
+    const createButton = actions.createEl("button", { text: "Create Holiday Budget" });
+    createButton.addEventListener("click", async () => {
+      await this.createFromForm();
+    });
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Select Or Create Holiday Budget" });
+    const intro = contentEl.createEl("p", {
+      text: "Search an existing holiday budget. If nothing matches, choose the create option to start a new one inside your budgets folder.",
+    });
+    intro.addClass("finance-tracker-settings-section-copy");
+
+    const input = contentEl.createEl("input", {
+      type: "text",
+      placeholder: "Japan 2026",
+    });
+    input.addClass("finance-tracker-holiday-input");
+    input.addEventListener("input", () => {
+      this.query = input.value || "";
+      this.renderResults();
+    });
+    input.addEventListener("keydown", async (event) => {
+      if (event.key === "Enter" && this.query.trim()) {
+        event.preventDefault();
+        const matches = this.getMatchingFiles();
+        if (matches.length) {
+          await this.chooseFile(matches[0]);
+          return;
+        }
+        await this.createFromForm();
+      }
+    });
+
+    this.resultsEl = contentEl.createDiv({ cls: "finance-tracker-holiday-results" });
+    this.createPanelEl = contentEl.createDiv({ cls: "finance-tracker-holiday-create-panel" });
+    this.renderResults();
+    window.setTimeout(() => input.focus(), 0);
+  }
+}
+
+class ExportFolderModal extends Modal {
+  constructor(app, plugin, suggestedFolder, onSubmit) {
+    super(app);
+    this.plugin = plugin;
+    this.suggestedFolder = suggestedFolder;
+    this.onSubmit = onSubmit;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Choose Export Folder" });
+    contentEl.createEl("p", {
+      cls: "finance-tracker-settings-section-copy",
+      text: "Pick the folder where this CSV should be saved for this export.",
+    });
+
+    const input = contentEl.createEl("input", {
+      type: "text",
+      placeholder: "Utility/Exports",
+      value: this.suggestedFolder || "Utility/Exports",
+    });
+    input.addClass("finance-tracker-holiday-input");
+
+    const actions = contentEl.createDiv({ cls: "finance-tracker-settings-actions" });
+    const cancelButton = actions.createEl("button", { text: "Cancel" });
+    cancelButton.addEventListener("click", () => {
+      this.close();
+      this.onSubmit("");
+    });
+
+    const exportButton = actions.createEl("button", { text: "Export" });
+    exportButton.addEventListener("click", async () => {
+      const folder = (input.value || "").trim() || "Utility/Exports";
+      this.close();
+      await this.onSubmit(folder);
+    });
+
+    input.addEventListener("keydown", async (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        exportButton.click();
+      }
+    });
+
+    window.setTimeout(() => {
+      input.focus();
+      input.select();
+    }, 0);
+  }
+}
+
 class FinanceTrackerSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -1074,7 +1898,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
     containerEl.createEl("h2", { text: "Finance Tracker" });
     containerEl.createEl("p", {
       cls: "finance-tracker-settings-intro",
-      text: "Configure capture behavior, dashboard defaults, export paths, and the category list you use in Apple Shortcuts.",
+      text: "Configure capture behavior, dashboard defaults, holiday budgets, and the category list you use in Apple Shortcuts.",
     });
 
     const addSection = (title, description) => {
@@ -1091,7 +1915,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Daily notes folder")
-      .setDesc("Folder that stores your daily notes in the YYYY/MM/YYYY-MM-DD.md structure.")
+      .setDesc("Folder that stores your daily notes. The plugin follows your core Daily Notes folder and infers the existing file layout from notes already in the vault.")
       .addText((text) =>
         text.setPlaceholder("Journal/Periodics/1. Daily").setValue(this.plugin.settings.dailyNotesFolder).onChange(async (value) => {
           this.plugin.settings.dailyNotesFolder = value.trim() || DEFAULT_SETTINGS.dailyNotesFolder;
@@ -1186,24 +2010,24 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
           })
       );
 
-    addSection("Files", "Budget and CSV locations used by the plugin.");
+    addSection("Files", "Choose where your normal and holiday budget notes are stored.");
 
     new Setting(containerEl)
-      .setName("Budget note path")
-      .setDesc("Markdown note that stores your budget table.")
+      .setName("Budgets folder")
+      .setDesc("Folder where the default budget and holiday budgets are stored.")
       .addText((text) =>
-        text.setPlaceholder("Utility/Finance/Budgets.md").setValue(this.plugin.settings.budgetNotePath).onChange(async (value) => {
-          this.plugin.settings.budgetNotePath = value.trim() || DEFAULT_SETTINGS.budgetNotePath;
+        text.setPlaceholder("Utility/Budgets").setValue(this.plugin.settings.budgetsFolderPath).onChange(async (value) => {
+          this.plugin.settings.budgetsFolderPath = value.trim() || DEFAULT_SETTINGS.budgetsFolderPath;
           await this.plugin.saveSettings();
         })
       );
 
     new Setting(containerEl)
-      .setName("CSV export folder")
-      .setDesc("Where CSV exports should be written.")
+      .setName("Budget archive folder")
+      .setDesc("Holiday budgets are moved here when you end holiday mode.")
       .addText((text) =>
-        text.setPlaceholder("Utility/Exports").setValue(this.plugin.settings.csvExportFolder).onChange(async (value) => {
-          this.plugin.settings.csvExportFolder = value.trim() || DEFAULT_SETTINGS.csvExportFolder;
+        text.setPlaceholder("Utility/Budgets/Archive").setValue(this.plugin.settings.budgetArchiveFolderPath).onChange(async (value) => {
+          this.plugin.settings.budgetArchiveFolderPath = value.trim() || DEFAULT_SETTINGS.budgetArchiveFolderPath;
           await this.plugin.saveSettings();
         })
       );
@@ -1214,19 +2038,35 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
       await this.plugin.openBudgetNote();
     });
 
-    const help = containerEl.createDiv({ cls: "finance-tracker-settings-help" });
-    help.createEl("p", {
-      text: `Shortcut URL action: obsidian://${FINANCE_CAPTURE_ACTION}?vault=<vault>&amount=12.50&merchant=Coles&name=Coles&card=Visa&category=food/groceries&source=apple-pay`,
+    addSection("Holiday Mode", "Enable a separate holiday budget, search existing holiday budgets, create a new one if needed, and archive it when the trip ends.");
+
+    new Setting(containerEl)
+      .setName("Holiday mode")
+      .setDesc(this.plugin.settings.activeHolidayBudgetPath || "No active holiday budget selected.")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.holidayModeEnabled).onChange(async (value) => {
+          this.plugin.settings.holidayModeEnabled = value;
+          if (!value) {
+            this.plugin.settings.activeHolidayBudgetPath = "";
+          }
+          await this.plugin.saveSettings();
+          this.display();
+        })
+      );
+
+    const holidayActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
+    const selectHolidayButton = holidayActions.createEl("button", { text: "Select Or Create Holiday" });
+    selectHolidayButton.addEventListener("click", () => {
+      new HolidayBudgetModal(this.app, this.plugin, async () => {
+        this.display();
+      }).open();
     });
-    help.createEl("p", {
-      text: "New entries are written as plain markdown using only #log/spending/{{category}} tags.",
+    const archiveHolidayButton = holidayActions.createEl("button", { text: "End Holiday And Archive" });
+    archiveHolidayButton.addEventListener("click", async () => {
+      await this.plugin.archiveActiveHolidayBudget();
+      this.display();
     });
-    help.createEl("p", {
-      text: `Suggested categories: ${(this.plugin.settings.categoryOptions || []).join(", ")}`,
-    });
-    help.createEl("p", {
-      text: `Weekly dashboard block: \`\`\`${DASHBOARD_BLOCK}\nperiod: week\ngroupBy: primary\n\`\`\``,
-    });
+
   }
 }
 

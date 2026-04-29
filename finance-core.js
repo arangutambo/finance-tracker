@@ -125,9 +125,41 @@ function primaryCategory(value) {
   return normalized ? normalized.split("/")[0] : "uncategorized";
 }
 
-function buildCategoryTag(categoryPath) {
+function normalizeHolidayKey(value) {
+  const raw = String(value || "").replace(/^#/, "");
+  const normalized = normalizeCategoryPath(raw);
+  const spendingMatch = normalized.match(/(?:^|\/)spending\/(.+)$/i);
+  const candidate = spendingMatch ? spendingMatch[1] : normalized;
+  const segments = candidate.split("/").filter(Boolean);
+  if (segments.length < 2) return "";
+  return `${segments[0]}/${segments[1]}`;
+}
+
+function parseHolidayTagContext(value) {
+  const normalized = normalizeCategoryPath(value);
+  const segments = normalized.split("/").filter(Boolean);
+  if (segments.length >= 3 && /^(?:\d{2}|\d{4})$/.test(segments[0])) {
+    return {
+      holidayCategory: segments.slice(2).join("/") || "uncategorized",
+      holidayKey: `${segments[0]}/${segments[1]}`,
+      holidayName: segments[1],
+      holidayYear: segments[0],
+    };
+  }
+  return {
+    holidayCategory: normalized || "uncategorized",
+    holidayKey: "",
+    holidayName: "",
+    holidayYear: "",
+  };
+}
+
+function buildCategoryTag(categoryPath, holidayKey = "") {
   const normalizedCategory = normalizeCategoryPath(categoryPath) || "uncategorized";
-  return `#log/spending/${normalizedCategory}`;
+  const normalizedHoliday = normalizeHolidayKey(holidayKey);
+  return normalizedHoliday
+    ? `#log/spending/${normalizedHoliday}/${normalizedCategory}`
+    : `#log/spending/${normalizedCategory}`;
 }
 
 function stripFirstTag(value) {
@@ -190,9 +222,9 @@ function parseTransactionLine(line, noteDate, filePath, options = {}, childLines
   const amount = extractVisibleAmount(text);
   if (!Number.isFinite(amount)) return null;
 
-  const category =
-    extractCategoryFromLogSpendingTag(text) ||
-    "uncategorized";
+  const tagPath = extractCategoryFromLogSpendingTag(text) || "uncategorized";
+  const holidayContext = parseHolidayTagContext(tagPath);
+  const category = holidayContext.holidayCategory || "uncategorized";
 
   const currency = normalizeCurrency(options.defaultCurrency || "AUD");
   const merchant = normalizeWhitespace(childLines[0] || "");
@@ -207,6 +239,9 @@ function parseTransactionLine(line, noteDate, filePath, options = {}, childLines
     currency,
     date: transactionDate,
     filePath,
+    holidayKey: holidayContext.holidayKey,
+    holidayName: holidayContext.holidayName,
+    holidayYear: holidayContext.holidayYear,
     merchant,
     note,
     rawLine: text,
@@ -273,7 +308,7 @@ function buildTransactionBlock(expense, settings = {}) {
   const date = parseIsoDate(expense.date) || todayIsoLocal();
   const amount = Number(Number(expense.amount || 0).toFixed(2));
 
-  const tag = buildCategoryTag(category);
+  const tag = buildCategoryTag(category, expense.holidayKey || "");
   const visibleLabel = formatCurrency(amount, currency);
   const lines = [`\t- ${visibleLabel} ${tag}`.trimEnd()];
 
@@ -513,7 +548,9 @@ module.exports = {
   isDateInRange,
   normalizeCategoryPath,
   normalizeCurrency,
+  normalizeHolidayKey,
   parseBudgets,
+  parseHolidayTagContext,
   parseIsoDate,
   parseNumber,
   parseTransactionsFromNoteContent,

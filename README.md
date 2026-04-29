@@ -9,6 +9,7 @@ Finance Tracker is an Obsidian plugin for logging spending from Apple Shortcuts 
 - Recalculates the running total next to `#log/spending` every time.
 - Writes entries as plain markdown using `#log/spending/{{category}}` tags.
 - Renders a weekly `finance-dashboard` code block with a pie chart and budget progress.
+- Renders a dedicated `holiday-dashboard` code block for trip spending and holiday budget progress.
 - Exports parsed transactions to CSV.
 
 ## Entry format
@@ -23,6 +24,16 @@ New payments are written in this shape:
 ```
 
 Travel and historical notes using paths such as `#log/25/japan/spending/food/snacks` are also parsed by the dashboard.
+
+Holiday notes can use tags like:
+
+```md
+#log/spending/2026/japan/food/restaurants
+#log/spending/2026/japan/accommodation
+#log/spending/2026/japan/shopping
+```
+
+The holiday dashboard treats `2026/japan` as the holiday key and still groups the spending by the real category like `food`, `accommodation`, or `shopping`.
 
 ## Apple Shortcuts URL
 
@@ -41,6 +52,17 @@ Expected fields:
 - `category`: category path such as `food/groceries`
 - `source`: optional source, for example `apple-pay`
 
+Suggested day-to-day categories:
+
+- `groceries`
+- `restaurants`
+- `snacks`
+- `transport`
+- `subscription`
+- `medical`
+- `clothes`
+- `uncategorized`
+
 ## Weekly dashboard
 
 Add this code block to your weekly note:
@@ -57,9 +79,32 @@ Supported options:
 - `currency`: override display currency
 - `start` and `end`: explicit date range in `YYYY-MM-DD`
 
+## Holiday dashboard
+
+Add this code block to your holiday daily note template:
+
+```holiday-dashboard
+holiday: 2026/japan
+```
+
+Supported options:
+
+- `holiday`: the holiday tag root after `#log/spending/`, for example `2026/japan`
+- `budget`: optional path to the holiday budget note
+- `currency`: optional display currency override
+- `start` and `end`: optional date limits in `YYYY-MM-DD`
+
+The holiday dashboard shows:
+
+- total spent out of the whole holiday budget
+- average spend per day excluding accommodation
+- average food spend per day so far
+- average shopping spend per day so far
+- planned, booked, and prepaid trip costs from the holiday budget note
+
 ## Budgets
 
-The plugin reads budgets from a markdown table, by default in `Utility/Finance/Budgets.md`.
+The plugin reads budgets from a markdown table, by default in `Utility/Budgets/💸 Budgets.md`.
 
 Example:
 
@@ -71,6 +116,34 @@ Example:
 | All Spending | all | 450 | week | AUD |
 ```
 
+Holiday budget notes can also include frontmatter and a planned-expenses table. Example:
+
+```md
+---
+holiday_name: Japan 2026
+holiday_tag: 2026/japan
+total_budget: 5000
+currency: AUD
+start_date: 2026-09-10
+end_date: 2026-09-24
+---
+
+| Item | Category | Planned | Booked | Paid | Notes |
+| --- | --- | ---: | ---: | ---: | --- |
+| Flights | flights | 1200 | 1200 | 1200 | |
+| Accommodation | accommodation | 1800 | 900 | 900 | First half booked |
+| Recreation | recreation | 700 | 0 | 0 | |
+```
+
+When you create a new holiday from settings, the modal now lets you set:
+
+- the holiday tracking tag, for example `2026/japan`
+- the start date as a date property
+- the end date as a date property
+- the file is saved with `Budget` appended to the holiday name automatically
+
+New holiday notes now seed planned expenses with only `flights`, `accommodation`, and `recreation`.
+
 ## Settings
 
 The settings tab lets you configure:
@@ -81,8 +154,11 @@ The settings tab lets you configure:
 - shortcut category list
 - dashboard grouping defaults
 - pie chart label threshold
-- budget note path
-- CSV export folder
+- budgets folder and archive folder
+
+## CSV export
+
+Every time you export, the plugin asks which folder you want to save the CSV into before writing the file.
 
 ## Development
 
