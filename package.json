@@ -1,0 +1,19 @@
+{
+  "name": "finance-tracker",
+  "version": "0.1.0",
+  "description": "Obsidian plugin for capturing spending from Apple Shortcuts, updating daily note totals, and visualizing weekly finance data.",
+  "license": "MIT",
+  "author": "Antoine Haddad",
+  "type": "commonjs",
+  "main": "main.js",
+  "keywords": [
+    "obsidian",
+    "obsidian-plugin",
+    "finance",
+    "budgeting",
+    "apple-shortcuts"
+  ],
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  }
+}
