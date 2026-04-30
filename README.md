@@ -74,10 +74,21 @@ groupBy: primary
 
 Supported options:
 
-- `period`: `day`, `week`, or `month`
+- `period`: `day`, `week`, `fortnight`, `month`, `bimonth`, `quarter`, or `year`
 - `groupBy`: `primary` or `full`
 - `currency`: override display currency
 - `start` and `end`: explicit date range in `YYYY-MM-DD`
+
+## Daily budget check
+
+Add this code block to your daily note template:
+
+```daily-budget-check
+groupBy: full
+```
+
+This block evaluates your budgeting progress over the current budget period and highlights overspent categories in red.
+It uses your configured `Week starts on` setting and your chosen `Budget check period` setting by default, so it can check a week, fortnight, month, bi-month, quarter, or year.
 
 ## Holiday dashboard
 
@@ -126,6 +137,8 @@ total_budget: 5000
 currency: AUD
 start_date: 2026-09-10
 end_date: 2026-09-24
+exchange_rates: JPY=0.0097, JPY CASH=0.0100, USD=1.53
+exchange_rate_periods: 2026-09-10..2026-09-14:JPY=0.0098, JPY CASH=0.0101; 2026-09-15..2026-09-24:JPY=0.0095
 ---
 
 | Item | Category | Planned | Booked | Paid | Notes |
@@ -142,7 +155,63 @@ When you create a new holiday from settings, the modal now lets you set:
 - the end date as a date property
 - the file is saved with `Budget` appended to the holiday name automatically
 
+Holiday detection:
+
+- you do not need to turn a holiday mode on or off
+- the plugin treats spending as holiday spending automatically when the transaction date falls between a holiday budget note's `start_date` and `end_date`
+- holiday budgets can still be created, selected, and archived from settings
+
 New holiday notes now seed planned expenses with only `flights`, `accommodation`, and `recreation`.
+
+Exchange rate rules:
+
+- `currency` is the budget and dashboard currency the plugin should use, for example `AUD`
+- `exchange_rates` is the flat fallback rate map for the whole trip, and can include several source currencies
+- `exchange_rate_periods` lets you override rates for specific date ranges
+- rates are interpreted as `1 foreign currency unit = X budget currency units`
+- cash can use a separate rate key like `JPY CASH`
+
+Frontmatter format:
+
+- `exchange_rates` format: `SOURCE=RATE, SOURCE CASH=RATE, OTHER=RATE`
+- `exchange_rate_periods` format: `YYYY-MM-DD..YYYY-MM-DD:SOURCE=RATE, SOURCE CASH=RATE; YYYY-MM-DD..YYYY-MM-DD:SOURCE=RATE`
+- use commas to separate multiple rate keys inside one period
+- use semicolons to separate different periods
+- period-specific rates override the flat `exchange_rates` values for matching dates
+
+Frontmatter examples:
+
+```md
+exchange_rates: JPY=0.0097, JPY CASH=0.0100, USD=1.53
+exchange_rate_periods: 2026-06-18..2026-06-24:JPY=0.0098, JPY CASH=0.0101; 2026-06-25..2026-07-02:JPY=0.0095, USD=1.50
+```
+
+Example:
+
+- `exchange_rates: JPY=0.0097, JPY CASH=0.0100, USD=1.53` means the same holiday can convert card yen, cash yen, and USD into the holiday budget currency
+- `exchange_rate_periods: 2026-06-18..2026-06-24:JPY=0.0098, JPY CASH=0.0101; 2026-06-25..2026-07-02:JPY=0.0095` uses different rates during different parts of the trip
+
+When a captured holiday spend arrives in another currency and a matching exchange rate exists, the daily note line is written like:
+
+```md
+- ¥1,800 JPY : $17.46 AUD #log/spending/2026/japan/food/restaurants
+	- Ichiran
+```
+
+For cash, the currency input can be something like `YEN CASH`, which writes:
+
+```md
+- ¥1,800 JPY CASH : $18.10 AUD #log/spending/2026/japan/food/restaurants
+	- Cash ramen
+```
+
+If no currency is supplied, the plugin assumes your normal default currency, which is usually `AUD`.
+
+Planned expense columns:
+
+- `Planned`: the target amount you expect that item to cost
+- `Booked`: the amount you have committed or reserved but not necessarily paid yet
+- `Paid`: the amount already paid out of your account
 
 ## Settings
 
@@ -154,6 +223,8 @@ The settings tab lets you configure:
 - shortcut category list
 - dashboard grouping defaults
 - pie chart label threshold
+- week start day
+- budget check period
 - budgets folder and archive folder
 
 ## CSV export

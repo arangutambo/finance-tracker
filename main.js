@@ -17,7 +17,21 @@ const core = (() => {
 
   function normalizeCurrency(value, fallback = "AUD") {
     const cleaned = String(value || "").toUpperCase().replace(/[^A-Z]/g, "");
-    return cleaned || fallback;
+    const aliases = {
+      AUSD: "AUD",
+      AUD: "AUD",
+      CAD: "CAD",
+      CNY: "CNY",
+      EUR: "EUR",
+      GBP: "GBP",
+      HKD: "HKD",
+      JPY: "JPY",
+      NZD: "NZD",
+      SGD: "SGD",
+      USD: "USD",
+      YEN: "JPY",
+    };
+    return aliases[cleaned] || cleaned || fallback;
   }
 
   function parseNumber(value) {
@@ -52,6 +66,52 @@ const core = (() => {
     }
   }
 
+  function formatCurrencyWithCode(amount, currency = "AUD") {
+    const numeric = Number(amount || 0);
+    const code = normalizeCurrency(currency);
+    const symbols = {
+      AUD: "$",
+      CAD: "$",
+      CNY: "¥",
+      EUR: "€",
+      GBP: "£",
+      HKD: "$",
+      JPY: "¥",
+      NZD: "$",
+      SGD: "$",
+      USD: "$",
+    };
+    const fractionDigits = code === "JPY" ? 0 : 2;
+    const formattedNumber = new Intl.NumberFormat("en-AU", {
+      maximumFractionDigits: fractionDigits,
+      minimumFractionDigits: fractionDigits,
+    }).format(numeric);
+    const symbol = symbols[code];
+    if (symbol) {
+      return `${symbol}${formattedNumber} ${code}`;
+    }
+    return `${code} ${formattedNumber}`;
+  }
+
+  function parseCurrencyDescriptor(value, fallback = "AUD") {
+    const raw = String(value || "").trim().toUpperCase();
+    const isCash = /\bCASH\b/.test(raw);
+    const base = raw.replace(/\bCASH\b/g, " ").trim();
+    const currencyMatch = base.match(/\b([A-Z]{3,}|YEN)\b/);
+    const currency = normalizeCurrency(currencyMatch ? currencyMatch[1] : fallback, fallback);
+    return {
+      currency,
+      isCash,
+      rateKey: isCash ? `${currency}_CASH` : currency,
+    };
+  }
+
+  function formatOriginalCurrencyLabel(amount, descriptor) {
+    const parsed = typeof descriptor === "string" ? parseCurrencyDescriptor(descriptor, "") : descriptor || {};
+    const label = formatCurrencyWithCode(amount, parsed.currency || "AUD");
+    return parsed.isCash ? `${label} CASH` : label;
+  }
+
   function pad(value) {
     return String(value).padStart(2, "0");
   }
@@ -78,6 +138,69 @@ const core = (() => {
     if (!date) return null;
     date.setDate(date.getDate() + count);
     return todayIsoLocal(date);
+  }
+
+  function startOfWeek(iso, weekStartsOn = "monday") {
+    const date = isoToDate(iso);
+    if (!date) return null;
+    const weekStartIndex = String(weekStartsOn || "monday").toLowerCase() === "sunday" ? 0 : 1;
+    const diff = (date.getDay() - weekStartIndex + 7) % 7;
+    date.setDate(date.getDate() - diff);
+    return todayIsoLocal(date);
+  }
+
+  function endOfQuarter(iso) {
+    const date = isoToDate(iso);
+    if (!date) return null;
+    const quarterStartMonth = Math.floor(date.getMonth() / 3) * 3;
+    return todayIsoLocal(new Date(date.getFullYear(), quarterStartMonth + 3, 0));
+  }
+
+  function startOfQuarter(iso) {
+    const date = isoToDate(iso);
+    if (!date) return null;
+    const quarterStartMonth = Math.floor(date.getMonth() / 3) * 3;
+    return todayIsoLocal(new Date(date.getFullYear(), quarterStartMonth, 1));
+  }
+
+  function startOfYear(iso) {
+    const date = isoToDate(iso);
+    if (!date) return null;
+    return todayIsoLocal(new Date(date.getFullYear(), 0, 1));
+  }
+
+  function endOfYear(iso) {
+    const date = isoToDate(iso);
+    if (!date) return null;
+    return todayIsoLocal(new Date(date.getFullYear(), 11, 31));
+  }
+
+  function startOfBiMonth(iso) {
+    const date = isoToDate(iso);
+    if (!date) return null;
+    const month = date.getMonth();
+    const biMonthStart = month % 2 === 0 ? month : month - 1;
+    return todayIsoLocal(new Date(date.getFullYear(), biMonthStart, 1));
+  }
+
+  function endOfBiMonth(iso) {
+    const date = isoToDate(iso);
+    if (!date) return null;
+    const month = date.getMonth();
+    const biMonthStart = month % 2 === 0 ? month : month - 1;
+    return todayIsoLocal(new Date(date.getFullYear(), biMonthStart + 2, 0));
+  }
+
+  function startOfFortnight(iso, weekStartsOn = "monday") {
+    const anchor = startOfWeek(iso, weekStartsOn);
+    const anchorDate = isoToDate(anchor);
+    if (!anchorDate) return null;
+    const yearStart = todayIsoLocal(new Date(anchorDate.getFullYear(), 0, 1));
+    const firstPeriodStart = startOfWeek(yearStart, weekStartsOn);
+    const firstDate = isoToDate(firstPeriodStart);
+    const diffDays = Math.floor((anchorDate.getTime() - firstDate.getTime()) / (24 * 60 * 60 * 1000));
+    const fortnightIndex = Math.floor(diffDays / 14);
+    return addDays(firstPeriodStart, fortnightIndex * 14);
   }
 
   function endOfMonth(iso) {
@@ -228,6 +351,10 @@ const core = (() => {
     const category = holidayContext.holidayCategory || "uncategorized";
 
     const currency = normalizeCurrency(options.defaultCurrency || "AUD");
+    const visibleSection = stripFirstTag(text).replace(/^\s*-\s*(?:\[[^\]]\]\s*)?/, "").trim();
+    const originalSide = visibleSection.includes(":") ? visibleSection.split(":")[0].trim() : "";
+    const originalAmount = extractVisibleAmount(`- ${originalSide}`);
+    const originalDescriptor = parseCurrencyDescriptor(originalSide, currency);
     const merchant = normalizeWhitespace(childLines[0] || "");
     const note = normalizeWhitespace(childLines.slice(1).join(" | "));
     const transactionDate = noteDate || extractNoteDate("", filePath);
@@ -246,6 +373,9 @@ const core = (() => {
       merchant,
       name: merchant,
       note,
+      originalAmount: Number.isFinite(originalAmount) ? Number(Number(originalAmount).toFixed(2)) : null,
+      originalCurrency: originalSide ? originalDescriptor.currency : "",
+      originalRateKey: originalSide ? originalDescriptor.rateKey : "",
       rawLine: text,
       source: "",
       card: "",
@@ -302,7 +432,18 @@ const core = (() => {
     const amount = Number(Number(expense.amount || 0).toFixed(2));
 
     const tag = buildCategoryTag(category, expense.holidayKey || "");
-    const visibleLabel = formatCurrency(amount, currency);
+    const originalDescriptor = {
+      currency: normalizeCurrency(expense.originalCurrency || "", ""),
+      isCash: /_CASH$/i.test(String(expense.originalRateKey || "")),
+      rateKey: String(expense.originalRateKey || ""),
+    };
+    const shouldShowConverted =
+      Number.isFinite(expense.originalAmount) &&
+      originalDescriptor.currency &&
+      originalDescriptor.currency !== currency;
+    const visibleLabel = shouldShowConverted
+      ? `${formatOriginalCurrencyLabel(expense.originalAmount, originalDescriptor)} : ${formatCurrencyWithCode(amount, currency)}`
+      : formatCurrency(amount, currency);
     const lines = [`\t- ${visibleLabel} ${tag}`.trimEnd()];
 
     if (merchant) {
@@ -375,22 +516,40 @@ const core = (() => {
     return `${lines.join("\n").replace(/\n{4,}/g, "\n\n\n")}\n`;
   }
 
-  function toPeriodRange({ period = "week", referenceDate, start, end }) {
+  function toPeriodRange({ period = "week", referenceDate, start, end, weekStartsOn = "monday" }) {
     const normalizedPeriod = String(period || "week").toLowerCase();
     if (parseIsoDate(start) && parseIsoDate(end)) {
       return { period: normalizedPeriod, start: parseIsoDate(start), end: parseIsoDate(end) };
     }
 
     const anchor = parseIsoDate(referenceDate) || todayIsoLocal();
+    if (normalizedPeriod === "year" || normalizedPeriod === "yearly" || normalizedPeriod === "annual") {
+      return { period: "year", start: startOfYear(anchor), end: endOfYear(anchor) };
+    }
+
+    if (normalizedPeriod === "quarter" || normalizedPeriod === "quarterly") {
+      return { period: "quarter", start: startOfQuarter(anchor), end: endOfQuarter(anchor) };
+    }
+
+    if (normalizedPeriod === "bimonth" || normalizedPeriod === "bi-month" || normalizedPeriod === "bi-monthly") {
+      return { period: "bimonth", start: startOfBiMonth(anchor), end: endOfBiMonth(anchor) };
+    }
+
     if (normalizedPeriod === "month") {
       return { period: normalizedPeriod, start: anchor.slice(0, 8) + "01", end: endOfMonth(anchor) };
+    }
+
+    if (normalizedPeriod === "fortnight" || normalizedPeriod === "2-weeks" || normalizedPeriod === "2weeks") {
+      const periodStart = startOfFortnight(anchor, weekStartsOn);
+      return { period: "fortnight", start: periodStart, end: addDays(periodStart, 13) };
     }
 
     if (normalizedPeriod === "day") {
       return { period: normalizedPeriod, start: anchor, end: anchor };
     }
 
-    return { period: "week", start: anchor, end: addDays(anchor, 6) };
+    const periodStart = startOfWeek(anchor, weekStartsOn);
+    return { period: "week", start: periodStart, end: addDays(periodStart, 6) };
   }
 
   function isDateInRange(date, range) {
@@ -491,7 +650,15 @@ const core = (() => {
           category,
           currency: normalizeCurrency(row.currency || fallbackCurrency, fallbackCurrency),
           limit: Number(limit.toFixed(2)),
-          period: ["day", "week", "month"].includes(period) ? period : "week",
+          period: ["day", "week", "fortnight", "month", "bimonth", "quarter", "year"].includes(period)
+            ? period
+            : period === "bi-month" || period === "bi-monthly"
+              ? "bimonth"
+              : period === "quarterly"
+                ? "quarter"
+                : period === "yearly" || period === "annual"
+                  ? "year"
+                : "week",
         });
       }
     }
@@ -548,6 +715,8 @@ const core = (() => {
     extractCategoryFromLogSpendingTag,
     extractNoteDate,
     formatCurrency,
+    formatCurrencyWithCode,
+    formatOriginalCurrencyLabel,
     formatPlainNumber,
     groupTransactionsByCategory,
     insertTransactionIntoDailyNote,
@@ -555,6 +724,7 @@ const core = (() => {
     normalizeCategoryPath,
     normalizeCurrency,
     normalizeHolidayKey,
+    parseCurrencyDescriptor,
     parseBudgets,
     parseHolidayTagContext,
     parseMarkdownTable,
@@ -575,7 +745,6 @@ const DEFAULT_SETTINGS = {
   budgetsFolderPath: "Utility/Budgets",
   budgetArchiveFolderPath: "Utility/Budgets/Archive",
   defaultBudgetNoteName: "💸 Budgets.md",
-  holidayModeEnabled: false,
   activeHolidayBudgetPath: "",
   categoryOptions: [
     "food/groceries",
@@ -591,11 +760,14 @@ const DEFAULT_SETTINGS = {
   openDailyNoteAfterCapture: false,
   dashboardDefaultGroupBy: "primary",
   dashboardSliceLabelThreshold: 0.08,
+  budgetCheckPeriod: "week",
+  weekStartsOn: "monday",
 };
 
 const FINANCE_CAPTURE_ACTION = "finance-capture";
 const DASHBOARD_BLOCK = "finance-dashboard";
 const HOLIDAY_DASHBOARD_BLOCK = "holiday-dashboard";
+const DAILY_BUDGET_CHECK_BLOCK = "daily-budget-check";
 const PIE_COLORS = [
   "#2B6CB0",
   "#2F855A",
@@ -645,7 +817,7 @@ function parseFrontmatter(content) {
   for (const rawLine of match[1].split("\n")) {
     const line = rawLine.trim();
     if (!line || line.startsWith("#")) continue;
-    const parsed = line.match(/^([A-Za-z0-9_-]+)\s*:\s*(.+)$/);
+    const parsed = line.match(/^([A-Za-z0-9_-]+)\s*:\s*(.*)$/);
     if (!parsed) continue;
     data[parsed[1].toLowerCase()] = parsed[2].trim();
   }
@@ -682,6 +854,42 @@ function sumBy(entries, predicate) {
       .reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
       .toFixed(2)
   );
+}
+
+function normalizeExchangeRateKey(value, fallbackCurrency) {
+  const descriptor = core.parseCurrencyDescriptor(value, fallbackCurrency);
+  return descriptor.rateKey;
+}
+
+function parseFlatExchangeRates(value, fallbackCurrency) {
+  const rates = {};
+  for (const rawPart of String(value || "").split(/[,|\n]+/)) {
+    const part = rawPart.trim();
+    if (!part) continue;
+    const match = part.match(/^([A-Za-z _]{3,})\s*=\s*([0-9.]+)$/);
+    if (!match) continue;
+    const rateKey = normalizeExchangeRateKey(match[1], fallbackCurrency);
+    const rate = Number(match[2]);
+    if (!rateKey || !Number.isFinite(rate) || rate <= 0) continue;
+    rates[rateKey] = rate;
+  }
+  return rates;
+}
+
+function parseExchangeRatePeriods(value, fallbackCurrency) {
+  const periods = [];
+  for (const rawPart of String(value || "").split(/\s*;\s*/)) {
+    const part = rawPart.trim();
+    if (!part) continue;
+    const match = part.match(/^(\d{4}-\d{2}-\d{2})\s*(?:\.\.|to)\s*(\d{4}-\d{2}-\d{2})\s*[:|]\s*(.+)$/i);
+    if (!match) continue;
+    periods.push({
+      end: core.parseIsoDate(match[2]),
+      rates: parseFlatExchangeRates(match[3], fallbackCurrency),
+      start: core.parseIsoDate(match[1]),
+    });
+  }
+  return periods.filter((period) => period.start && period.end && Object.keys(period.rates).length);
 }
 
 function stripBudgetSuffix(value) {
@@ -782,6 +990,10 @@ class FinanceTrackerPlugin extends Plugin {
 
     this.registerMarkdownCodeBlockProcessor(HOLIDAY_DASHBOARD_BLOCK, async (source, el, ctx) => {
       await this.renderHolidayDashboard(source, el, ctx);
+    });
+
+    this.registerMarkdownCodeBlockProcessor(DAILY_BUDGET_CHECK_BLOCK, async (source, el, ctx) => {
+      await this.renderDailyBudgetCheck(source, el, ctx);
     });
   }
 
@@ -888,6 +1100,9 @@ class FinanceTrackerPlugin extends Plugin {
   }
 
   parseCaptureParams(params) {
+    const rawCurrency = String(params.currency || "").trim();
+    const currencyProvided = Object.prototype.hasOwnProperty.call(params, "currency") && rawCurrency.length > 0;
+    const currencyDescriptor = core.parseCurrencyDescriptor(rawCurrency || this.settings.defaultCurrency, this.settings.defaultCurrency);
     const amount = core.parseNumber(params.amount || params.total);
     if (!Number.isFinite(amount)) {
       throw new Error("Missing or invalid amount.");
@@ -898,8 +1113,10 @@ class FinanceTrackerPlugin extends Plugin {
     return {
       amount,
       category,
-      currency: core.normalizeCurrency(params.currency || this.settings.defaultCurrency),
+      currency: currencyDescriptor.currency,
+      currencyProvided,
       date: core.parseIsoDate(params.date) || core.todayIsoLocal(),
+      exchangeRateKey: currencyDescriptor.rateKey,
       card: String(params.card || params.pass || "").trim(),
       merchant: String(params.merchant || params.payee || params.name || "").trim(),
       name: String(params.name || params.merchant || params.payee || "").trim(),
@@ -913,12 +1130,11 @@ class FinanceTrackerPlugin extends Plugin {
 
   async handleCapture(params) {
     try {
-      const expense = this.parseCaptureParams(params);
-      if (this.settings.holidayModeEnabled) {
-        const holidayContext = await this.getActiveHolidayContext();
-        if (holidayContext?.holidayKey) {
-          expense.holidayKey = holidayContext.holidayKey;
-        }
+      let expense = this.parseCaptureParams(params);
+      const holidayContext = await this.findHolidayContextForDate(expense.date);
+      if (holidayContext?.holidayKey) {
+        expense.holidayKey = holidayContext.holidayKey;
+        expense = this.applyHolidayCurrencyContext(expense, holidayContext);
       }
       const notePath = this.getDailyNotePath(expense.date);
       const file =
@@ -1003,7 +1219,7 @@ class FinanceTrackerPlugin extends Plugin {
   }
 
   getActiveBudgetNotePath() {
-    if (this.settings.holidayModeEnabled && this.settings.activeHolidayBudgetPath) {
+    if (this.settings.activeHolidayBudgetPath) {
       return normalizePath(this.settings.activeHolidayBudgetPath);
     }
     return this.getDefaultBudgetNotePath();
@@ -1019,8 +1235,13 @@ class FinanceTrackerPlugin extends Plugin {
     return this.ensureTextFile(this.getDefaultBudgetNotePath(), () => this.buildBudgetNoteContent());
   }
 
+  async openDefaultBudgetNote() {
+    const file = await this.ensureBudgetNote();
+    await this.app.workspace.getLeaf(true).openFile(file);
+  }
+
   async openBudgetNote() {
-    const file = await this.ensureActiveBudgetNote();
+    const file = await this.ensureBudgetNote();
     await this.app.workspace.getLeaf(true).openFile(file);
   }
 
@@ -1077,6 +1298,10 @@ class FinanceTrackerPlugin extends Plugin {
     return {
       currency: core.normalizeCurrency(frontmatter.currency || this.settings.defaultCurrency),
       endDate: core.parseIsoDate(frontmatter.end_date || frontmatter.end || frontmatter.return_date || ""),
+      exchangeRates: {
+        flat: parseFlatExchangeRates(frontmatter.exchange_rates || frontmatter.rates || "", this.settings.defaultCurrency),
+        periods: parseExchangeRatePeriods(frontmatter.exchange_rate_periods || frontmatter.rate_periods || "", this.settings.defaultCurrency),
+      },
       filePath,
       holidayKey,
       holidayName: String(frontmatter.holiday_name || frontmatter.name || toTitleFromHolidayKey(holidayKey || guessHolidayTagFromName(this.getHolidayBudgetNameFromPath(filePath)))).trim(),
@@ -1123,6 +1348,96 @@ class FinanceTrackerPlugin extends Plugin {
     return this.readHolidayBudgetFile(active);
   }
 
+  async findHolidayContextForDate(date) {
+    const normalizedDate = core.parseIsoDate(date);
+    if (!normalizedDate) return null;
+
+    const candidates = [];
+    const active = this.app.vault.getAbstractFileByPath(this.settings.activeHolidayBudgetPath || "");
+    if (active instanceof TFile) {
+      candidates.push(active);
+    }
+    for (const file of this.getHolidayBudgetFiles()) {
+      if (!candidates.some((candidate) => candidate.path === file.path)) {
+        candidates.push(file);
+      }
+    }
+
+    for (const file of candidates) {
+      const meta = await this.readHolidayBudgetFile(file);
+      if (!meta?.holidayKey || !meta.startDate || !meta.endDate) continue;
+      if (normalizedDate >= meta.startDate && normalizedDate <= meta.endDate) {
+        return meta;
+      }
+    }
+    return null;
+  }
+
+  getExchangeRateForDate(exchangeConfig, fromCurrency, date, explicitRateKey = "") {
+    const normalizedCurrency = core.normalizeCurrency(fromCurrency, "");
+    const normalizedRateKey = explicitRateKey || normalizeExchangeRateKey(fromCurrency, "");
+    const normalizedDate = core.parseIsoDate(date);
+    if (!normalizedCurrency && !normalizedRateKey) return null;
+
+    for (const period of exchangeConfig?.periods || []) {
+      if (!period.start || !period.end || !normalizedDate) continue;
+      if (normalizedDate >= period.start && normalizedDate <= period.end) {
+        const specificRate = Number(period.rates?.[normalizedRateKey]);
+        if (Number.isFinite(specificRate) && specificRate > 0) {
+          return specificRate;
+        }
+        const rate = Number(period.rates?.[normalizedCurrency]);
+        if (Number.isFinite(rate) && rate > 0) {
+          return rate;
+        }
+      }
+    }
+
+    const specificFlatRate = Number(exchangeConfig?.flat?.[normalizedRateKey]);
+    if (Number.isFinite(specificFlatRate) && specificFlatRate > 0) return specificFlatRate;
+    const flatRate = Number(exchangeConfig?.flat?.[normalizedCurrency]);
+    return Number.isFinite(flatRate) && flatRate > 0 ? flatRate : null;
+  }
+
+  applyHolidayCurrencyContext(expense, holidayContext) {
+    const displayCurrency = core.normalizeCurrency(holidayContext?.currency || this.settings.defaultCurrency);
+    const inputCurrency = core.normalizeCurrency(expense.currency || displayCurrency, displayCurrency);
+    const inputRateKey = String(expense.exchangeRateKey || inputCurrency);
+    const date = core.parseIsoDate(expense.date) || core.todayIsoLocal();
+    const amount = Number(expense.amount || 0);
+
+    if (!Number.isFinite(amount)) {
+      return expense;
+    }
+
+    if (!expense.currencyProvided || inputCurrency === displayCurrency) {
+      return {
+        ...expense,
+        amount,
+        currency: displayCurrency,
+        originalAmount: null,
+        originalCurrency: "",
+      };
+    }
+
+    const rate = this.getExchangeRateForDate(holidayContext?.exchangeRates, inputCurrency, date, inputRateKey);
+    if (!Number.isFinite(rate) || rate <= 0) {
+      throw new Error(`No exchange rate is configured for ${inputCurrency} on ${date}.`);
+    }
+
+    return {
+      ...expense,
+      amount: Number((amount * rate).toFixed(2)),
+      convertedFromAmount: amount,
+      convertedFromCurrency: inputCurrency,
+      currency: displayCurrency,
+      exchangeRate: rate,
+      originalAmount: amount,
+      originalCurrency: inputCurrency,
+      originalRateKey: inputRateKey,
+    };
+  }
+
   buildBudgetNoteContent(title = "Finance Budgets") {
     return [
       `# ${title}`,
@@ -1161,11 +1476,14 @@ class FinanceTrackerPlugin extends Plugin {
       `currency: ${currency}`,
       `start_date: ${startDate}`,
       `end_date: ${endDate}`,
+      "exchange_rates: JPY=0.0095, JPY CASH=0.0098",
+      "exchange_rate_periods: ",
       "---",
       "",
       `# ${appendBudgetSuffix(holidayTitle)}`,
       "",
       "Set your whole-trip budget in the frontmatter above, then use the tables below to plan expected costs before you travel.",
+      "Use `exchange_rates` for one flat rate across the whole trip, or `exchange_rate_periods` for date-specific overrides.",
       "",
       "## Daily Holiday Dashboard",
       "",
@@ -1174,6 +1492,8 @@ class FinanceTrackerPlugin extends Plugin {
       "```",
       "",
       "## Planned Expenses",
+      "",
+      "`Booked` means reserved or committed but not fully paid yet. `Paid` is what has actually left your account already.",
       "",
       "| Item | Category | Planned | Booked | Paid | Notes |",
       "| --- | --- | ---: | ---: | ---: | --- |",
@@ -1193,8 +1513,8 @@ class FinanceTrackerPlugin extends Plugin {
     ].join("\n");
   }
 
-  async loadBudgets() {
-    const file = await this.ensureActiveBudgetNote();
+  async loadBudgets(mode = "active") {
+    const file = mode === "default" ? await this.ensureBudgetNote() : await this.ensureActiveBudgetNote();
     const content = await this.app.vault.cachedRead(file);
     return core.parseBudgets(content, this.settings.defaultCurrency);
   }
@@ -1233,7 +1553,6 @@ class FinanceTrackerPlugin extends Plugin {
         startDate: definition?.startDate,
       })
     );
-    this.settings.holidayModeEnabled = true;
     this.settings.activeHolidayBudgetPath = file.path;
     await this.saveSettings();
     return file;
@@ -1244,7 +1563,6 @@ class FinanceTrackerPlugin extends Plugin {
     const activeFile = this.app.vault.getAbstractFileByPath(activePath);
     if (!(activeFile instanceof TFile)) {
       this.settings.activeHolidayBudgetPath = "";
-      this.settings.holidayModeEnabled = false;
       await this.saveSettings();
       new Notice("No active holiday budget to archive.");
       return;
@@ -1258,7 +1576,6 @@ class FinanceTrackerPlugin extends Plugin {
     }
     await this.app.vault.rename(activeFile, archivePath);
     this.settings.activeHolidayBudgetPath = "";
-    this.settings.holidayModeEnabled = false;
     await this.saveSettings();
     new Notice(`Archived holiday budget to ${archivePath}`);
   }
@@ -1277,7 +1594,8 @@ class FinanceTrackerPlugin extends Plugin {
 
   buildBudgetProgress(entries, budgets, period, groupBy) {
     const useFull = String(groupBy || "primary").toLowerCase() === "full";
-    const matchingBudgets = budgets.filter((budget) => budget.period === period || (period === "week" && budget.period === "all"));
+    const normalizedPeriod = String(period || "week").toLowerCase();
+    const matchingBudgets = budgets.filter((budget) => budget.period === normalizedPeriod);
     return matchingBudgets
       .map((budget) => {
         const spent = entries
@@ -1485,7 +1803,193 @@ class FinanceTrackerPlugin extends Plugin {
     }
   }
 
+  renderExchangeRates(wrapper, holidayMeta) {
+    const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
+    section.createEl("h4", { text: "Exchange Rates" });
+
+    const flatEntries = Object.entries(holidayMeta?.exchangeRates?.flat || {});
+    const periodEntries = holidayMeta?.exchangeRates?.periods || [];
+
+    if (!flatEntries.length && !periodEntries.length) {
+      section.createDiv({
+        cls: "finance-tracker-empty",
+        text: "No exchange rates configured yet. Add `exchange_rates` or `exchange_rate_periods` to the holiday budget frontmatter.",
+      });
+      return;
+    }
+
+    if (flatEntries.length) {
+      const flatList = section.createDiv({ cls: "finance-tracker-budget-list" });
+      for (const [rateKey, rate] of flatEntries) {
+        const item = flatList.createDiv({ cls: "finance-tracker-budget-card" });
+        const label = rateKey.replace(/_CASH$/i, " CASH");
+        item.createDiv({
+          cls: "finance-tracker-budget-title",
+          text: `Flat rate - 1 ${label} = ${Number(rate).toFixed(4)} ${holidayMeta.currency}`,
+        });
+      }
+    }
+
+    if (periodEntries.length) {
+      const periodList = section.createDiv({ cls: "finance-tracker-budget-list" });
+      for (const period of periodEntries) {
+        const item = periodList.createDiv({ cls: "finance-tracker-budget-card" });
+        const rates = Object.entries(period.rates || {})
+          .map(([rateKey, rate]) => `1 ${rateKey.replace(/_CASH$/i, " CASH")} = ${Number(rate).toFixed(4)} ${holidayMeta.currency}`)
+          .join(" · ");
+        item.createDiv({
+          cls: "finance-tracker-budget-title",
+          text: `${period.start} to ${period.end}`,
+        });
+        item.createDiv({ cls: "finance-tracker-budget-meta", text: rates });
+      }
+    }
+  }
+
   async renderHolidayDashboard(source, el, ctx) {
+    if (typeof el.empty === "function") {
+      el.empty();
+    } else {
+      el.innerHTML = "";
+    }
+
+    try {
+      const config = parseConfigBlock(source);
+      const referenceDate = this.getReferenceDateForSource(ctx.sourcePath);
+      const explicitHoliday = core.normalizeHolidayKey(config.holiday || config.tag || config.track || "");
+      const budgetTarget = String(config.budget || "").trim();
+
+      let holidayMeta = null;
+      let budgetFile = null;
+
+      const sourceFile = this.app.vault.getAbstractFileByPath(ctx.sourcePath || "");
+      if (sourceFile instanceof TFile) {
+        const sourceMeta = await this.readHolidayBudgetFile(sourceFile);
+        if (sourceMeta?.holidayKey) {
+          holidayMeta = sourceMeta;
+          budgetFile = sourceFile;
+        }
+      }
+
+      if (!holidayMeta && budgetTarget) {
+        const targetFile = this.app.vault.getAbstractFileByPath(normalizePath(budgetTarget));
+        if (targetFile instanceof TFile) {
+          budgetFile = targetFile;
+          holidayMeta = await this.readHolidayBudgetFile(targetFile);
+        }
+      }
+
+      if (!holidayMeta && explicitHoliday) {
+        const found = await this.findHolidayBudgetByKey(explicitHoliday);
+        holidayMeta = found?.meta || null;
+        budgetFile = found?.file || null;
+      }
+
+      if (!holidayMeta && this.settings.activeHolidayBudgetPath) {
+        const active = await this.getActiveHolidayContext();
+        if (active) {
+          holidayMeta = active;
+          const activeFile = this.app.vault.getAbstractFileByPath(active.filePath || this.settings.activeHolidayBudgetPath);
+          if (activeFile instanceof TFile) {
+            budgetFile = activeFile;
+          }
+        }
+      }
+
+      const holidayKey = explicitHoliday || holidayMeta?.holidayKey || "";
+      const wrapper = el.createDiv({ cls: "finance-tracker-dashboard" });
+
+      if (!holidayKey) {
+        wrapper.createDiv({
+          cls: "finance-tracker-empty",
+          text: "Set `holiday: 2026/japan` in this code block, or add a `holiday_tag` to the budget note frontmatter.",
+        });
+        return;
+      }
+
+      const startDate = core.parseIsoDate(config.start || holidayMeta?.startDate || "") || "";
+      const configuredEndDate = core.parseIsoDate(config.end || holidayMeta?.endDate || "") || "";
+      const cappedEnd =
+        configuredEndDate && startDate && configuredEndDate >= startDate
+          ? configuredEndDate
+          : configuredEndDate && !startDate
+            ? configuredEndDate
+            : "";
+      const effectiveEnd = cappedEnd && cappedEnd < referenceDate ? cappedEnd : referenceDate;
+      const entries = await this.collectTransactionsForHoliday(holidayKey, {
+        start: startDate || "1900-01-01",
+        end: effectiveEnd || "2999-12-31",
+      });
+      const currency = core.normalizeCurrency(config.currency || holidayMeta?.currency || this.settings.defaultCurrency);
+      const groupBy = String(config.groupby || this.settings.dashboardDefaultGroupBy || "primary").toLowerCase();
+      const entryDates = entries.map((entry) => entry.date).filter(Boolean).sort();
+      const tripStart = startDate || entryDates[0] || referenceDate;
+      const tripEnd = effectiveEnd || entryDates[entryDates.length - 1] || referenceDate;
+      const tripDays =
+        startDate && referenceDate < startDate
+          ? 0
+          : core.daysBetweenInclusive(tripStart, tripEnd);
+      const totalSpent = sumBy(entries, () => true);
+      const accommodationAliases = new Set(["accommodation", "accomodation"]);
+      const averageExcludingAccommodation = tripDays
+        ? Number((sumBy(entries, (entry) => !accommodationAliases.has(core.primaryCategory(entry.category))) / tripDays).toFixed(2))
+        : 0;
+      const averageFoodPerDay = tripDays
+        ? Number((sumBy(entries, (entry) => core.primaryCategory(entry.category) === "food") / tripDays).toFixed(2))
+        : 0;
+      const averageShoppingPerDay = tripDays
+        ? Number((sumBy(entries, (entry) => core.primaryCategory(entry.category) === "shopping") / tripDays).toFixed(2))
+        : 0;
+      const totalBudget = Number(core.parseNumber(config.total_budget || config.totalbudget || holidayMeta?.totalBudget) || 0);
+
+      const header = wrapper.createDiv({ cls: "finance-tracker-header" });
+      header.createEl("h3", {
+        text: config.title || `${toTitleFromHolidayKey(holidayKey)} Holiday Dashboard`,
+      });
+
+      const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
+      const exportButton = headerActions.createEl("button", { text: "Export Holiday CSV" });
+      exportButton.addEventListener("click", async () => {
+        await this.exportEntriesToCsv(entries, `holiday-${holidayKey.replace(/\//g, "-")}-${tripEnd}`);
+      });
+      if (budgetFile instanceof TFile) {
+        const budgetButton = headerActions.createEl("button", { text: "Open Holiday Budget" });
+        budgetButton.addEventListener("click", async () => {
+          await this.app.workspace.getLeaf(true).openFile(budgetFile);
+        });
+      }
+
+      this.renderHolidaySummary(
+        wrapper,
+        {
+          averageExcludingAccommodation,
+          averageFoodPerDay,
+          averageShoppingPerDay,
+          bookedTotal: holidayMeta?.totals?.booked || 0,
+          paidTotal: holidayMeta?.totals?.paid || 0,
+          plannedTotal: holidayMeta?.totals?.planned || 0,
+          totalBudget,
+          totalSpent,
+          tripDays,
+        },
+        currency
+      );
+
+      const grouped = core.groupTransactionsByCategory(entries, groupBy);
+      this.renderPieChart(wrapper, grouped, currency, Number(this.settings.dashboardSliceLabelThreshold || 0.08));
+      this.renderPlannedExpenses(wrapper, holidayMeta?.plannedExpenses || [], currency);
+      this.renderExchangeRates(wrapper, holidayMeta);
+    } catch (error) {
+      const wrapper = el.createDiv({ cls: "finance-tracker-dashboard" });
+      wrapper.createDiv({
+        cls: "finance-tracker-empty",
+        text: `Holiday dashboard failed to render: ${error.message}`,
+      });
+      console.error("[finance-tracker] holiday dashboard render failed", error);
+    }
+  }
+
+  async renderDailyBudgetCheck(source, el, ctx) {
     if (typeof el.empty === "function") {
       el.empty();
     } else {
@@ -1494,106 +1998,36 @@ class FinanceTrackerPlugin extends Plugin {
 
     const config = parseConfigBlock(source);
     const referenceDate = this.getReferenceDateForSource(ctx.sourcePath);
-    const explicitHoliday = core.normalizeHolidayKey(config.holiday || config.tag || config.track || "");
-    const budgetTarget = String(config.budget || "").trim();
-
-    let holidayMeta = null;
-    let budgetFile = null;
-
-    if (budgetTarget) {
-      const targetFile = this.app.vault.getAbstractFileByPath(normalizePath(budgetTarget));
-      if (targetFile instanceof TFile) {
-        budgetFile = targetFile;
-        holidayMeta = await this.readHolidayBudgetFile(targetFile);
-      }
-    }
-
-    if (!holidayMeta && explicitHoliday) {
-      const found = await this.findHolidayBudgetByKey(explicitHoliday);
-      holidayMeta = found?.meta || null;
-      budgetFile = found?.file || null;
-    }
-
-    if (!holidayMeta && this.settings.holidayModeEnabled) {
-      const active = await this.getActiveHolidayContext();
-      if (active) {
-        holidayMeta = active;
-        const activeFile = this.app.vault.getAbstractFileByPath(active.filePath || this.settings.activeHolidayBudgetPath);
-        if (activeFile instanceof TFile) {
-          budgetFile = activeFile;
-        }
-      }
-    }
-
-    const holidayKey = explicitHoliday || holidayMeta?.holidayKey || "";
-    const wrapper = el.createDiv({ cls: "finance-tracker-dashboard" });
-
-    if (!holidayKey) {
-      wrapper.createDiv({
-        cls: "finance-tracker-empty",
-        text: "Set `holiday: 2026/japan` in this code block, or select an active holiday budget with a holiday_tag in its frontmatter.",
-      });
-      return;
-    }
-
-    const startDate = core.parseIsoDate(config.start || holidayMeta?.startDate || "") || "";
-    const cappedEnd = core.parseIsoDate(config.end || holidayMeta?.endDate || "") || "";
-    const effectiveEnd = cappedEnd && cappedEnd < referenceDate ? cappedEnd : referenceDate;
-    const entries = await this.collectTransactionsForHoliday(holidayKey, {
-      start: startDate || "1900-01-01",
-      end: effectiveEnd || "2999-12-31",
+    const range = core.toPeriodRange({
+      period: config.period || this.settings.budgetCheckPeriod || "week",
+      referenceDate,
+      start: config.start,
+      end: config.end,
+      weekStartsOn: this.settings.weekStartsOn,
     });
-    const currency = core.normalizeCurrency(config.currency || holidayMeta?.currency || this.settings.defaultCurrency);
-    const groupBy = String(config.groupby || this.settings.dashboardDefaultGroupBy || "primary").toLowerCase();
-    const entryDates = entries.map((entry) => entry.date).filter(Boolean).sort();
-    const tripStart = startDate || entryDates[0] || referenceDate;
-    const tripEnd = effectiveEnd || entryDates[entryDates.length - 1] || referenceDate;
-    const tripDays = core.daysBetweenInclusive(tripStart, tripEnd);
-    const totalSpent = sumBy(entries, () => true);
-    const accommodationAliases = new Set(["accommodation", "accomodation"]);
-    const averageExcludingAccommodation = Number(
-      (sumBy(entries, (entry) => !accommodationAliases.has(core.primaryCategory(entry.category))) / tripDays).toFixed(2)
-    );
-    const averageFoodPerDay = Number((sumBy(entries, (entry) => core.primaryCategory(entry.category) === "food") / tripDays).toFixed(2));
-    const averageShoppingPerDay = Number((sumBy(entries, (entry) => core.primaryCategory(entry.category) === "shopping") / tripDays).toFixed(2));
-    const totalBudget = Number(core.parseNumber(config.total_budget || config.totalbudget || holidayMeta?.totalBudget) || 0);
 
+    const currency = core.normalizeCurrency(config.currency || this.settings.defaultCurrency);
+    const groupBy = String(config.groupby || "full").toLowerCase();
+    const entries = await this.collectTransactionsForRange({
+      ...range,
+      end: referenceDate < range.end ? referenceDate : range.end,
+    });
+    const budgets = await this.loadBudgets("default");
+    const budgetProgress = this.buildBudgetProgress(entries, budgets, range.period, groupBy);
+
+    const wrapper = el.createDiv({ cls: "finance-tracker-dashboard" });
     const header = wrapper.createDiv({ cls: "finance-tracker-header" });
     header.createEl("h3", {
-      text: config.title || `${toTitleFromHolidayKey(holidayKey)} Holiday Dashboard`,
+      text: config.title || `Budget Check: ${range.start} to ${range.end}`,
     });
 
     const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
-    const exportButton = headerActions.createEl("button", { text: "Export Holiday CSV" });
-    exportButton.addEventListener("click", async () => {
-      await this.exportEntriesToCsv(entries, `holiday-${holidayKey.replace(/\//g, "-")}-${tripEnd}`);
+    const budgetsButton = headerActions.createEl("button", { text: "Budgets" });
+    budgetsButton.addEventListener("click", async () => {
+      await this.openDefaultBudgetNote();
     });
-    if (budgetFile instanceof TFile) {
-      const budgetButton = headerActions.createEl("button", { text: "Open Holiday Budget" });
-      budgetButton.addEventListener("click", async () => {
-        await this.app.workspace.getLeaf(true).openFile(budgetFile);
-      });
-    }
 
-    this.renderHolidaySummary(
-      wrapper,
-      {
-        averageExcludingAccommodation,
-        averageFoodPerDay,
-        averageShoppingPerDay,
-        bookedTotal: holidayMeta?.totals?.booked || 0,
-        paidTotal: holidayMeta?.totals?.paid || 0,
-        plannedTotal: holidayMeta?.totals?.planned || 0,
-        totalBudget,
-        totalSpent,
-        tripDays,
-      },
-      currency
-    );
-
-    const grouped = core.groupTransactionsByCategory(entries, groupBy);
-    this.renderPieChart(wrapper, grouped, currency, Number(this.settings.dashboardSliceLabelThreshold || 0.08));
-    this.renderPlannedExpenses(wrapper, holidayMeta?.plannedExpenses || [], currency);
+    this.renderBudgets(wrapper, budgetProgress, currency);
   }
 
   async renderDashboard(source, el, ctx) {
@@ -1610,6 +2044,7 @@ class FinanceTrackerPlugin extends Plugin {
       referenceDate,
       start: config.start,
       end: config.end,
+      weekStartsOn: this.settings.weekStartsOn,
     });
     const currency = core.normalizeCurrency(config.currency || this.settings.defaultCurrency);
     const groupBy = String(config.groupby || this.settings.dashboardDefaultGroupBy || "primary").toLowerCase();
@@ -1629,7 +2064,7 @@ class FinanceTrackerPlugin extends Plugin {
 
     const budgetsButton = headerActions.createEl("button", { text: "Budgets" });
     budgetsButton.addEventListener("click", async () => {
-      await this.openBudgetNote();
+      await this.openDefaultBudgetNote();
     });
 
     const entries = await this.collectTransactionsForRange(range);
@@ -1638,7 +2073,7 @@ class FinanceTrackerPlugin extends Plugin {
     const grouped = core.groupTransactionsByCategory(entries, groupBy);
     this.renderPieChart(wrapper, grouped, currency, Number(this.settings.dashboardSliceLabelThreshold || 0.08));
 
-    const budgets = await this.loadBudgets();
+    const budgets = await this.loadBudgets("default");
     const budgetProgress = this.buildBudgetProgress(entries, budgets, range.period, groupBy);
     this.renderBudgets(wrapper, budgetProgress, currency);
   }
@@ -1666,7 +2101,6 @@ class HolidayBudgetModal extends Modal {
   }
 
   async chooseFile(file) {
-    this.plugin.settings.holidayModeEnabled = true;
     this.plugin.settings.activeHolidayBudgetPath = file.path;
     await this.plugin.saveSettings();
     await this.app.workspace.getLeaf(true).openFile(file);
@@ -2010,6 +2444,38 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
           })
       );
 
+    new Setting(containerEl)
+      .setName("Week starts on")
+      .setDesc("Used when the plugin calculates week and fortnight ranges.")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("monday", "Monday")
+          .addOption("sunday", "Sunday")
+          .setValue(this.plugin.settings.weekStartsOn || DEFAULT_SETTINGS.weekStartsOn)
+          .onChange(async (value) => {
+            this.plugin.settings.weekStartsOn = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Budget check period")
+      .setDesc("Default period used by the daily budget checker.")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("week", "1 week")
+          .addOption("fortnight", "1 fortnight")
+          .addOption("month", "Monthly")
+          .addOption("bimonth", "Bi-monthly")
+          .addOption("quarter", "Quarterly")
+          .addOption("year", "Yearly")
+          .setValue(this.plugin.settings.budgetCheckPeriod || DEFAULT_SETTINGS.budgetCheckPeriod)
+          .onChange(async (value) => {
+            this.plugin.settings.budgetCheckPeriod = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
     addSection("Files", "Choose where your normal and holiday budget notes are stored.");
 
     new Setting(containerEl)
@@ -2024,7 +2490,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Budget archive folder")
-      .setDesc("Holiday budgets are moved here when you end holiday mode.")
+      .setDesc("Holiday budgets are moved here when you archive them from the settings page.")
       .addText((text) =>
         text.setPlaceholder("Utility/Budgets/Archive").setValue(this.plugin.settings.budgetArchiveFolderPath).onChange(async (value) => {
           this.plugin.settings.budgetArchiveFolderPath = value.trim() || DEFAULT_SETTINGS.budgetArchiveFolderPath;
@@ -2038,21 +2504,17 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
       await this.plugin.openBudgetNote();
     });
 
-    addSection("Holiday Mode", "Enable a separate holiday budget, search existing holiday budgets, create a new one if needed, and archive it when the trip ends.");
+    addSection(
+      "Holiday Budgets",
+      "Create, select, and archive holiday budgets here. Spending is treated as holiday spending automatically when the note date falls inside a holiday budget's start and end dates."
+    );
 
-    new Setting(containerEl)
-      .setName("Holiday mode")
-      .setDesc(this.plugin.settings.activeHolidayBudgetPath || "No active holiday budget selected.")
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.holidayModeEnabled).onChange(async (value) => {
-          this.plugin.settings.holidayModeEnabled = value;
-          if (!value) {
-            this.plugin.settings.activeHolidayBudgetPath = "";
-          }
-          await this.plugin.saveSettings();
-          this.display();
-        })
-      );
+    containerEl.createEl("p", {
+      cls: "finance-tracker-settings-section-copy",
+      text: this.plugin.settings.activeHolidayBudgetPath
+        ? `Selected holiday budget: ${this.plugin.settings.activeHolidayBudgetPath}`
+        : "No holiday budget currently selected.",
+    });
 
     const holidayActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
     const selectHolidayButton = holidayActions.createEl("button", { text: "Select Or Create Holiday" });
@@ -2061,7 +2523,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
         this.display();
       }).open();
     });
-    const archiveHolidayButton = holidayActions.createEl("button", { text: "End Holiday And Archive" });
+    const archiveHolidayButton = holidayActions.createEl("button", { text: "Archive Selected Holiday" });
     archiveHolidayButton.addEventListener("click", async () => {
       await this.plugin.archiveActiveHolidayBudget();
       this.display();

@@ -16,7 +16,21 @@ function normalizeWhitespace(value) {
 
 function normalizeCurrency(value, fallback = "AUD") {
   const cleaned = String(value || "").toUpperCase().replace(/[^A-Z]/g, "");
-  return cleaned || fallback;
+  const aliases = {
+    AUSD: "AUD",
+    AUD: "AUD",
+    CAD: "CAD",
+    CNY: "CNY",
+    EUR: "EUR",
+    GBP: "GBP",
+    HKD: "HKD",
+    JPY: "JPY",
+    NZD: "NZD",
+    SGD: "SGD",
+    USD: "USD",
+    YEN: "JPY",
+  };
+  return aliases[cleaned] || cleaned || fallback;
 }
 
 function parseNumber(value) {
@@ -51,6 +65,52 @@ function formatCurrency(amount, currency = "AUD") {
   }
 }
 
+function formatCurrencyWithCode(amount, currency = "AUD") {
+  const numeric = Number(amount || 0);
+  const code = normalizeCurrency(currency);
+  const symbols = {
+    AUD: "$",
+    CAD: "$",
+    CNY: "¥",
+    EUR: "€",
+    GBP: "£",
+    HKD: "$",
+    JPY: "¥",
+    NZD: "$",
+    SGD: "$",
+    USD: "$",
+  };
+  const fractionDigits = code === "JPY" ? 0 : 2;
+  const formattedNumber = new Intl.NumberFormat("en-AU", {
+    maximumFractionDigits: fractionDigits,
+    minimumFractionDigits: fractionDigits,
+  }).format(numeric);
+  const symbol = symbols[code];
+  if (symbol) {
+    return `${symbol}${formattedNumber} ${code}`;
+  }
+  return `${code} ${formattedNumber}`;
+}
+
+function parseCurrencyDescriptor(value, fallback = "AUD") {
+  const raw = String(value || "").trim().toUpperCase();
+  const isCash = /\bCASH\b/.test(raw);
+  const base = raw.replace(/\bCASH\b/g, " ").trim();
+  const currencyMatch = base.match(/\b([A-Z]{3,}|YEN)\b/);
+  const currency = normalizeCurrency(currencyMatch ? currencyMatch[1] : fallback, fallback);
+  return {
+    currency,
+    isCash,
+    rateKey: isCash ? `${currency}_CASH` : currency,
+  };
+}
+
+function formatOriginalCurrencyLabel(amount, descriptor) {
+  const parsed = typeof descriptor === "string" ? parseCurrencyDescriptor(descriptor, "") : descriptor || {};
+  const label = formatCurrencyWithCode(amount, parsed.currency || "AUD");
+  return parsed.isCash ? `${label} CASH` : label;
+}
+
 function pad(value) {
   return String(value).padStart(2, "0");
 }
@@ -77,6 +137,69 @@ function addDays(iso, count) {
   if (!date) return null;
   date.setDate(date.getDate() + count);
   return todayIsoLocal(date);
+}
+
+function startOfWeek(iso, weekStartsOn = "monday") {
+  const date = isoToDate(iso);
+  if (!date) return null;
+  const weekStartIndex = String(weekStartsOn || "monday").toLowerCase() === "sunday" ? 0 : 1;
+  const diff = (date.getDay() - weekStartIndex + 7) % 7;
+  date.setDate(date.getDate() - diff);
+  return todayIsoLocal(date);
+}
+
+function endOfQuarter(iso) {
+  const date = isoToDate(iso);
+  if (!date) return null;
+  const quarterStartMonth = Math.floor(date.getMonth() / 3) * 3;
+  return todayIsoLocal(new Date(date.getFullYear(), quarterStartMonth + 3, 0));
+}
+
+function startOfQuarter(iso) {
+  const date = isoToDate(iso);
+  if (!date) return null;
+  const quarterStartMonth = Math.floor(date.getMonth() / 3) * 3;
+  return todayIsoLocal(new Date(date.getFullYear(), quarterStartMonth, 1));
+}
+
+function startOfYear(iso) {
+  const date = isoToDate(iso);
+  if (!date) return null;
+  return todayIsoLocal(new Date(date.getFullYear(), 0, 1));
+}
+
+function endOfYear(iso) {
+  const date = isoToDate(iso);
+  if (!date) return null;
+  return todayIsoLocal(new Date(date.getFullYear(), 11, 31));
+}
+
+function startOfBiMonth(iso) {
+  const date = isoToDate(iso);
+  if (!date) return null;
+  const month = date.getMonth();
+  const biMonthStart = month % 2 === 0 ? month : month - 1;
+  return todayIsoLocal(new Date(date.getFullYear(), biMonthStart, 1));
+}
+
+function endOfBiMonth(iso) {
+  const date = isoToDate(iso);
+  if (!date) return null;
+  const month = date.getMonth();
+  const biMonthStart = month % 2 === 0 ? month : month - 1;
+  return todayIsoLocal(new Date(date.getFullYear(), biMonthStart + 2, 0));
+}
+
+function startOfFortnight(iso, weekStartsOn = "monday") {
+  const anchor = startOfWeek(iso, weekStartsOn);
+  const anchorDate = isoToDate(anchor);
+  if (!anchorDate) return null;
+  const yearStart = todayIsoLocal(new Date(anchorDate.getFullYear(), 0, 1));
+  const firstPeriodStart = startOfWeek(yearStart, weekStartsOn);
+  const firstDate = isoToDate(firstPeriodStart);
+  const diffDays = Math.floor((anchorDate.getTime() - firstDate.getTime()) / (24 * 60 * 60 * 1000));
+  const fortnightIndex = Math.floor(diffDays / 14);
+  return addDays(firstPeriodStart, fortnightIndex * 14);
 }
 
 function endOfMonth(iso) {
@@ -227,6 +350,10 @@ function parseTransactionLine(line, noteDate, filePath, options = {}, childLines
   const category = holidayContext.holidayCategory || "uncategorized";
 
   const currency = normalizeCurrency(options.defaultCurrency || "AUD");
+  const visibleSection = stripFirstTag(text).replace(/^\s*-\s*(?:\[[^\]]\]\s*)?/, "").trim();
+  const originalSide = visibleSection.includes(":") ? visibleSection.split(":")[0].trim() : "";
+  const originalAmount = extractVisibleAmount(`- ${originalSide}`);
+  const originalDescriptor = parseCurrencyDescriptor(originalSide, currency);
   const merchant = normalizeWhitespace(childLines[0] || "");
   const note = normalizeWhitespace(childLines.slice(1).join(" | "));
   const transactionDate = noteDate || extractNoteDate("", filePath);
@@ -243,6 +370,9 @@ function parseTransactionLine(line, noteDate, filePath, options = {}, childLines
     holidayName: holidayContext.holidayName,
     holidayYear: holidayContext.holidayYear,
     merchant,
+    originalAmount: Number.isFinite(originalAmount) ? Number(Number(originalAmount).toFixed(2)) : null,
+    originalCurrency: originalSide ? originalDescriptor.currency : "",
+    originalRateKey: originalSide ? originalDescriptor.rateKey : "",
     note,
     rawLine: text,
     source: "",
@@ -309,7 +439,18 @@ function buildTransactionBlock(expense, settings = {}) {
   const amount = Number(Number(expense.amount || 0).toFixed(2));
 
   const tag = buildCategoryTag(category, expense.holidayKey || "");
-  const visibleLabel = formatCurrency(amount, currency);
+  const originalDescriptor = {
+    currency: normalizeCurrency(expense.originalCurrency || "", ""),
+    isCash: /_CASH$/i.test(String(expense.originalRateKey || "")),
+    rateKey: String(expense.originalRateKey || ""),
+  };
+  const shouldShowConverted =
+    Number.isFinite(expense.originalAmount) &&
+    originalDescriptor.currency &&
+    originalDescriptor.currency !== currency;
+  const visibleLabel = shouldShowConverted
+    ? `${formatOriginalCurrencyLabel(expense.originalAmount, originalDescriptor)} : ${formatCurrencyWithCode(amount, currency)}`
+    : formatCurrency(amount, currency);
   const lines = [`\t- ${visibleLabel} ${tag}`.trimEnd()];
 
   if (merchant) {
@@ -382,22 +523,40 @@ function insertTransactionIntoDailyNote(content, expense, settings = {}) {
   return `${lines.join("\n").replace(/\n{4,}/g, "\n\n\n")}\n`;
 }
 
-function toPeriodRange({ period = "week", referenceDate, start, end }) {
+function toPeriodRange({ period = "week", referenceDate, start, end, weekStartsOn = "monday" }) {
   const normalizedPeriod = String(period || "week").toLowerCase();
   if (parseIsoDate(start) && parseIsoDate(end)) {
     return { period: normalizedPeriod, start: parseIsoDate(start), end: parseIsoDate(end) };
   }
 
   const anchor = parseIsoDate(referenceDate) || todayIsoLocal();
+  if (normalizedPeriod === "year" || normalizedPeriod === "yearly" || normalizedPeriod === "annual") {
+    return { period: "year", start: startOfYear(anchor), end: endOfYear(anchor) };
+  }
+
+  if (normalizedPeriod === "quarter" || normalizedPeriod === "quarterly") {
+    return { period: "quarter", start: startOfQuarter(anchor), end: endOfQuarter(anchor) };
+  }
+
+  if (normalizedPeriod === "bimonth" || normalizedPeriod === "bi-month" || normalizedPeriod === "bi-monthly") {
+    return { period: "bimonth", start: startOfBiMonth(anchor), end: endOfBiMonth(anchor) };
+  }
+
   if (normalizedPeriod === "month") {
     return { period: normalizedPeriod, start: anchor.slice(0, 8) + "01", end: endOfMonth(anchor) };
+  }
+
+  if (normalizedPeriod === "fortnight" || normalizedPeriod === "2-weeks" || normalizedPeriod === "2weeks") {
+    const periodStart = startOfFortnight(anchor, weekStartsOn);
+    return { period: "fortnight", start: periodStart, end: addDays(periodStart, 13) };
   }
 
   if (normalizedPeriod === "day") {
     return { period: normalizedPeriod, start: anchor, end: anchor };
   }
 
-  return { period: "week", start: anchor, end: addDays(anchor, 6) };
+  const periodStart = startOfWeek(anchor, weekStartsOn);
+  return { period: "week", start: periodStart, end: addDays(periodStart, 6) };
 }
 
 function isDateInRange(date, range) {
@@ -490,7 +649,15 @@ function parseBudgets(content, fallbackCurrency = "AUD") {
         category,
         currency: normalizeCurrency(row.currency || fallbackCurrency, fallbackCurrency),
         limit: Number(limit.toFixed(2)),
-        period: ["day", "week", "month"].includes(period) ? period : "week",
+        period: ["day", "week", "fortnight", "month", "bimonth", "quarter", "year"].includes(period)
+          ? period
+          : period === "bi-month" || period === "bi-monthly"
+            ? "bimonth"
+            : period === "quarterly"
+              ? "quarter"
+              : period === "yearly" || period === "annual"
+                ? "year"
+              : "week",
       });
     }
   }
@@ -542,6 +709,8 @@ module.exports = {
   extractCategoryFromLogSpendingTag,
   extractNoteDate,
   formatCurrency,
+  formatCurrencyWithCode,
+  formatOriginalCurrencyLabel,
   formatPlainNumber,
   groupTransactionsByCategory,
   insertTransactionIntoDailyNote,
@@ -549,6 +718,7 @@ module.exports = {
   normalizeCategoryPath,
   normalizeCurrency,
   normalizeHolidayKey,
+  parseCurrencyDescriptor,
   parseBudgets,
   parseHolidayTagContext,
   parseIsoDate,

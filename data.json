@@ -6,7 +6,6 @@
   "budgetsFolderPath": "Utility/Budgets",
   "budgetArchiveFolderPath": "Utility/Budgets/Archive",
   "defaultBudgetNoteName": "💸 Budgets.md",
-  "holidayModeEnabled": true,
   "activeHolidayBudgetPath": "Utility/Budgets/Japan Mid-Year Budget.md",
   "categoryOptions": [
     "groceries",
