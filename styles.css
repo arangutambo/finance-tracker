@@ -131,13 +131,77 @@
 }
 
 .finance-tracker-planned-list {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
 }
 
 .finance-tracker-budget-card {
   padding: 12px 14px;
+}
+
+.finance-tracker-planned-details {
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.finance-tracker-planned-details:last-child {
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.finance-tracker-planned-summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 12px 0;
+  display: block;
+}
+
+.finance-tracker-planned-summary::-webkit-details-marker {
+  display: none;
+}
+
+.finance-tracker-planned-summary::before {
+  content: "";
+}
+
+.finance-tracker-planned-summary-title {
+  font-weight: 600;
+  font-size: 1.02em;
+  padding-left: 14px;
+  position: relative;
+}
+
+.finance-tracker-planned-summary-title::before {
+  content: "•";
+  position: absolute;
+  left: 0;
+  color: var(--text-muted);
+}
+
+.finance-tracker-planned-content {
+  padding: 0 0 12px 30px;
+}
+
+.finance-tracker-planned-details .finance-tracker-budget-list {
+  gap: 6px;
+}
+
+.finance-tracker-planned-details.is-complete {
+  border-top-color: rgba(47, 133, 90, 0.45);
+  border-bottom-color: rgba(47, 133, 90, 0.45);
+}
+
+.finance-tracker-planned-details.is-complete .finance-tracker-planned-summary-title {
+  color: #2f855a;
+}
+
+.finance-tracker-planned-details.is-complete .finance-tracker-planned-summary-title::before {
+  color: #2f855a;
 }
 
 .finance-tracker-budget-title {

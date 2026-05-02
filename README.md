@@ -1,6 +1,6 @@
 # Finance Tracker
 
-Finance Tracker is an Obsidian plugin for logging spending from Apple Shortcuts straight into your daily note, keeping the `#log/spending` total updated, and turning those notes into weekly budget and category dashboards.
+Finance Tracker is an Obsidian plugin for logging spending from Apple Shortcuts straight into your daily note, keeping the `#log/spending` total updated, and turning those notes into spending, holiday, and savings-goal dashboards.
 
 ## What it does
 
@@ -10,17 +10,32 @@ Finance Tracker is an Obsidian plugin for logging spending from Apple Shortcuts 
 - Writes entries as plain markdown using `#log/spending/{{category}}` tags.
 - Renders a weekly `finance-dashboard` code block with a pie chart and budget progress.
 - Renders a dedicated `holiday-dashboard` code block for trip spending and holiday budget progress.
+- Renders a `savings-dashboard` code block for savings goals and holiday funding.
+- Adds a command to write flat or period-based exchange rates into a holiday budget note.
+- Adds a command to create standalone savings goal notes.
 - Exports parsed transactions to CSV.
 
 ## Entry format
 
-New payments are written in this shape:
+New spending payments are written in this shape:
 
 ```md
-## Spending
+## Finance
 - [ ] #log/spending 18.48
 	- $18.48 #log/spending/food/groceries
 		- Woolworths
+```
+
+You can also track income and savings-goal activity in the same section:
+
+```md
+## Finance
+- $1200 #log/income/pay
+	- Salary
+- $300 #log/income/japanmidyear
+	- Transfer to Japan fund
+- $90 #log/spending/goal/rainy-day-fund/emergency
+	- Car battery
 ```
 
 Travel and historical notes using paths such as `#log/25/japan/spending/food/snacks` are also parsed by the dashboard.
@@ -31,9 +46,10 @@ Holiday notes can use tags like:
 #log/spending/2026/japan/food/restaurants
 #log/spending/2026/japan/accommodation
 #log/spending/2026/japan/shopping
+#log/spending/26/japanmidyear/planned/flights
 ```
 
-The holiday dashboard treats `2026/japan` as the holiday key and still groups the spending by the real category like `food`, `accommodation`, or `shopping`.
+The plugin also parses older travel-note styles like `#log/25/japan/spending/food/snacks` and planned-payment tags like `#log/spending/26/japanmidyear/planned/flights`.
 
 ## Apple Shortcuts URL
 
@@ -89,6 +105,24 @@ groupBy: full
 
 This block evaluates your budgeting progress over the current budget period and highlights overspent categories in red.
 It uses your configured `Week starts on` setting and your chosen `Budget check period` setting by default, so it can check a week, fortnight, month, bi-month, quarter, or year.
+If the daily note falls inside a holiday budget date range, this block also shows `Can Spend / Day` from the active holiday plan.
+If you mark savings goals as active, it also shows the required savings target for the current period.
+
+## Savings dashboard
+
+Add this code block to a savings goal note or holiday budget note:
+
+```savings-dashboard
+```
+
+It shows:
+
+- target amount
+- current saved
+- amount remaining
+- required this period
+- saved percentage
+- current period contributions
 
 ## Holiday dashboard
 
@@ -107,11 +141,17 @@ Supported options:
 
 The holiday dashboard shows:
 
-- total spent out of the whole holiday budget
+- holiday budget
+- total spent
+- total spent as a percentage of the holiday budget
+- remaining amount after planned and booked commitments
+- can spend per day based on remaining amount and remaining trip days
+- trip days so far
 - average spend per day excluding accommodation
-- average food spend per day so far
-- average shopping spend per day so far
-- planned, booked, and prepaid trip costs from the holiday budget note
+- average accommodation spend per day
+- average transport spend per day
+- average food spend per day
+- foldable planned-expense items with their matched payment logs
 
 ## Budgets
 
@@ -127,13 +167,20 @@ Example:
 | All Spending | all | 450 | week | AUD |
 ```
 
-Holiday budget notes can also include frontmatter and a planned-expenses table. Example:
+Holiday budget notes include frontmatter, savings fields, and a planned-expenses table. Example:
 
 ```md
 ---
 holiday_name: Japan 2026
 holiday_tag: 2026/japan
 total_budget: 5000
+savings_goal_key: japanmidyear
+savings_goal_amount: 5000
+savings_starting_balance: 0
+savings_due_date: 2026-09-10
+active_savings_goal: true
+carry_missed_savings: false
+savings_display_mode: dual-phase
 currency: AUD
 start_date: 2026-09-10
 end_date: 2026-09-24
@@ -141,11 +188,13 @@ exchange_rates: JPY=0.0097, JPY CASH=0.0100, USD=1.53
 exchange_rate_periods: 2026-09-10..2026-09-14:JPY=0.0098, JPY CASH=0.0101; 2026-09-15..2026-09-24:JPY=0.0095
 ---
 
-| Item | Category | Planned | Booked | Paid | Notes |
-| --- | --- | ---: | ---: | ---: | --- |
-| Flights | flights | 1200 | 1200 | 1200 | |
-| Accommodation | accommodation | 1800 | 900 | 900 | First half booked |
-| Recreation | recreation | 700 | 0 | 0 | |
+| Item | Category | Planned | Booked | Fully Paid |
+| --- | --- | ---: | ---: | --- |
+| Flights | flights | 1200 | 1200 | false |
+| Accommodation | accommodation | 1800 | 900 | false |
+| Recreation | recreation | 700 | 0 | false |
+| Transport | transport | 250 | 0 | false |
+| Shopping | shopping | 400 | 0 | false |
 ```
 
 When you create a new holiday from settings, the modal now lets you set:
@@ -161,7 +210,13 @@ Holiday detection:
 - the plugin treats spending as holiday spending automatically when the transaction date falls between a holiday budget note's `start_date` and `end_date`
 - holiday budgets can still be created, selected, and archived from settings
 
-New holiday notes now seed planned expenses with only `flights`, `accommodation`, and `recreation`.
+New holiday notes seed planned expenses with `flights`, `accommodation`, `recreation`, `transport`, and `shopping`.
+
+Standalone savings goal notes:
+
+- Use the command palette action `Create savings goal`
+- Log contributions with `#log/income/{goal_key}`
+- Log non-holiday withdrawals with `#log/spending/goal/{goal_key}/{category}`
 
 Exchange rate rules:
 
@@ -191,6 +246,14 @@ Example:
 - `exchange_rates: JPY=0.0097, JPY CASH=0.0100, USD=1.53` means the same holiday can convert card yen, cash yen, and USD into the holiday budget currency
 - `exchange_rate_periods: 2026-06-18..2026-06-24:JPY=0.0098, JPY CASH=0.0101; 2026-06-25..2026-07-02:JPY=0.0095` uses different rates during different parts of the trip
 
+Exchange-rate command:
+
+- Run `Add holiday exchange rate` from the command palette.
+- Pick the holiday budget note you want to update.
+- Choose `Whole holiday` for a flat rate or `Date range` for a period override.
+- Enter the source currency, target currency, and rate.
+- Period rates are written into `exchange_rate_periods`, and flat rates are written into `exchange_rates`.
+
 When a captured holiday spend arrives in another currency and a matching exchange rate exists, the daily note line is written like:
 
 ```md
@@ -209,9 +272,25 @@ If no currency is supplied, the plugin assumes your normal default currency, whi
 
 Planned expense columns:
 
-- `Planned`: the target amount you expect that item to cost
-- `Booked`: the amount you have committed or reserved but not necessarily paid yet
-- `Paid`: the amount already paid out of your account
+- `Planned`: the fallback amount used for holiday planning
+- `Booked`: the committed amount that overrides `Planned` once it is above `0`
+- `Fully Paid`: derived by the dashboard when the sum of matching `#log/.../spending/planned/...` payments equals the `Booked` amount
+
+Planned-payment rules:
+
+- Log planned holiday payments in the daily note with tags like `#log/spending/26/japanmidyear/planned/flights`
+- These planned-payment entries are used by the holiday dashboard only
+- They do not count toward normal weekly, monthly, quarterly, or yearly budget checks
+
+Savings frontmatter:
+
+- `active_savings_goal: true|false`
+- `carry_missed_savings: true|false`
+- `savings_display_mode: standard|dual-phase`
+- `savings_goal_key`
+- `savings_goal_amount`
+- `savings_starting_balance`
+- `savings_due_date`
 
 ## Settings
 

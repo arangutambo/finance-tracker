@@ -34,6 +34,7 @@ test("parses lowercase travel spending tags like japan trip notes", () => {
   assert.equal(entries.length, 1);
   assert.equal(entries[0].amount, 22.15);
   assert.equal(entries[0].category, "food/snacks");
+  assert.equal(entries[0].holidayKey, "25/japan");
 });
 
 test("parses holiday spending tags without polluting the category path", () => {
@@ -52,6 +53,60 @@ test("parses holiday spending tags without polluting the category path", () => {
   assert.equal(entries[0].category, "food/restaurants");
   assert.equal(entries[0].holidayKey, "2026/japan");
   assert.equal(entries[0].merchant, "Ichiran");
+});
+
+test("parses planned holiday payment tags separately from real spending", () => {
+  const content = `
+## Spending
+- $671.49 #log/spending/26/japanmidyear/planned/flights
+\t- Jetstar return
+`.trim();
+
+  const entries = core.parseTransactionsFromNoteContent(content, "Journal/Periodics/1. Daily/2026/04/2026-04-30.md", {
+    defaultCurrency: "AUD",
+  });
+
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].holidayKey, "26/japanmidyear");
+  assert.equal(entries[0].isPlannedExpense, true);
+  assert.equal(entries[0].plannedCategory, "flights");
+  assert.equal(entries[0].category, "flights");
+});
+
+test("parses finance-section income contributions", () => {
+  const content = `
+## Finance
+- $300 #log/income/japanmidyear
+\t- Savings transfer
+`.trim();
+
+  const entries = core.parseTransactionsFromNoteContent(content, "Journal/Periodics/1. Daily/2026/05/2026-05-01.md", {
+    defaultCurrency: "AUD",
+    financeHeading: "## Finance",
+  });
+
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].entryType, "income");
+  assert.equal(entries[0].goalKey, "japanmidyear");
+  assert.equal(entries[0].isGoalContribution, true);
+});
+
+test("parses generic savings-goal withdrawals", () => {
+  const content = `
+## Finance
+- $120 #log/spending/goal/rainy-day-fund/emergency
+\t- Tyre replacement
+`.trim();
+
+  const entries = core.parseTransactionsFromNoteContent(content, "Journal/Periodics/1. Daily/2026/05/2026-05-01.md", {
+    defaultCurrency: "AUD",
+    financeHeading: "## Finance",
+  });
+
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].entryType, "goal-withdrawal");
+  assert.equal(entries[0].goalKey, "rainy-day-fund");
+  assert.equal(entries[0].isGoalWithdrawal, true);
 });
 
 test("inserts a new transaction and updates the daily spending total", () => {
@@ -195,6 +250,46 @@ test("parses fortnight budget periods", () => {
   assert.equal(budgets[0].period, "fortnight");
 });
 
+test("orders daily budget sections from a weekly base period", () => {
+  assert.deepEqual(core.getDailyBudgetSectionPeriods("week"), [
+    "week",
+    "fortnight",
+    "month",
+    "quarter",
+    "year",
+  ]);
+});
+
+test("orders daily budget sections from a fortnight base period", () => {
+  assert.deepEqual(core.getDailyBudgetSectionPeriods("fortnight"), [
+    "fortnight",
+    "month",
+    "quarter",
+    "year",
+  ]);
+});
+
+test("orders daily budget sections from a monthly base period", () => {
+  assert.deepEqual(core.getDailyBudgetSectionPeriods("month"), [
+    "month",
+    "quarter",
+    "year",
+  ]);
+});
+
+test("allows shorter budget periods to roll into larger daily sections", () => {
+  assert.equal(core.canRollBudgetPeriodIntoSection("week", "fortnight"), true);
+  assert.equal(core.canRollBudgetPeriodIntoSection("week", "month"), true);
+  assert.equal(core.canRollBudgetPeriodIntoSection("fortnight", "month"), true);
+  assert.equal(core.canRollBudgetPeriodIntoSection("month", "quarter"), true);
+});
+
+test("does not roll larger budget periods into smaller daily sections", () => {
+  assert.equal(core.canRollBudgetPeriodIntoSection("fortnight", "week"), false);
+  assert.equal(core.canRollBudgetPeriodIntoSection("month", "fortnight"), false);
+  assert.equal(core.canRollBudgetPeriodIntoSection("quarter", "month"), false);
+});
+
 test("calculates yearly ranges", () => {
   const range = core.toPeriodRange({
     period: "year",
@@ -203,4 +298,113 @@ test("calculates yearly ranges", () => {
 
   assert.equal(range.start, "2026-01-01");
   assert.equal(range.end, "2026-12-31");
+});
+
+test("scales weekly budgets into fortnight ranges", () => {
+  const scaled = core.scaleBudgetLimit(
+    100,
+    "week",
+    { start: "2026-04-27", end: "2026-05-10" },
+    "2026-04-30",
+    "monday"
+  );
+
+  assert.equal(scaled, 200);
+});
+
+test("scales weekly and fortnight budgets into a monthly range using calendar days", () => {
+  const weeklyScaled = core.scaleBudgetLimit(
+    100,
+    "week",
+    { start: "2026-04-01", end: "2026-04-30" },
+    "2026-04-30",
+    "monday"
+  );
+  const fortnightScaled = core.scaleBudgetLimit(
+    200,
+    "fortnight",
+    { start: "2026-04-01", end: "2026-04-30" },
+    "2026-04-30",
+    "monday"
+  );
+
+  assert.equal(weeklyScaled, 428.57);
+  assert.equal(fortnightScaled, 428.57);
+});
+
+test("scales weekly, fortnight, and monthly budgets into a quarter range", () => {
+  const weeklyScaled = core.scaleBudgetLimit(
+    100,
+    "week",
+    { start: "2026-04-01", end: "2026-06-30" },
+    "2026-05-01",
+    "monday"
+  );
+  const fortnightScaled = core.scaleBudgetLimit(
+    200,
+    "fortnight",
+    { start: "2026-04-01", end: "2026-06-30" },
+    "2026-05-01",
+    "monday"
+  );
+  const monthlyScaled = core.scaleBudgetLimit(
+    500,
+    "month",
+    { start: "2026-04-01", end: "2026-06-30" },
+    "2026-05-01",
+    "monday"
+  );
+
+  assert.equal(weeklyScaled, 1300);
+  assert.equal(fortnightScaled, 1300);
+  assert.equal(monthlyScaled, 1467.74);
+});
+
+test("builds planned expense summaries with booked overrides and fully paid matching", () => {
+  const summary = core.buildPlannedExpenseSummary(
+    [
+      { item: "Flights", category: "flights", planned: 1300, booked: 1296.47 },
+      { item: "Shopping", category: "shopping", planned: 400, booked: 0 },
+    ],
+    [
+      { amount: 624.98, holidayKey: "26/japanmidyear", isPlannedExpense: true, plannedCategory: "flights" },
+      { amount: 671.49, holidayKey: "26/japanmidyear", isPlannedExpense: true, plannedCategory: "flights" },
+    ]
+  );
+
+  assert.equal(summary.rows[0].effectiveAmount, 1296.47);
+  assert.equal(summary.rows[0].paidFromLog, 1296.47);
+  assert.equal(summary.rows[0].isFullyPaid, true);
+  assert.equal(summary.rows[1].effectiveAmount, 400);
+  assert.equal(summary.totals.effective, 1696.47);
+});
+
+test("calculates remaining trip days inclusively", () => {
+  assert.equal(core.getRemainingTripDaysInclusive("2026-06-18", "2026-07-08", "2026-06-18"), 21);
+  assert.equal(core.getRemainingTripDaysInclusive("2026-06-18", "2026-07-08", "2026-06-20"), 19);
+  assert.equal(core.getRemainingTripDaysInclusive("2026-06-18", "2026-07-08", "2026-07-09"), 0);
+});
+
+test("summarizes dual-phase holiday savings goals", () => {
+  const beforeTrip = core.summarizeGoalProgress(
+    {
+      goalKey: "japanmidyear",
+      savingsDisplayMode: "dual-phase",
+      savingsGoalAmount: 7000,
+      savingsStartingBalance: 800,
+      savingsDueDate: "2026-06-18",
+      startDate: "2026-06-18",
+      totalBudget: 7000,
+    },
+    [
+      { amount: 1000, date: "2026-05-01", goalKey: "japanmidyear", isGoalContribution: true, isGoalWithdrawal: false },
+      { amount: 500, date: "2026-05-10", goalKey: "japanmidyear", isGoalContribution: false, isGoalWithdrawal: true },
+    ],
+    "2026-05-15",
+    { period: "week", weekStartsOn: "monday" }
+  );
+
+  assert.equal(beforeTrip.currentSaved, 1800);
+  assert.equal(beforeTrip.amountRemaining, 5200);
+  assert.equal(beforeTrip.amountRemainingLabel, "Still Need To Save");
 });

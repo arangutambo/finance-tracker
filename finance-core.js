@@ -1,6 +1,7 @@
 "use strict";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const PERIOD_ORDER = ["day", "week", "fortnight", "month", "bimonth", "quarter", "year"];
 
 function splitLines(text) {
   return String(text || "").replace(/\r\n/g, "\n").split("\n");
@@ -251,21 +252,31 @@ function primaryCategory(value) {
 function normalizeHolidayKey(value) {
   const raw = String(value || "").replace(/^#/, "");
   const normalized = normalizeCategoryPath(raw);
-  const spendingMatch = normalized.match(/(?:^|\/)spending\/(.+)$/i);
-  const candidate = spendingMatch ? spendingMatch[1] : normalized;
-  const segments = candidate.split("/").filter(Boolean);
-  if (segments.length < 2) return "";
-  return `${segments[0]}/${segments[1]}`;
+  const segments = normalized.split("/").filter(Boolean);
+  const withoutLog = segments[0] === "log" ? segments.slice(1) : segments;
+  const spendingIndex = withoutLog.findIndex((segment) => segment.toLowerCase() === "spending");
+  if (spendingIndex >= 2 && /^(?:\d{2}|\d{4})$/.test(withoutLog[spendingIndex - 2])) {
+    return `${withoutLog[spendingIndex - 2]}/${withoutLog[spendingIndex - 1]}`;
+  }
+  if (withoutLog.length >= 2 && /^(?:\d{2}|\d{4})$/.test(withoutLog[0])) {
+    return `${withoutLog[0]}/${withoutLog[1]}`;
+  }
+  return "";
 }
 
 function parseHolidayTagContext(value) {
   const normalized = normalizeCategoryPath(value);
   const segments = normalized.split("/").filter(Boolean);
   if (segments.length >= 3 && /^(?:\d{2}|\d{4})$/.test(segments[0])) {
+    const remainder = segments.slice(2);
+    const isPlannedExpense = String(remainder[0] || "").toLowerCase() === "planned";
+    const normalizedCategory = (isPlannedExpense ? remainder.slice(1) : remainder).join("/") || "uncategorized";
     return {
-      holidayCategory: segments.slice(2).join("/") || "uncategorized",
+      holidayCategory: normalizedCategory,
       holidayKey: `${segments[0]}/${segments[1]}`,
       holidayName: segments[1],
+      isPlannedExpense,
+      plannedCategory: isPlannedExpense ? normalizedCategory : "",
       holidayYear: segments[0],
     };
   }
@@ -273,6 +284,8 @@ function parseHolidayTagContext(value) {
     holidayCategory: normalized || "uncategorized",
     holidayKey: "",
     holidayName: "",
+    isPlannedExpense: false,
+    plannedCategory: "",
     holidayYear: "",
   };
 }
@@ -283,6 +296,10 @@ function buildCategoryTag(categoryPath, holidayKey = "") {
   return normalizedHoliday
     ? `#log/spending/${normalizedHoliday}/${normalizedCategory}`
     : `#log/spending/${normalizedCategory}`;
+}
+
+function buildIncomeTag(bucket) {
+  return `#log/income/${normalizeCategoryPath(bucket) || "income"}`;
 }
 
 function stripFirstTag(value) {
@@ -302,13 +319,118 @@ function extractVisibleAmount(line) {
 }
 
 function extractCategoryFromLogSpendingTag(line) {
-  const matches = Array.from(String(line || "").matchAll(/#([^\s#\]]*\/spending\/[^\s#\]]+)/gi));
+  const matches = Array.from(String(line || "").matchAll(/#([^\s#\]]+)/gi));
   if (!matches.length) return "";
-  const fullTag = matches[matches.length - 1][1];
-  const parts = fullTag.split("/");
-  const spendingIndex = parts.findIndex((part) => part.toLowerCase() === "spending");
-  if (spendingIndex < 0 || spendingIndex === parts.length - 1) return "";
-  return normalizeCategoryPath(parts.slice(spendingIndex + 1).join("/"));
+  for (let index = matches.length - 1; index >= 0; index -= 1) {
+    const fullTag = normalizeCategoryPath(matches[index][1]);
+    const parts = fullTag.split("/").filter(Boolean);
+    const spendingIndex = parts.findIndex((part) => part.toLowerCase() === "spending");
+    if (spendingIndex < 0 || spendingIndex === parts.length - 1) continue;
+    if (spendingIndex >= 2 && /^(?:\d{2}|\d{4})$/.test(parts[spendingIndex - 2])) {
+      return normalizeCategoryPath(`${parts[spendingIndex - 2]}/${parts[spendingIndex - 1]}/${parts.slice(spendingIndex + 1).join("/")}`);
+    }
+    return normalizeCategoryPath(parts.slice(spendingIndex + 1).join("/"));
+  }
+  return "";
+}
+
+function extractFinanceTagContext(line) {
+  const matches = Array.from(String(line || "").matchAll(/#([^\s#\]]+)/gi));
+  for (let index = matches.length - 1; index >= 0; index -= 1) {
+    const fullTag = normalizeCategoryPath(matches[index][1]);
+    const parts = fullTag.split("/").filter(Boolean);
+    if (!parts.length || parts[0] !== "log") continue;
+
+    if (parts[1] === "income" && parts[2]) {
+      return {
+        category: normalizeCategoryPath(parts.slice(2).join("/")) || "income",
+        entryType: "income",
+        goalKey: normalizeCategoryPath(parts[2]),
+        holidayKey: "",
+        isGoalContribution: true,
+        isGoalWithdrawal: false,
+        isIncome: true,
+        isPlannedExpense: false,
+        plannedCategory: "",
+      };
+    }
+
+    if (parts[1] === "spending") {
+      if (parts[2] === "goal" && parts[3]) {
+        return {
+          category: normalizeCategoryPath(parts.slice(4).join("/")) || "uncategorized",
+          entryType: "goal-withdrawal",
+          goalKey: normalizeCategoryPath(parts[3]),
+          holidayKey: "",
+          isGoalContribution: false,
+          isGoalWithdrawal: true,
+          isIncome: false,
+          isPlannedExpense: false,
+          plannedCategory: "",
+        };
+      }
+
+      if (parts[2] && /^(?:\d{2}|\d{4})$/.test(parts[2]) && parts[3]) {
+        const holidayKey = `${parts[2]}/${parts[3]}`;
+        const remainder = parts.slice(4);
+        const isPlannedExpense = String(remainder[0] || "").toLowerCase() === "planned";
+        const category = normalizeCategoryPath((isPlannedExpense ? remainder.slice(1) : remainder).join("/")) || "uncategorized";
+        return {
+          category,
+          entryType: "holiday-spending",
+          goalKey: normalizeCategoryPath(parts[3]),
+          holidayKey,
+          isGoalContribution: false,
+          isGoalWithdrawal: true,
+          isIncome: false,
+          isPlannedExpense,
+          plannedCategory: isPlannedExpense ? category : "",
+        };
+      }
+
+      return {
+        category: normalizeCategoryPath(parts.slice(2).join("/")) || "uncategorized",
+        entryType: "spending",
+        goalKey: "",
+        holidayKey: "",
+        isGoalContribution: false,
+        isGoalWithdrawal: false,
+        isIncome: false,
+        isPlannedExpense: false,
+        plannedCategory: "",
+      };
+    }
+
+    if (parts[1] && /^(?:\d{2}|\d{4})$/.test(parts[1]) && parts[3] === "spending" && parts[2]) {
+      const holidayKey = `${parts[1]}/${parts[2]}`;
+      const remainder = parts.slice(4);
+      const isPlannedExpense = String(remainder[0] || "").toLowerCase() === "planned";
+      const category = normalizeCategoryPath((isPlannedExpense ? remainder.slice(1) : remainder).join("/")) || "uncategorized";
+      return {
+        category,
+        entryType: "holiday-spending",
+        goalKey: normalizeCategoryPath(parts[2]),
+        holidayKey,
+        isGoalContribution: false,
+        isGoalWithdrawal: true,
+        isIncome: false,
+        isPlannedExpense,
+        plannedCategory: isPlannedExpense ? category : "",
+      };
+    }
+  }
+
+  return {
+    category: "uncategorized",
+    entryType: "spending",
+    goalKey: "",
+    holidayKey: "",
+    isGoalContribution: false,
+    isGoalWithdrawal: false,
+    isIncome: false,
+    isPlannedExpense: false,
+    plannedCategory: "",
+  };
 }
 
 function extractNoteDate(content, filePath) {
@@ -345,9 +467,11 @@ function parseTransactionLine(line, noteDate, filePath, options = {}, childLines
   const amount = extractVisibleAmount(text);
   if (!Number.isFinite(amount)) return null;
 
-  const tagPath = extractCategoryFromLogSpendingTag(text) || "uncategorized";
-  const holidayContext = parseHolidayTagContext(tagPath);
-  const category = holidayContext.holidayCategory || "uncategorized";
+  const financeContext = extractFinanceTagContext(text);
+  const holidayContext = financeContext.holidayKey
+    ? parseHolidayTagContext(`${financeContext.holidayKey}/${financeContext.isPlannedExpense ? `planned/${financeContext.category}` : financeContext.category}`)
+    : parseHolidayTagContext(financeContext.category);
+  const category = financeContext.category || holidayContext.holidayCategory || "uncategorized";
 
   const currency = normalizeCurrency(options.defaultCurrency || "AUD");
   const visibleSection = stripFirstTag(text).replace(/^\s*-\s*(?:\[[^\]]\]\s*)?/, "").trim();
@@ -365,9 +489,16 @@ function parseTransactionLine(line, noteDate, filePath, options = {}, childLines
     categoryPrimary: primaryCategory(category),
     currency,
     date: transactionDate,
+    entryType: financeContext.entryType,
     filePath,
-    holidayKey: holidayContext.holidayKey,
+    goalKey: financeContext.goalKey || "",
+    holidayKey: financeContext.holidayKey || holidayContext.holidayKey,
     holidayName: holidayContext.holidayName,
+    isGoalContribution: Boolean(financeContext.isGoalContribution),
+    isGoalWithdrawal: Boolean(financeContext.isGoalWithdrawal),
+    isIncome: Boolean(financeContext.isIncome),
+    isPlannedExpense: Boolean(holidayContext.isPlannedExpense),
+    plannedCategory: financeContext.plannedCategory || holidayContext.plannedCategory || "",
     holidayYear: holidayContext.holidayYear,
     merchant,
     originalAmount: Number.isFinite(originalAmount) ? Number(Number(originalAmount).toFixed(2)) : null,
@@ -379,25 +510,60 @@ function parseTransactionLine(line, noteDate, filePath, options = {}, childLines
   };
 }
 
+function isPlannedExpenseEntry(entry) {
+  return Boolean(entry?.holidayKey && entry?.isPlannedExpense);
+}
+
+function splitHolidayEntries(entries) {
+  const actual = [];
+  const planned = [];
+  for (const entry of entries || []) {
+    if (isPlannedExpenseEntry(entry)) {
+      planned.push(entry);
+    } else {
+      actual.push(entry);
+    }
+  }
+  return { actual, planned };
+}
+
+function roundCurrencyAmount(value) {
+  return Number(Number(value || 0).toFixed(2));
+}
+
+function getRemainingTripDaysInclusive(start, end, reference) {
+  const normalizedStart = parseIsoDate(start);
+  const normalizedEnd = parseIsoDate(end);
+  const normalizedReference = parseIsoDate(reference);
+  if (!normalizedStart || !normalizedEnd || !normalizedReference) return 0;
+  if (normalizedReference > normalizedEnd) return 0;
+  const effectiveStart = normalizedReference < normalizedStart ? normalizedStart : normalizedReference;
+  return daysBetweenInclusive(effectiveStart, normalizedEnd);
+}
+
 function parseTransactionsFromNoteContent(content, filePath, options = {}) {
   const lines = splitLines(content);
   const noteDate = extractNoteDate(content, filePath);
   const transactions = [];
-  let inSpendingSection = false;
-  const spendingHeading = normalizeWhitespace(options.spendingHeading || "## Spending").toLowerCase();
+  let inFinanceSection = false;
+  const candidateHeadings = new Set(
+    [options.financeHeading || "## Finance", options.spendingHeading || "## Spending", "## Spending", "## Finance"]
+      .map((value) => normalizeWhitespace(value).toLowerCase())
+      .filter(Boolean)
+  );
 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
-    if (normalizeWhitespace(line).toLowerCase() === spendingHeading) {
-      inSpendingSection = true;
+    if (candidateHeadings.has(normalizeWhitespace(line).toLowerCase())) {
+      inFinanceSection = true;
       continue;
     }
 
-    if (inSpendingSection && (/^#{1,6}\s+/.test(line.trim()) || /^---\s*$/.test(line.trim()))) {
-      inSpendingSection = false;
+    if (inFinanceSection && (/^#{1,6}\s+/.test(line.trim()) || /^---\s*$/.test(line.trim()))) {
+      inFinanceSection = false;
     }
 
-    if (!inSpendingSection) continue;
+    if (!inFinanceSection) continue;
       if (/^\t\t- /.test(line) || /^\s{4,}- /.test(line)) continue;
 
     const childLines = [];
@@ -424,7 +590,7 @@ function calculateSpendingSectionTotal(sectionLines, noteDate, options = {}) {
   return Number(
     sectionLines
       .map((line) => parseTransactionLine(line, noteDate, "", options))
-      .filter(Boolean)
+      .filter((entry) => entry && !entry.isIncome && !entry.isGoalContribution)
       .reduce((sum, entry) => sum + entry.amount, 0)
       .toFixed(2)
   );
@@ -559,10 +725,58 @@ function toPeriodRange({ period = "week", referenceDate, start, end, weekStartsO
   return { period: "week", start: periodStart, end: addDays(periodStart, 6) };
 }
 
+function normalizeBudgetPeriod(period) {
+  const normalized = String(period || "week").toLowerCase();
+  if (normalized === "bi-month" || normalized === "bi-monthly") return "bimonth";
+  if (normalized === "quarterly") return "quarter";
+  if (normalized === "yearly" || normalized === "annual") return "year";
+  return PERIOD_ORDER.includes(normalized) ? normalized : "week";
+}
+
+function getDailyBudgetSectionPeriods(basePeriod) {
+  const normalizedBase = normalizeBudgetPeriod(basePeriod);
+  const displayOrder = ["week", "fortnight", "month", "quarter", "year"];
+  if (normalizedBase === "day") return displayOrder;
+  if (normalizedBase === "bimonth") return ["bimonth", "quarter", "year"];
+  const index = displayOrder.indexOf(normalizedBase);
+  return index >= 0 ? displayOrder.slice(index) : displayOrder;
+}
+
+function canRollBudgetPeriodIntoSection(budgetPeriod, sectionPeriod) {
+  const budgetIndex = PERIOD_ORDER.indexOf(normalizeBudgetPeriod(budgetPeriod));
+  const sectionIndex = PERIOD_ORDER.indexOf(normalizeBudgetPeriod(sectionPeriod));
+  if (budgetIndex < 0 || sectionIndex < 0) return false;
+  return budgetIndex <= sectionIndex;
+}
+
+function periodLengthDays(period, referenceDate, weekStartsOn = "monday") {
+  const range = toPeriodRange({
+    period,
+    referenceDate: parseIsoDate(referenceDate) || todayIsoLocal(),
+    weekStartsOn,
+  });
+  return daysBetweenInclusive(range.start, range.end);
+}
+
+function scaleBudgetLimit(limit, budgetPeriod, displayRange, referenceDate, weekStartsOn = "monday") {
+  const baseDays = periodLengthDays(budgetPeriod, referenceDate, weekStartsOn);
+  const displayDays = daysBetweenInclusive(displayRange.start, displayRange.end);
+  if (!Number.isFinite(limit) || !baseDays || !displayDays) return 0;
+  return roundCurrencyAmount((Number(limit) * displayDays) / baseDays);
+}
+
 function isDateInRange(date, range) {
   const normalizedDate = parseIsoDate(date);
   if (!normalizedDate) return false;
   return normalizedDate >= range.start && normalizedDate <= range.end;
+}
+
+function daysBetweenInclusive(start, end) {
+  const startDate = isoToDate(start);
+  const endDate = isoToDate(end);
+  if (!startDate || !endDate) return 1;
+  const diff = Math.round((endDate.getTime() - startDate.getTime()) / DAY_MS);
+  return Math.max(1, diff + 1);
 }
 
 function groupTransactionsByCategory(entries, groupBy = "primary") {
@@ -586,6 +800,126 @@ function groupTransactionsByCategory(entries, groupBy = "primary") {
   }
 
   return Array.from(grouped.values()).sort((left, right) => right.total - left.total);
+}
+
+function buildPlannedExpenseSummary(plannedExpenses, plannedEntries) {
+  const entriesByCategory = new Map();
+  for (const entry of plannedEntries || []) {
+    const key = normalizeCategoryPath(entry.plannedCategory || entry.category || "") || "uncategorized";
+    const current = entriesByCategory.get(key) || [];
+    current.push(entry);
+    entriesByCategory.set(key, current);
+  }
+
+  const rows = (plannedExpenses || []).map((item) => {
+    const category = normalizeCategoryPath(item.category || "") || "uncategorized";
+    const entries = entriesByCategory.get(category) || [];
+    const planned = roundCurrencyAmount(item.planned || 0);
+    const booked = roundCurrencyAmount(item.booked || 0);
+    const paidFromLog = roundCurrencyAmount(entries.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
+    const effectiveAmount = booked > 0 ? booked : planned;
+    const isFullyPaid = booked > 0 && roundCurrencyAmount(paidFromLog) === booked;
+    return {
+      ...item,
+      booked,
+      category,
+      effectiveAmount,
+      entries,
+      isFullyPaid,
+      paidFromLog,
+      planned,
+      remainingToPay: booked > 0 ? roundCurrencyAmount(Math.max(booked - paidFromLog, 0)) : 0,
+    };
+  });
+
+  const totals = rows.reduce(
+    (summary, row) => {
+      summary.booked += row.booked;
+      summary.effective += row.effectiveAmount;
+      summary.paidFromLog += row.paidFromLog;
+      summary.planned += row.planned;
+      return summary;
+    },
+    { booked: 0, effective: 0, paidFromLog: 0, planned: 0 }
+  );
+
+  return {
+    rows,
+    totals: {
+      booked: roundCurrencyAmount(totals.booked),
+      effective: roundCurrencyAmount(totals.effective),
+      paidFromLog: roundCurrencyAmount(totals.paidFromLog),
+      planned: roundCurrencyAmount(totals.planned),
+    },
+  };
+}
+
+function summarizeGoalProgress(definition, entries, referenceDate, options = {}) {
+  const targetAmount = roundCurrencyAmount(definition?.targetAmount || definition?.savingsGoalAmount || 0);
+  const startingBalance = roundCurrencyAmount(definition?.startingBalance || definition?.savingsStartingBalance || 0);
+  const dueDate = parseIsoDate(definition?.dueDate || definition?.savingsDueDate || "");
+  const goalKey = normalizeCategoryPath(definition?.goalKey || definition?.savingsGoalKey || "");
+  const activeSavingsGoal = Boolean(definition?.activeSavingsGoal);
+  const carryMissedSavings = Boolean(definition?.carryMissedSavings);
+  const savingsDisplayMode = String(definition?.savingsDisplayMode || "dual-phase").toLowerCase();
+  const holidayStartDate = parseIsoDate(definition?.startDate || "");
+  const totalBudget = roundCurrencyAmount(definition?.totalBudget || 0);
+  const contributions = (entries || []).filter((entry) => entry.goalKey === goalKey && entry.isGoalContribution);
+  const withdrawals = (entries || []).filter((entry) => entry.goalKey === goalKey && entry.isGoalWithdrawal);
+  const totalContributed = roundCurrencyAmount(contributions.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
+  const totalWithdrawn = roundCurrencyAmount(withdrawals.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
+
+  let currentSaved = roundCurrencyAmount(startingBalance + totalContributed - totalWithdrawn);
+  let amountRemaining = Math.max(roundCurrencyAmount(targetAmount - currentSaved), 0);
+  let amountRemainingLabel = "Amount Remaining";
+
+  if (savingsDisplayMode === "dual-phase" && holidayStartDate) {
+    currentSaved = roundCurrencyAmount(startingBalance + totalContributed);
+    if (referenceDate < holidayStartDate) {
+      amountRemaining = Math.max(roundCurrencyAmount(targetAmount - currentSaved), 0);
+      amountRemainingLabel = "Still Need To Save";
+    } else {
+      amountRemaining = Math.max(roundCurrencyAmount(totalBudget - totalWithdrawn), 0);
+      amountRemainingLabel = "Travel Budget Remaining";
+    }
+  }
+
+  const proportionSaved = targetAmount > 0 ? Number(((currentSaved / targetAmount) * 100).toFixed(1)) : 0;
+  const period = String(options.period || "week").toLowerCase();
+  const range = toPeriodRange({ period, referenceDate, weekStartsOn: options.weekStartsOn || "monday" });
+  const currentPeriodContribution = roundCurrencyAmount(
+    contributions
+      .filter((entry) => isDateInRange(entry.date, range))
+      .reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
+  );
+
+  let requiredPerPeriod = 0;
+  if (dueDate && dueDate >= referenceDate && amountRemaining > 0) {
+    const remainingDays = daysBetweenInclusive(referenceDate, dueDate);
+    const periodDays = Math.max(1, daysBetweenInclusive(range.start, range.end));
+    const periodsRemaining = Math.max(1, Math.ceil(remainingDays / periodDays));
+    requiredPerPeriod = roundCurrencyAmount(amountRemaining / periodsRemaining);
+    if (carryMissedSavings && currentPeriodContribution < requiredPerPeriod) {
+      const deficit = roundCurrencyAmount(requiredPerPeriod - currentPeriodContribution);
+      requiredPerPeriod = roundCurrencyAmount(requiredPerPeriod + deficit);
+    }
+  }
+
+  return {
+    activeSavingsGoal,
+    amountRemaining: roundCurrencyAmount(amountRemaining),
+    amountRemainingLabel,
+    carryMissedSavings,
+    currentPeriodContribution,
+    currentSaved: roundCurrencyAmount(currentSaved),
+    goalKey,
+    proportionSaved,
+    requiredPerPeriod,
+    savingsDisplayMode,
+    targetAmount,
+    totalContributed,
+    totalWithdrawn,
+  };
 }
 
 function parseMarkdownTable(content) {
@@ -642,22 +976,14 @@ function parseBudgets(content, fallbackCurrency = "AUD") {
     for (const row of rows) {
       const limit = parseNumber(row.limit || row.budget || row.amount || row.cap);
       const category = normalizeCategoryPath(row.category || row.tag || "");
-      const period = String(row.period || "week").toLowerCase();
+      const period = normalizeBudgetPeriod(row.period || "week");
       if (!Number.isFinite(limit) || !category) continue;
       budgets.push({
         name: normalizeWhitespace(row.name || displayCategoryPath(category)),
         category,
         currency: normalizeCurrency(row.currency || fallbackCurrency, fallbackCurrency),
         limit: Number(limit.toFixed(2)),
-        period: ["day", "week", "fortnight", "month", "bimonth", "quarter", "year"].includes(period)
-          ? period
-          : period === "bi-month" || period === "bi-monthly"
-            ? "bimonth"
-            : period === "quarterly"
-              ? "quarter"
-              : period === "yearly" || period === "annual"
-                ? "year"
-              : "week",
+        period,
       });
     }
   }
@@ -703,10 +1029,15 @@ module.exports = {
   addDays,
   buildCategoryTag,
   buildCsv,
+  buildPlannedExpenseSummary,
+  buildIncomeTag,
   buildTransactionBlock,
   calculateSpendingSectionTotal,
+  canRollBudgetPeriodIntoSection,
+  daysBetweenInclusive,
   displayCategoryPath,
   extractCategoryFromLogSpendingTag,
+  extractFinanceTagContext,
   extractNoteDate,
   formatCurrency,
   formatCurrencyWithCode,
@@ -715,7 +1046,11 @@ module.exports = {
   groupTransactionsByCategory,
   insertTransactionIntoDailyNote,
   isDateInRange,
+  isPlannedExpenseEntry,
+  getRemainingTripDaysInclusive,
+  getDailyBudgetSectionPeriods,
   normalizeCategoryPath,
+  normalizeBudgetPeriod,
   normalizeCurrency,
   normalizeHolidayKey,
   parseCurrencyDescriptor,
@@ -725,7 +1060,12 @@ module.exports = {
   parseNumber,
   parseTransactionsFromNoteContent,
   primaryCategory,
+  roundCurrencyAmount,
+  scaleBudgetLimit,
+  splitHolidayEntries,
+  summarizeGoalProgress,
   titleCaseSegment,
   toPeriodRange,
+  periodLengthDays,
   todayIsoLocal,
 };

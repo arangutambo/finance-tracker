@@ -1,6 +1,6 @@
 {
   "dailyNotesFolder": "Journal/Periodics/1. Daily",
-  "spendingHeading": "## Spending",
+  "spendingHeading": "## Finance",
   "spendingRootTag": "#log/spending",
   "defaultCurrency": "AUD",
   "budgetsFolderPath": "Utility/Budgets",
@@ -20,6 +20,8 @@
   "openDailyNoteAfterCapture": false,
   "dashboardDefaultGroupBy": "primary",
   "dashboardSliceLabelThreshold": 0.08,
+  "budgetCheckPeriod": "week",
+  "weekStartsOn": "monday",
   "csvExportFolder": "Utility/Exports",
   "categoryTagRoot": "#finance/category",
   "sourceTagRoot": "#finance/source",
