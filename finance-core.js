@@ -311,7 +311,7 @@ function extractVisibleAmount(line) {
     .replace(/^\s*-\s*(?:\[[^\]]\]\s*)?/, "")
     .trim();
   if (!visible) return null;
-  const matches = Array.from(visible.matchAll(/-?\d+(?:[.,]\d+)?/g))
+  const matches = Array.from(visible.matchAll(/-?\d[\d,]*(?:\.\d+)?|-?\d+(?:,\d{3})*(?:\.\d+)?/g))
     .map((match) => Number(String(match[0]).replace(/,/g, "")))
     .filter((value) => Number.isFinite(value));
   if (!matches.length) return null;
@@ -418,6 +418,22 @@ function extractFinanceTagContext(line) {
         plannedCategory: isPlannedExpense ? category : "",
       };
     }
+
+    if (parts[1] && /^(?:\d{2}|\d{4})$/.test(parts[1]) && parts[2] && parts[3] === "planned") {
+      const holidayKey = `${parts[1]}/${parts[2]}`;
+      const category = normalizeCategoryPath(parts.slice(4).join("/")) || "uncategorized";
+      return {
+        category,
+        entryType: "holiday-spending",
+        goalKey: normalizeCategoryPath(parts[2]),
+        holidayKey,
+        isGoalContribution: false,
+        isGoalWithdrawal: true,
+        isIncome: false,
+        isPlannedExpense: true,
+        plannedCategory: category,
+      };
+    }
   }
 
   return {
@@ -459,6 +475,71 @@ function extractMerchantFromChildLines(lines, startIndex) {
   return "";
 }
 
+function extractPlannedLogMetadata(childLines = []) {
+  let startDate = "";
+  let endDate = "";
+  const detailLinks = [];
+  const detailLines = [];
+
+  for (const rawLine of childLines) {
+    const line = String(rawLine || "").trim();
+    if (!line) continue;
+    detailLines.push(line);
+
+    const links = Array.from(line.matchAll(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g)).map((match) => ({
+      path: String(match[1] || "").trim(),
+      label: String(match[2] || match[1] || "").trim(),
+      raw: match[0],
+    })).filter((link) => link.path);
+    detailLinks.push(...links);
+
+    const dates = Array.from(line.matchAll(/\b\d{4}-\d{2}-\d{2}\b/g)).map((match) => parseIsoDate(match[0])).filter(Boolean);
+    if (!dates.length) continue;
+
+    const lower = line.toLowerCase();
+    if (dates.length >= 2) {
+      startDate = startDate || dates[0];
+      endDate = endDate || dates[1];
+      continue;
+    }
+
+    if (!startDate && (/\b(start|check[- ]?in|arrival|from)\b/.test(lower) || !endDate)) {
+      startDate = dates[0];
+      continue;
+    }
+
+    if (!endDate && /\b(end|check[- ]?out|departure|until|to)\b/.test(lower)) {
+      endDate = dates[0];
+      continue;
+    }
+
+    if (!endDate) {
+      endDate = dates[0];
+    }
+  }
+
+  if (startDate && !endDate) endDate = startDate;
+  if (endDate && !startDate) startDate = endDate;
+
+  return {
+    detailLines,
+    detailLinks,
+    endDate,
+    startDate,
+  };
+}
+
+function extractPlannedLineDates(line = "") {
+  const dates = Array.from(String(line || "").matchAll(/\b\d{4}-\d{2}-\d{2}\b/g))
+    .map((match) => parseIsoDate(match[0]))
+    .filter(Boolean);
+  if (!dates.length) return { startDate: "", endDate: "" };
+  return {
+    endDate: dates[1] || dates[0],
+    startDate: dates[0],
+  };
+}
+
 function parseTransactionLine(line, noteDate, filePath, options = {}, childLines = []) {
   const text = String(line || "");
   if (!text.trimStart().startsWith("-")) return null;
@@ -480,6 +561,8 @@ function parseTransactionLine(line, noteDate, filePath, options = {}, childLines
   const originalDescriptor = parseCurrencyDescriptor(originalSide, currency);
   const merchant = normalizeWhitespace(childLines[0] || "");
   const note = normalizeWhitespace(childLines.slice(1).join(" | "));
+  const plannedLogMeta = extractPlannedLogMetadata(childLines);
+  const plannedLineDates = holidayContext.isPlannedExpense ? extractPlannedLineDates(text) : { startDate: "", endDate: "" };
   const transactionDate = noteDate || extractNoteDate("", filePath);
 
   return {
@@ -499,6 +582,10 @@ function parseTransactionLine(line, noteDate, filePath, options = {}, childLines
     isIncome: Boolean(financeContext.isIncome),
     isPlannedExpense: Boolean(holidayContext.isPlannedExpense),
     plannedCategory: financeContext.plannedCategory || holidayContext.plannedCategory || "",
+    plannedDetailLines: plannedLogMeta.detailLines,
+    plannedDetailLinks: plannedLogMeta.detailLinks,
+    plannedEndDate: plannedLogMeta.endDate || plannedLineDates.endDate,
+    plannedStartDate: plannedLogMeta.startDate || plannedLineDates.startDate,
     holidayYear: holidayContext.holidayYear,
     merchant,
     originalAmount: Number.isFinite(originalAmount) ? Number(Number(originalAmount).toFixed(2)) : null,
@@ -564,7 +651,7 @@ function parseTransactionsFromNoteContent(content, filePath, options = {}) {
     }
 
     if (!inFinanceSection) continue;
-      if (/^\t\t- /.test(line) || /^\s{4,}- /.test(line)) continue;
+    if ((/^\t- /.test(line) || /^\s{2,}- /.test(line)) && !/#log\//i.test(line)) continue;
 
     const childLines = [];
     for (let childIndex = index + 1; childIndex < lines.length; childIndex += 1) {
@@ -824,11 +911,14 @@ function buildPlannedExpenseSummary(plannedExpenses, plannedEntries) {
       booked,
       category,
       effectiveAmount,
+      endDate: parseIsoDate(item.endDate || item.end || ""),
       entries,
       isFullyPaid,
+      link: String(item.link || "").trim(),
       paidFromLog,
       planned,
       remainingToPay: booked > 0 ? roundCurrencyAmount(Math.max(booked - paidFromLog, 0)) : 0,
+      startDate: parseIsoDate(item.startDate || item.start || ""),
     };
   });
 
@@ -854,6 +944,34 @@ function buildPlannedExpenseSummary(plannedExpenses, plannedEntries) {
   };
 }
 
+function buildAllocatedExpenseSummary(allocatedExpenses, holidayStartDate, holidayEndDate) {
+  const rows = (allocatedExpenses || []).map((item) => {
+    const category = normalizeCategoryPath(item.category || "") || "uncategorized";
+    const allocated = roundCurrencyAmount(item.allocated || 0);
+    const startDate = parseIsoDate(item.startDate || item.start || "") || parseIsoDate(holidayStartDate || "") || "";
+    const endCandidate = parseIsoDate(item.endDate || item.end || "") || parseIsoDate(holidayEndDate || "") || startDate;
+    const endDate = startDate && endCandidate && endCandidate < startDate ? startDate : endCandidate;
+    const spanDays = startDate && endDate ? daysBetweenInclusive(startDate, endDate) : 0;
+    return {
+      ...item,
+      allocated,
+      allocatedPerDay: spanDays > 0 ? roundCurrencyAmount(allocated / spanDays) : 0,
+      category,
+      endDate,
+      link: String(item.link || "").trim(),
+      spanDays,
+      startDate,
+    };
+  }).filter((item) => item.allocated > 0 || item.item || item.category);
+
+  return {
+    rows,
+    totals: {
+      allocated: roundCurrencyAmount(rows.reduce((sum, item) => sum + Number(item.allocated || 0), 0)),
+    },
+  };
+}
+
 function summarizeGoalProgress(definition, entries, referenceDate, options = {}) {
   const targetAmount = roundCurrencyAmount(definition?.targetAmount || definition?.savingsGoalAmount || 0);
   const startingBalance = roundCurrencyAmount(definition?.startingBalance || definition?.savingsStartingBalance || 0);
@@ -862,21 +980,28 @@ function summarizeGoalProgress(definition, entries, referenceDate, options = {})
   const activeSavingsGoal = Boolean(definition?.activeSavingsGoal);
   const carryMissedSavings = Boolean(definition?.carryMissedSavings);
   const savingsDisplayMode = String(definition?.savingsDisplayMode || "dual-phase").toLowerCase();
+  const savingsProgressMode = String(definition?.savingsProgressMode || "account-only").toLowerCase();
   const holidayStartDate = parseIsoDate(definition?.startDate || "");
   const totalBudget = roundCurrencyAmount(definition?.totalBudget || 0);
+  const paidPlannedExpenses = roundCurrencyAmount(definition?.paidPlannedExpenses || 0);
   const contributions = (entries || []).filter((entry) => entry.goalKey === goalKey && entry.isGoalContribution);
   const withdrawals = (entries || []).filter((entry) => entry.goalKey === goalKey && entry.isGoalWithdrawal);
   const totalContributed = roundCurrencyAmount(contributions.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
   const totalWithdrawn = roundCurrencyAmount(withdrawals.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
 
-  let currentSaved = roundCurrencyAmount(startingBalance + totalContributed - totalWithdrawn);
+  const currentAccountBalance = roundCurrencyAmount(startingBalance + totalContributed - totalWithdrawn);
+  let savedProgress = currentAccountBalance;
+  let currentSaved = currentAccountBalance;
   let amountRemaining = Math.max(roundCurrencyAmount(targetAmount - currentSaved), 0);
   let amountRemainingLabel = "Amount Remaining";
 
   if (savingsDisplayMode === "dual-phase" && holidayStartDate) {
-    currentSaved = roundCurrencyAmount(startingBalance + totalContributed);
+    savedProgress = savingsProgressMode === "account-plus-paid-planned"
+      ? roundCurrencyAmount(currentAccountBalance + paidPlannedExpenses)
+      : currentAccountBalance;
+    currentSaved = savedProgress;
     if (referenceDate < holidayStartDate) {
-      amountRemaining = Math.max(roundCurrencyAmount(targetAmount - currentSaved), 0);
+      amountRemaining = Math.max(roundCurrencyAmount(targetAmount - savedProgress), 0);
       amountRemainingLabel = "Still Need To Save";
     } else {
       amountRemaining = Math.max(roundCurrencyAmount(totalBudget - totalWithdrawn), 0);
@@ -884,7 +1009,7 @@ function summarizeGoalProgress(definition, entries, referenceDate, options = {})
     }
   }
 
-  const proportionSaved = targetAmount > 0 ? Number(((currentSaved / targetAmount) * 100).toFixed(1)) : 0;
+  const proportionSaved = targetAmount > 0 ? Number(((savedProgress / targetAmount) * 100).toFixed(1)) : 0;
   const period = String(options.period || "week").toLowerCase();
   const range = toPeriodRange({ period, referenceDate, weekStartsOn: options.weekStartsOn || "monday" });
   const currentPeriodContribution = roundCurrencyAmount(
@@ -910,12 +1035,16 @@ function summarizeGoalProgress(definition, entries, referenceDate, options = {})
     amountRemaining: roundCurrencyAmount(amountRemaining),
     amountRemainingLabel,
     carryMissedSavings,
+    currentAccountBalance,
     currentPeriodContribution,
     currentSaved: roundCurrencyAmount(currentSaved),
     goalKey,
+    paidPlannedExpenses,
     proportionSaved,
     requiredPerPeriod,
+    savedProgress: roundCurrencyAmount(savedProgress),
     savingsDisplayMode,
+    savingsProgressMode,
     targetAmount,
     totalContributed,
     totalWithdrawn,
@@ -1029,6 +1158,7 @@ module.exports = {
   addDays,
   buildCategoryTag,
   buildCsv,
+  buildAllocatedExpenseSummary,
   buildPlannedExpenseSummary,
   buildIncomeTag,
   buildTransactionBlock,

@@ -312,7 +312,7 @@ const core = (() => {
       .replace(/^\s*-\s*(?:\[[^\]]\]\s*)?/, "")
       .trim();
     if (!visible) return null;
-    const matches = Array.from(visible.matchAll(/-?\d+(?:[.,]\d+)?/g))
+    const matches = Array.from(visible.matchAll(/-?\d[\d,]*(?:\.\d+)?|-?\d+(?:,\d{3})*(?:\.\d+)?/g))
       .map((match) => Number(String(match[0]).replace(/,/g, "")))
       .filter((value) => Number.isFinite(value));
     if (!matches.length) return null;
@@ -419,6 +419,22 @@ const core = (() => {
           plannedCategory: isPlannedExpense ? category : "",
         };
       }
+
+      if (parts[1] && /^(?:\d{2}|\d{4})$/.test(parts[1]) && parts[2] && parts[3] === "planned") {
+        const holidayKey = `${parts[1]}/${parts[2]}`;
+        const category = normalizeCategoryPath(parts.slice(4).join("/")) || "uncategorized";
+        return {
+          category,
+          entryType: "holiday-spending",
+          goalKey: normalizeCategoryPath(parts[2]),
+          holidayKey,
+          isGoalContribution: false,
+          isGoalWithdrawal: true,
+          isIncome: false,
+          isPlannedExpense: true,
+          plannedCategory: category,
+        };
+      }
     }
 
     return {
@@ -481,6 +497,8 @@ const core = (() => {
     const originalDescriptor = parseCurrencyDescriptor(originalSide, currency);
     const merchant = normalizeWhitespace(childLines[0] || "");
     const note = normalizeWhitespace(childLines.slice(1).join(" | "));
+    const plannedLogMeta = extractPlannedLogMetadata(childLines);
+    const plannedLineDates = holidayContext.isPlannedExpense ? extractPlannedLineDates(text) : { startDate: "", endDate: "" };
     const transactionDate = noteDate || extractNoteDate("", filePath);
 
     return {
@@ -504,6 +522,10 @@ const core = (() => {
       merchant,
       name: merchant,
       note,
+      plannedDetailLines: plannedLogMeta.detailLines,
+      plannedDetailLinks: plannedLogMeta.detailLinks,
+      plannedEndDate: plannedLogMeta.endDate || plannedLineDates.endDate,
+      plannedStartDate: plannedLogMeta.startDate || plannedLineDates.startDate,
       originalAmount: Number.isFinite(originalAmount) ? Number(Number(originalAmount).toFixed(2)) : null,
       originalCurrency: originalSide ? originalDescriptor.currency : "",
       originalRateKey: originalSide ? originalDescriptor.rateKey : "",
@@ -568,7 +590,7 @@ const core = (() => {
       }
 
       if (!inFinanceSection) continue;
-      if (/^\t\t- /.test(line) || /^\s{4,}- /.test(line)) continue;
+      if ((/^\t- /.test(line) || /^\s{2,}- /.test(line)) && !/#log\//i.test(line)) continue;
 
       const parsed = parseTransactionLine(line, noteDate, filePath, options, extractChildLines(lines, index));
       if (parsed) {
@@ -817,11 +839,14 @@ const core = (() => {
         booked,
         category,
         effectiveAmount,
+        endDate: parseIsoDate(item.endDate || item.end || ""),
         entries,
         isFullyPaid,
+        link: String(item.link || "").trim(),
         paidFromLog,
         planned,
         remainingToPay: booked > 0 ? roundCurrencyAmount(Math.max(booked - paidFromLog, 0)) : 0,
+        startDate: parseIsoDate(item.startDate || item.start || ""),
       };
     });
 
@@ -847,6 +872,34 @@ const core = (() => {
     };
   }
 
+  function buildAllocatedExpenseSummary(allocatedExpenses, holidayStartDate, holidayEndDate) {
+    const rows = (allocatedExpenses || []).map((item) => {
+      const category = normalizeCategoryPath(item.category || "") || "uncategorized";
+      const allocated = roundCurrencyAmount(item.allocated || 0);
+      const startDate = parseIsoDate(item.startDate || item.start || "") || parseIsoDate(holidayStartDate || "") || "";
+      const endCandidate = parseIsoDate(item.endDate || item.end || "") || parseIsoDate(holidayEndDate || "") || startDate;
+      const endDate = startDate && endCandidate && endCandidate < startDate ? startDate : endCandidate;
+      const spanDays = startDate && endDate ? daysBetweenInclusive(startDate, endDate) : 0;
+      return {
+        ...item,
+        allocated,
+        allocatedPerDay: spanDays > 0 ? roundCurrencyAmount(allocated / spanDays) : 0,
+        category,
+        endDate,
+        link: String(item.link || "").trim(),
+        spanDays,
+        startDate,
+      };
+    }).filter((item) => item.allocated > 0 || item.item || item.category);
+
+    return {
+      rows,
+      totals: {
+        allocated: roundCurrencyAmount(rows.reduce((sum, item) => sum + Number(item.allocated || 0), 0)),
+      },
+    };
+  }
+
   function summarizeGoalProgress(definition, entries, referenceDate, options = {}) {
     const targetAmount = roundCurrencyAmount(definition?.targetAmount || definition?.savingsGoalAmount || 0);
     const startingBalance = roundCurrencyAmount(definition?.startingBalance || definition?.savingsStartingBalance || 0);
@@ -855,21 +908,28 @@ const core = (() => {
     const activeSavingsGoal = Boolean(definition?.activeSavingsGoal);
     const carryMissedSavings = Boolean(definition?.carryMissedSavings);
     const savingsDisplayMode = String(definition?.savingsDisplayMode || "standard").toLowerCase();
+    const savingsProgressMode = String(definition?.savingsProgressMode || "account-only").toLowerCase();
     const holidayStartDate = parseIsoDate(definition?.startDate || "");
     const totalBudget = roundCurrencyAmount(definition?.totalBudget || 0);
+    const paidPlannedExpenses = roundCurrencyAmount(definition?.paidPlannedExpenses || 0);
     const contributions = (entries || []).filter((entry) => entry.goalKey === goalKey && entry.isGoalContribution);
     const withdrawals = (entries || []).filter((entry) => entry.goalKey === goalKey && entry.isGoalWithdrawal);
     const totalContributed = roundCurrencyAmount(contributions.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
     const totalWithdrawn = roundCurrencyAmount(withdrawals.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
 
-    let currentSaved = roundCurrencyAmount(startingBalance + totalContributed - totalWithdrawn);
+    const currentAccountBalance = roundCurrencyAmount(startingBalance + totalContributed - totalWithdrawn);
+    let savedProgress = currentAccountBalance;
+    let currentSaved = currentAccountBalance;
     let amountRemaining = Math.max(roundCurrencyAmount(targetAmount - currentSaved), 0);
     let amountRemainingLabel = "Amount Remaining";
 
     if (savingsDisplayMode === "dual-phase" && holidayStartDate) {
-      currentSaved = roundCurrencyAmount(startingBalance + totalContributed);
+      savedProgress = savingsProgressMode === "account-plus-paid-planned"
+        ? roundCurrencyAmount(currentAccountBalance + paidPlannedExpenses)
+        : currentAccountBalance;
+      currentSaved = savedProgress;
       if (referenceDate < holidayStartDate) {
-        amountRemaining = Math.max(roundCurrencyAmount(targetAmount - currentSaved), 0);
+        amountRemaining = Math.max(roundCurrencyAmount(targetAmount - savedProgress), 0);
         amountRemainingLabel = "Still Need To Save";
       } else {
         amountRemaining = Math.max(roundCurrencyAmount(totalBudget - totalWithdrawn), 0);
@@ -877,7 +937,7 @@ const core = (() => {
       }
     }
 
-    const proportionSaved = targetAmount > 0 ? Number(((currentSaved / targetAmount) * 100).toFixed(1)) : 0;
+    const proportionSaved = targetAmount > 0 ? Number(((savedProgress / targetAmount) * 100).toFixed(1)) : 0;
     const period = String(options.period || "week").toLowerCase();
     const range = toPeriodRange({ period, referenceDate, weekStartsOn: options.weekStartsOn || "monday" });
     const currentPeriodContribution = roundCurrencyAmount(
@@ -901,12 +961,16 @@ const core = (() => {
       amountRemaining: roundCurrencyAmount(amountRemaining),
       amountRemainingLabel,
       carryMissedSavings,
+      currentAccountBalance,
       currentPeriodContribution,
       currentSaved: roundCurrencyAmount(currentSaved),
       goalKey,
+      paidPlannedExpenses,
       proportionSaved,
       requiredPerPeriod,
+      savedProgress: roundCurrencyAmount(savedProgress),
       savingsDisplayMode,
+      savingsProgressMode,
       targetAmount,
       totalContributed,
       totalWithdrawn,
@@ -1024,6 +1088,7 @@ const core = (() => {
 
   return {
     buildCategoryTag,
+    buildAllocatedExpenseSummary,
     buildCsv,
     buildIncomeTag,
     canRollBudgetPeriodIntoSection,
@@ -1261,8 +1326,12 @@ const DEFAULT_HOLIDAY_PLANNED_EXPENSES = [
   { item: "Flights", category: "flights" },
   { item: "Accommodation", category: "accommodation" },
   { item: "Recreation", category: "recreation" },
+];
+
+const DEFAULT_HOLIDAY_ALLOCATED_EXPENSES = [
   { item: "Transport", category: "transport" },
   { item: "Shopping", category: "shopping" },
+  { item: "Food", category: "food" },
 ];
 
 function buildGoalKeyFromName(name) {
@@ -1276,6 +1345,91 @@ function stripBudgetSuffix(value) {
 function appendBudgetSuffix(value) {
   const base = stripBudgetSuffix(value) || "Holiday";
   return `${base} Budget`;
+}
+
+function parseTableDateValue(value) {
+  return core.parseIsoDate(value || "");
+}
+
+function parseTableLinkValue(value) {
+  return String(value || "").trim();
+}
+
+function parseWikiLinks(text) {
+  const matches = Array.from(String(text || "").matchAll(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g));
+  return matches.map((match) => ({
+    path: String(match[1] || "").trim(),
+    label: String(match[2] || match[1] || "").trim(),
+    raw: match[0],
+  })).filter((link) => link.path);
+}
+
+function extractPlannedLogMetadata(childLines = []) {
+  let startDate = "";
+  let endDate = "";
+  const detailLinks = [];
+  const detailLines = [];
+
+  for (const rawLine of childLines) {
+    const line = String(rawLine || "").trim();
+    if (!line) continue;
+    detailLines.push(line);
+
+    for (const link of parseWikiLinks(line)) {
+      detailLinks.push(link);
+    }
+
+    const dates = Array.from(line.matchAll(/\b\d{4}-\d{2}-\d{2}\b/g)).map((match) => core.parseIsoDate(match[0])).filter(Boolean);
+    if (!dates.length) continue;
+
+    const lower = line.toLowerCase();
+    if (dates.length >= 2) {
+      startDate = startDate || dates[0];
+      endDate = endDate || dates[1];
+      continue;
+    }
+
+    if (!startDate && (/\b(start|check[- ]?in|arrival|from)\b/.test(lower) || !endDate)) {
+      startDate = dates[0];
+      continue;
+    }
+
+    if (!endDate && /\b(end|check[- ]?out|departure|until|to)\b/.test(lower)) {
+      endDate = dates[0];
+      continue;
+    }
+
+    if (!endDate) {
+      endDate = dates[0];
+    }
+  }
+
+  if (startDate && !endDate) {
+    endDate = startDate;
+  }
+  if (endDate && !startDate) {
+    startDate = endDate;
+  }
+
+  return {
+    detailLines,
+    detailLinks,
+    endDate,
+    startDate,
+  };
+}
+
+function extractPlannedLineDates(line = "") {
+  const dates = Array.from(String(line || "").matchAll(/\b\d{4}-\d{2}-\d{2}\b/g))
+    .map((match) => core.parseIsoDate(match[0]))
+    .filter(Boolean);
+  if (!dates.length) {
+    return { startDate: "", endDate: "" };
+  }
+  return {
+    endDate: dates[1] || dates[0],
+    startDate: dates[0],
+  };
 }
 
 function normalizeCategoryOptions(value) {
@@ -1665,28 +1819,48 @@ class FinanceTrackerPlugin extends Plugin {
     const holidayKey = core.normalizeHolidayKey(frontmatter.holiday_tag || frontmatter.holiday || frontmatter.tag || inferredHolidayKey);
     const tables = core.parseMarkdownTable(content);
     const plannedExpenses = [];
+    const allocatedExpenses = [];
 
     for (const rows of tables) {
       for (const row of rows) {
-        const hasPlanningColumns =
-          "planned" in row || "estimate" in row || "estimated" in row || "booked" in row || "item" in row || "expense" in row;
-        if (!hasPlanningColumns) continue;
-        const planned = core.parseNumber(row.planned || row.estimate || row.estimated);
-        const booked = core.parseNumber(row.booked || row.committed || row.deposit);
         const item = String(row.item || row.name || row.expense || "").trim();
         const category = core.normalizeCategoryPath(row.category || row.group || "");
+        const startDate = parseTableDateValue(row.start || row.start_date || row["start date"] || "");
+        const endDate = parseTableDateValue(row.end || row.end_date || row["end date"] || "");
+        const link = parseTableLinkValue(row.link || row.note || row.location || "");
+        const allocated = core.parseNumber(row.allocated || row.allocation || row["allocated amount"]);
+        const planned = core.parseNumber(row.planned || row.estimate || row.estimated);
+        const booked = core.parseNumber(row.booked || row.committed || row.deposit);
+        const hasAllocatedColumns = "allocated" in row || "allocation" in row;
+        const hasPlannedColumns = "planned" in row || "estimate" in row || "estimated" in row || "booked" in row;
+        if (hasAllocatedColumns) {
+          if (!item && !category && !Number.isFinite(allocated)) continue;
+          allocatedExpenses.push({
+            item: item || core.displayCategoryPath(category || "uncategorized"),
+            category: category || "uncategorized",
+            allocated: Number.isFinite(allocated) ? Number(allocated.toFixed(2)) : 0,
+            endDate,
+            link,
+            startDate,
+          });
+          continue;
+        }
+        if (!hasPlannedColumns) continue;
         if (!item && !category && !Number.isFinite(planned) && !Number.isFinite(booked)) continue;
         plannedExpenses.push({
           item: item || core.displayCategoryPath(category || "uncategorized"),
           category: category || "uncategorized",
           booked: Number.isFinite(booked) ? Number(booked.toFixed(2)) : 0,
+          endDate,
           fullyPaid: /\b(?:true|yes|x|\[x\])\b/i.test(String(row.fully_paid || row["fully paid"] || "")),
+          link,
           planned: Number.isFinite(planned) ? Number(planned.toFixed(2)) : 0,
+          startDate,
         });
       }
     }
 
-    const totals = plannedExpenses.reduce(
+    const plannedTotals = plannedExpenses.reduce(
       (summary, item) => {
         summary.planned += Number(item.planned || 0);
         summary.booked += Number(item.booked || 0);
@@ -1694,9 +1868,17 @@ class FinanceTrackerPlugin extends Plugin {
       },
       { booked: 0, planned: 0 }
     );
+    const allocatedTotals = allocatedExpenses.reduce(
+      (summary, item) => {
+        summary.allocated += Number(item.allocated || 0);
+        return summary;
+      },
+      { allocated: 0 }
+    );
 
     return {
       activeSavingsGoal: /^(?:true|yes|1)$/i.test(String(frontmatter.active_savings_goal || "false")),
+      allocatedExpenses,
       currency: core.normalizeCurrency(frontmatter.currency || this.settings.defaultCurrency),
       carryMissedSavings: /^(?:true|yes|1)$/i.test(String(frontmatter.carry_missed_savings || "false")),
       endDate: core.parseIsoDate(frontmatter.end_date || frontmatter.end || frontmatter.return_date || ""),
@@ -1709,6 +1891,7 @@ class FinanceTrackerPlugin extends Plugin {
       holidayName: String(frontmatter.holiday_name || frontmatter.name || toTitleFromHolidayKey(holidayKey || guessHolidayTagFromName(this.getHolidayBudgetNameFromPath(filePath)))).trim(),
       plannedExpenses,
       savingsDisplayMode: String(frontmatter.savings_display_mode || "dual-phase").trim().toLowerCase(),
+      savingsProgressMode: String(frontmatter.savings_progress_mode || "account-plus-paid-planned").trim().toLowerCase(),
       savingsDueDate: core.parseIsoDate(frontmatter.savings_due_date || frontmatter.goal_due_date || frontmatter.start_date || ""),
       savingsGoalAmount: core.parseNumber(frontmatter.savings_goal_amount || frontmatter.total_budget || ""),
       savingsGoalKey: core.normalizeCategoryPath(frontmatter.savings_goal_key || frontmatter.goal_key || holidayKey.split("/")[1] || ""),
@@ -1716,8 +1899,9 @@ class FinanceTrackerPlugin extends Plugin {
       startDate: core.parseIsoDate(frontmatter.start_date || frontmatter.start || frontmatter.departure_date || ""),
       totalBudget: core.parseNumber(frontmatter.total_budget || frontmatter.budget || frontmatter.total || ""),
       totals: {
-        booked: Number(totals.booked.toFixed(2)),
-        planned: Number(totals.planned.toFixed(2)),
+        allocated: Number(allocatedTotals.allocated.toFixed(2)),
+        booked: Number(plannedTotals.booked.toFixed(2)),
+        planned: Number(plannedTotals.planned.toFixed(2)),
       },
     };
   }
@@ -1735,6 +1919,7 @@ class FinanceTrackerPlugin extends Plugin {
       goalName: String(frontmatter.goal_name || frontmatter.name || String(filePath || "").split("/").pop()?.replace(/\.md$/i, "") || "Savings Goal").trim(),
       goalType: String(frontmatter.goal_type || "general").trim().toLowerCase(),
       savingsDisplayMode: String(frontmatter.savings_display_mode || "standard").trim().toLowerCase(),
+      savingsProgressMode: String(frontmatter.savings_progress_mode || "account-only").trim().toLowerCase(),
       startingBalance: core.parseNumber(frontmatter.starting_balance || frontmatter.savings_starting_balance || "0") || 0,
       targetAmount: core.parseNumber(frontmatter.target_amount || frontmatter.savings_goal_amount || "0") || 0,
     };
@@ -1904,6 +2089,7 @@ class FinanceTrackerPlugin extends Plugin {
       "active_savings_goal: false",
       "carry_missed_savings: false",
       "savings_display_mode: dual-phase",
+      "savings_progress_mode: account-plus-paid-planned",
       `currency: ${currency}`,
       `start_date: ${startDate}`,
       `end_date: ${endDate}`,
@@ -1929,9 +2115,17 @@ class FinanceTrackerPlugin extends Plugin {
       "",
       "`Booked` means reserved or committed. If Booked is above 0 it overrides Planned for your remaining holiday budget.",
       "",
-      "| Item | Category | Planned | Booked | Fully Paid |",
-      "| --- | --- | ---: | ---: | --- |",
-      ...DEFAULT_HOLIDAY_PLANNED_EXPENSES.map((item) => `| ${item.item} | ${item.category} | 0 | 0 | false |`),
+      "| Item | Category | Planned | Booked | Start | End | Link |",
+      "| --- | --- | ---: | ---: | --- | --- | --- |",
+      ...DEFAULT_HOLIDAY_PLANNED_EXPENSES.map((item) => `| ${item.item} | ${item.category} | 0 | 0 | ${startDate} | ${startDate} |  |`),
+      "",
+      "## Allocated Expenses",
+      "",
+      "Use this table for predicted in-trip spending like transport, shopping, and food. If Start and End are blank the row spans the whole trip.",
+      "",
+      "| Item | Category | Allocated | Start | End | Link |",
+      "| --- | --- | ---: | --- | --- | --- |",
+      ...DEFAULT_HOLIDAY_ALLOCATED_EXPENSES.map((item) => `| ${item.item} | ${item.category} | 0 |  |  |  |`),
       "",
       "## Planned Expenses Log",
       "",
@@ -1944,7 +2138,7 @@ class FinanceTrackerPlugin extends Plugin {
   buildSavingsGoalNoteContent(title, options = {}) {
     const goalName = String(title || "Savings Goal").trim() || "Savings Goal";
     const goalKey = core.normalizeCategoryPath(options.goalKey || buildGoalKeyFromName(goalName));
-    const dueDate = core.parseIsoDate(options.dueDate || "");
+    const dueDate = core.parseIsoDate(options.dueDate || "") || core.todayIsoLocal();
     const currency = core.normalizeCurrency(options.currency || this.settings.defaultCurrency);
     return [
       "---",
@@ -1953,10 +2147,11 @@ class FinanceTrackerPlugin extends Plugin {
       "goal_type: general",
       "target_amount: 0",
       "starting_balance: 0",
-      `due_date: ${dueDate || ""}`,
+      `due_date: ${dueDate}`,
       "active_savings_goal: false",
       "carry_missed_savings: false",
       "savings_display_mode: standard",
+      "savings_progress_mode: account-only",
       `currency: ${currency}`,
       "---",
       "",
@@ -2192,6 +2387,7 @@ class FinanceTrackerPlugin extends Plugin {
     const tripDays = startDate && referenceDate < startDate ? 0 : core.daysBetweenInclusive(startDate || referenceDate, (endDate && endDate < referenceDate) ? endDate : referenceDate);
     const remainingTripDays = core.getRemainingTripDaysInclusive(startDate || referenceDate, endDate || referenceDate, referenceDate);
     const plannedSummary = core.buildPlannedExpenseSummary(holidayMeta?.plannedExpenses || [], plannedEntries);
+    const allocatedSummary = core.buildAllocatedExpenseSummary(holidayMeta?.allocatedExpenses || [], startDate, endDate);
     const actualTripSpend = core.roundCurrencyAmount(actualEntries.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
     const trackedPlannedSpend = core.roundCurrencyAmount(
       plannedSummary.rows.reduce((sum, row) => sum + Number(row.booked > 0 ? row.booked : row.paidFromLog || 0), 0)
@@ -2222,6 +2418,7 @@ class FinanceTrackerPlugin extends Plugin {
       averageTransportPerDay,
       canSpendPerDay,
       actualTripSpend,
+      allocatedSummary,
       plannedSummary,
       remaining,
       spendableRemaining,
@@ -2246,6 +2443,7 @@ class FinanceTrackerPlugin extends Plugin {
       if (holiday?.holidayKey) {
         goals.push({
           activeSavingsGoal: holiday.activeSavingsGoal,
+          allocatedExpenses: holiday.allocatedExpenses,
           carryMissedSavings: holiday.carryMissedSavings,
           currency: holiday.currency,
           dueDate: holiday.savingsDueDate,
@@ -2253,7 +2451,10 @@ class FinanceTrackerPlugin extends Plugin {
           goalKey: holiday.savingsGoalKey,
           goalName: holiday.holidayName,
           goalType: "holiday",
+          paidPlannedExpenses: 0,
+          plannedExpenses: holiday.plannedExpenses,
           savingsDisplayMode: holiday.savingsDisplayMode,
+          savingsProgressMode: holiday.savingsProgressMode,
           startDate: holiday.startDate,
           startingBalance: holiday.savingsStartingBalance,
           targetAmount: holiday.savingsGoalAmount || holiday.totalBudget || 0,
@@ -2269,14 +2470,25 @@ class FinanceTrackerPlugin extends Plugin {
     return goals;
   }
 
-  async buildSavingsGoalSummary(goalDefinition, referenceDate) {
+  async buildSavingsGoalSummary(goalDefinition, referenceDate, options = {}) {
     const allEntries = await this.collectTransactionsForRange({
       period: "all",
       start: "1900-01-01",
       end: "2999-12-31",
     });
-    return core.summarizeGoalProgress(goalDefinition, allEntries, referenceDate, {
-      period: this.settings.budgetCheckPeriod || "week",
+    let effectiveGoalDefinition = goalDefinition;
+    if (goalDefinition?.goalType === "holiday") {
+      const plannedEntries = allEntries.filter(
+        (entry) => entry.goalKey === goalDefinition.goalKey && core.isPlannedExpenseEntry(entry)
+      );
+      const plannedSummary = core.buildPlannedExpenseSummary(goalDefinition.plannedExpenses || [], plannedEntries);
+      effectiveGoalDefinition = {
+        ...goalDefinition,
+        paidPlannedExpenses: plannedSummary.totals.paidFromLog,
+      };
+    }
+    return core.summarizeGoalProgress(effectiveGoalDefinition, allEntries, referenceDate, {
+      period: options.period || this.settings.budgetCheckPeriod || "week",
       weekStartsOn: this.settings.weekStartsOn,
     });
   }
@@ -2465,6 +2677,86 @@ class FinanceTrackerPlugin extends Plugin {
     }
   }
 
+  describeSavingsGoalDueDate(goal, referenceDate) {
+    const dueDate = core.parseIsoDate(goal?.dueDate || goal?.savingsDueDate || "");
+    const reference = core.parseIsoDate(referenceDate || "");
+    if (!dueDate || !reference) return "No due date";
+    if (dueDate === reference) return "Due today";
+    const start = dueDate > reference ? reference : dueDate;
+    const end = dueDate > reference ? dueDate : reference;
+    const days = Math.max(0, core.daysBetweenInclusive(start, end) - 1);
+    if (dueDate > reference) {
+      return `${days} day${days === 1 ? "" : "s"} until due`;
+    }
+    return `${days} day${days === 1 ? "" : "s"} overdue`;
+  }
+
+  async renderSavingsActivity(wrapper, allEntries, currency, range, referenceDate) {
+    const contributionEntries = (allEntries || []).filter((entry) => entry.isGoalContribution);
+    const contributionTotals = new Map();
+    for (const entry of contributionEntries) {
+      const goalKey = core.normalizeCategoryPath(entry.goalKey || entry.category || "");
+      if (!goalKey) continue;
+      contributionTotals.set(
+        goalKey,
+        core.roundCurrencyAmount(Number(contributionTotals.get(goalKey) || 0) + Number(entry.amount || 0))
+      );
+    }
+
+    const goals = await this.collectSavingsGoalDefinitions();
+    const rows = [];
+    for (const goal of goals) {
+      const contributedThisRange = core.roundCurrencyAmount(Number(contributionTotals.get(goal.goalKey) || 0));
+      if (!(contributedThisRange > 0 || goal.activeSavingsGoal)) continue;
+      const summary = await this.buildSavingsGoalSummary(goal, referenceDate, { period: range.period });
+      rows.push({
+        contributedThisRange,
+        currency: goal.currency || currency,
+        dueText: this.describeSavingsGoalDueDate(goal, referenceDate),
+        goal,
+        summary,
+      });
+    }
+
+    if (!rows.length) return;
+
+    const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
+    section.createEl("h4", { text: "Savings Activity" });
+    section.createDiv({
+      cls: "finance-tracker-budget-meta",
+      text: `${core.formatCurrency(
+        core.roundCurrencyAmount(rows.reduce((sum, row) => sum + Number(row.contributedThisRange || 0), 0)),
+        currency
+      )} contributed this ${range.period}. Savings contributions are tracked separately from the spending pie chart.`,
+    });
+
+    const list = section.createDiv({ cls: "finance-tracker-budget-list" });
+    for (const row of rows) {
+      const item = list.createDiv({ cls: "finance-tracker-budget-card" });
+      const targetText = row.summary.currentPeriodContribution >= row.summary.requiredPerPeriod
+        ? "On track for this period."
+        : "Still below this period's target.";
+      item.createDiv({
+        cls: "finance-tracker-budget-title",
+        text: `${row.goal.goalName} - ${core.formatCurrency(row.contributedThisRange, row.currency)} contributed this ${range.period}`,
+      });
+      item.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: `${core.formatCurrency(row.summary.currentSaved, row.currency)} saved · ${core.formatCurrency(row.summary.amountRemaining, row.currency)} ${String(
+          row.summary.amountRemainingLabel || "remaining"
+        ).toLowerCase()}`,
+      });
+      item.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: `${core.formatCurrency(row.summary.requiredPerPeriod, row.currency)} target this ${range.period} · ${row.dueText}`,
+      });
+      item.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: targetText,
+      });
+    }
+  }
+
   renderHolidaySummary(wrapper, metrics, currency) {
     const cards = wrapper.createDiv({ cls: "finance-tracker-summary" });
     const cardData = [
@@ -2519,6 +2811,13 @@ class FinanceTrackerPlugin extends Plugin {
       meta.setText(
         `Planned ${core.formatCurrency(item.planned, currency)} · Booked ${core.formatCurrency(item.booked, currency)} · Paid ${core.formatCurrency(item.paidFromLog, currency)} · Remaining ${core.formatCurrency(item.remainingToPay, currency)}`
       );
+      const scheduleBits = [item.startDate, item.endDate].filter(Boolean);
+      if (scheduleBits.length || item.link) {
+        details.createDiv({
+          cls: "finance-tracker-planned-content finance-tracker-budget-meta",
+          text: `${scheduleBits.length ? scheduleBits.join(" to ") : "No dates set"}${item.link ? ` · ${item.link}` : ""}`,
+        });
+      }
       if (item.booked > 0) {
         details.createDiv({
           cls: "finance-tracker-planned-content finance-tracker-budget-meta",
@@ -2535,6 +2834,162 @@ class FinanceTrackerPlugin extends Plugin {
         }
       }
     }
+  }
+
+  renderAllocatedExpenses(wrapper, allocatedExpenses, currency) {
+    const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
+    section.createEl("h4", { text: "Allocated Expenses" });
+
+    if (!allocatedExpenses?.rows?.length) {
+      section.createDiv({
+        cls: "finance-tracker-empty",
+        text: "No allocated in-trip costs found yet. Add rows to the Allocated Expenses table in the holiday budget note.",
+      });
+      return;
+    }
+
+    const list = section.createDiv({ cls: "finance-tracker-budget-list" });
+    for (const item of allocatedExpenses.rows) {
+      const card = list.createDiv({ cls: "finance-tracker-budget-card" });
+      card.createDiv({
+        cls: "finance-tracker-budget-title",
+        text: `${item.item} - ${core.formatCurrency(item.allocated, currency)} · ${core.formatCurrency(item.allocatedPerDay, currency)}/day`,
+      });
+      if (item.link) {
+        card.createDiv({
+          cls: "finance-tracker-budget-meta",
+          text: item.link,
+        });
+      }
+    }
+  }
+
+  buildAccommodationPreparationMetrics(holidayMeta, plannedEntries = []) {
+    const tripDays = holidayMeta?.startDate && holidayMeta?.endDate
+      ? core.daysBetweenInclusive(holidayMeta.startDate, holidayMeta.endDate)
+      : 0;
+    const accommodationRow = (holidayMeta?.plannedExpenses || []).find(
+      (item) => core.normalizeCategoryPath(item.category || "") === "accommodation"
+    );
+    const plannedAccommodationTotal = core.roundCurrencyAmount(
+      Number(accommodationRow?.booked || 0) > 0 ? Number(accommodationRow.booked || 0) : Number(accommodationRow?.planned || 0)
+    );
+    const averageAccommodationPerDay = tripDays > 0
+      ? core.roundCurrencyAmount(plannedAccommodationTotal / tripDays)
+      : 0;
+
+    const nightlyRates = (plannedEntries || [])
+      .filter((entry) => core.isPlannedExpenseEntry(entry) && core.primaryCategory(entry.category) === "accommodation")
+      .map((entry) => {
+        const start = entry.plannedStartDate || "";
+        const end = entry.plannedEndDate || start;
+        const nights = start && end ? Math.max(1, core.daysBetweenInclusive(start, end)) : 1;
+        return core.roundCurrencyAmount(Number(entry.amount || 0) / nights);
+      })
+      .filter((value) => Number.isFinite(value) && value > 0);
+
+    return {
+      averageAccommodationPerDay,
+      maximumAccommodationPerNight: nightlyRates.length ? Math.max(...nightlyRates) : 0,
+      minimumAccommodationPerNight: nightlyRates.length ? Math.min(...nightlyRates) : 0,
+    };
+  }
+
+  renderPlannedExpenseCalendar(wrapper, plannedExpenses, plannedEntries, holidayMeta) {
+    const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
+    section.createEl("h4", { text: "Planned Expenses Calendar" });
+    const colorByCategory = {
+      accommodation: "is-accommodation",
+      flights: "is-flights",
+      recreation: "is-recreation",
+    };
+    const startDate = core.parseIsoDate(holidayMeta?.startDate || "");
+    const endDate = core.parseIsoDate(holidayMeta?.endDate || "");
+    const calendarEntries = (plannedEntries || []).filter((entry) => {
+      if (!core.isPlannedExpenseEntry(entry)) return false;
+      if (!["flights", "accommodation", "recreation"].includes(core.primaryCategory(entry.category))) return false;
+      return Boolean(entry.plannedStartDate || entry.plannedEndDate);
+    }).map((entry) => ({
+      category: entry.category,
+      displayAmount: entry.amount,
+      endDate: entry.plannedEndDate || entry.plannedStartDate,
+      item: entry.merchant || (entry.plannedDetailLinks?.[0]?.label) || core.displayCategoryPath(entry.category),
+      links: entry.plannedDetailLinks || [],
+      startDate: entry.plannedStartDate || entry.plannedEndDate,
+      textLines: entry.plannedDetailLines || [],
+    }));
+
+    if (!startDate || !endDate || !calendarEntries.length) {
+      section.createDiv({
+        cls: "finance-tracker-empty",
+        text: "Add dated planned log entries like `#log/26/japanmidyear/planned/accommodation 2026-06-18 2026-06-22` in your daily notes to populate the calendar.",
+      });
+      return;
+    }
+
+    const days = [];
+    for (let day = startDate; day && day <= endDate; day = core.addDays(day, 1)) {
+      days.push(day);
+    }
+
+    const itemsByDay = new Map();
+    for (const day of days) {
+      const entryItems = calendarEntries.filter((item) => {
+        const itemStart = item.startDate || startDate;
+        const itemEnd = item.endDate || endDate;
+        return day >= itemStart && day <= itemEnd;
+      });
+      itemsByDay.set(day, entryItems);
+    }
+
+    const grid = section.createDiv({ cls: "finance-tracker-calendar-grid" });
+    const details = section.createDiv({ cls: "finance-tracker-calendar-details" });
+    const renderDayDetails = (day) => {
+      details.empty();
+      const matching = itemsByDay.get(day) || [];
+      details.createEl("h5", { text: day });
+      if (!matching.length) {
+        details.createDiv({ cls: "finance-tracker-empty", text: "No planned items for this day." });
+        return;
+      }
+      for (const item of matching) {
+        const row = details.createDiv({ cls: "finance-tracker-budget-card" });
+        row.createDiv({ cls: "finance-tracker-budget-title", text: item.item });
+        row.createDiv({
+          cls: "finance-tracker-budget-meta",
+          text: `${core.titleCaseSegment(item.category)} · ${core.formatCurrency(item.displayAmount || 0, holidayMeta.currency)}`,
+        });
+        const links = item.links || [];
+        if (links.length) {
+          const linksEl = row.createDiv({ cls: "finance-tracker-calendar-links" });
+          for (const link of links) {
+            const button = linksEl.createEl("button", { text: link.label });
+            button.addEventListener("click", async () => {
+              await this.app.workspace.openLinkText(link.path, holidayMeta.filePath || "", true);
+            });
+          }
+        }
+        const extraLines = (item.textLines || []).filter((line) => !/\b\d{4}-\d{2}-\d{2}\b/.test(line));
+        for (const line of extraLines) {
+          row.createDiv({ cls: "finance-tracker-budget-meta", text: line });
+        }
+      }
+    };
+
+    for (const day of days) {
+      const button = grid.createEl("button", { cls: "finance-tracker-calendar-day" });
+      button.createDiv({ cls: "finance-tracker-calendar-date", text: day });
+      const chips = button.createDiv({ cls: "finance-tracker-calendar-chips" });
+      for (const item of itemsByDay.get(day) || []) {
+        chips.createDiv({
+          cls: `finance-tracker-calendar-chip ${colorByCategory[core.primaryCategory(item.category)] || ""}`,
+          text: item.item,
+        });
+      }
+      button.addEventListener("click", () => renderDayDetails(day));
+    }
+
+    renderDayDetails(days[0]);
   }
 
   renderExchangeRates(wrapper, holidayMeta) {
@@ -2580,18 +3035,32 @@ class FinanceTrackerPlugin extends Plugin {
     }
   }
 
-  renderSavingsSummary(wrapper, goal, summary, currency) {
+  renderSavingsSummary(wrapper, goal, summary, currency, extras = {}) {
     const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
     section.createEl("h4", { text: goal.goalName || "Savings Goal" });
     const cards = section.createDiv({ cls: "finance-tracker-summary" });
-    const cardData = [
-      { label: "Target", value: core.formatCurrency(summary.targetAmount, currency) },
-      { label: "Current Saved", value: core.formatCurrency(summary.currentSaved, currency) },
-      { label: summary.amountRemainingLabel, value: core.formatCurrency(summary.amountRemaining, currency) },
-      { label: "Saved %", value: summary.targetAmount > 0 ? `${summary.proportionSaved}%` : "0%" },
-      { label: "Required This Period", value: core.formatCurrency(summary.requiredPerPeriod, currency) },
-      { label: "This Period", value: core.formatCurrency(summary.currentPeriodContribution, currency) },
-    ];
+    const cardData = goal.goalType === "holiday"
+      ? [
+        { label: "Target", value: core.formatCurrency(summary.targetAmount, currency) },
+        { label: "Current Account Balance", value: core.formatCurrency(summary.currentAccountBalance, currency) },
+        { label: "Paid Planned Expenses", value: core.formatCurrency(summary.paidPlannedExpenses, currency) },
+        { label: "Saved Progress", value: core.formatCurrency(summary.savedProgress, currency) },
+        { label: summary.amountRemainingLabel, value: core.formatCurrency(summary.amountRemaining, currency) },
+        { label: "Saved %", value: summary.targetAmount > 0 ? `${summary.proportionSaved}%` : "0%" },
+        { label: "Required This Period", value: core.formatCurrency(summary.requiredPerPeriod, currency) },
+        { label: "This Period", value: core.formatCurrency(summary.currentPeriodContribution, currency) },
+        { label: "Avg Accommodation / Day", value: core.formatCurrency(extras.averageAccommodationPerDay || 0, currency) },
+        { label: "Maximum Spent / Night", value: extras.maximumAccommodationPerNight ? core.formatCurrency(extras.maximumAccommodationPerNight, currency) : "Not set" },
+        { label: "Minimum Spent / Night", value: extras.minimumAccommodationPerNight ? core.formatCurrency(extras.minimumAccommodationPerNight, currency) : "Not set" },
+      ]
+      : [
+        { label: "Target", value: core.formatCurrency(summary.targetAmount, currency) },
+        { label: "Current Saved", value: core.formatCurrency(summary.currentSaved, currency) },
+        { label: summary.amountRemainingLabel, value: core.formatCurrency(summary.amountRemaining, currency) },
+        { label: "Saved %", value: summary.targetAmount > 0 ? `${summary.proportionSaved}%` : "0%" },
+        { label: "Required This Period", value: core.formatCurrency(summary.requiredPerPeriod, currency) },
+        { label: "This Period", value: core.formatCurrency(summary.currentPeriodContribution, currency) },
+      ];
     for (const card of cardData) {
       const element = cards.createDiv({ cls: "finance-tracker-summary-card" });
       element.createDiv({ cls: "finance-tracker-summary-label", text: card.label });
@@ -2617,13 +3086,17 @@ class FinanceTrackerPlugin extends Plugin {
       if (holiday?.holidayKey) {
         goalDefinition = {
           activeSavingsGoal: holiday.activeSavingsGoal,
+          allocatedExpenses: holiday.allocatedExpenses,
           carryMissedSavings: holiday.carryMissedSavings,
           currency: holiday.currency,
           dueDate: holiday.savingsDueDate,
           goalKey: holiday.savingsGoalKey,
           goalName: holiday.holidayName,
           goalType: "holiday",
+          paidPlannedExpenses: 0,
+          plannedExpenses: holiday.plannedExpenses,
           savingsDisplayMode: holiday.savingsDisplayMode,
+          savingsProgressMode: holiday.savingsProgressMode,
           startDate: holiday.startDate,
           startingBalance: holiday.savingsStartingBalance,
           targetAmount: holiday.savingsGoalAmount || holiday.totalBudget || 0,
@@ -2643,8 +3116,36 @@ class FinanceTrackerPlugin extends Plugin {
     const summary = await this.buildSavingsGoalSummary(goalDefinition, referenceDate);
     const wrapper = el.createDiv({ cls: "finance-tracker-dashboard" });
     const header = wrapper.createDiv({ cls: "finance-tracker-header" });
-    header.createEl("h3", { text: config.title || `${goalDefinition.goalName} Savings Dashboard` });
-    this.renderSavingsSummary(wrapper, goalDefinition, summary, goalDefinition.currency || this.settings.defaultCurrency);
+    header.createEl("h3", { text: config.title || `${goalDefinition.goalName} ${goalDefinition.goalType === "holiday" ? "Trip Preparation Dashboard" : "Savings Dashboard"}` });
+    if (goalDefinition.goalType === "holiday") {
+      const holidayMeta = this.parseHolidayBudgetContent(await this.app.vault.cachedRead(sourceFile), sourceFile.path);
+      const plannedEntries = await this.collectTransactionsForHoliday(holidayMeta.holidayKey, {
+        start: "1900-01-01",
+        end: referenceDate,
+      });
+      const plannedSummary = core.buildPlannedExpenseSummary(
+        holidayMeta.plannedExpenses || [],
+        plannedEntries.filter((entry) => core.isPlannedExpenseEntry(entry))
+      );
+      const allocatedSummary = core.buildAllocatedExpenseSummary(holidayMeta.allocatedExpenses || [], holidayMeta.startDate, holidayMeta.endDate);
+      const accommodationMetrics = this.buildAccommodationPreparationMetrics(holidayMeta, plannedEntries.filter((entry) => core.isPlannedExpenseEntry(entry)));
+      this.renderSavingsSummary(
+        wrapper,
+        goalDefinition,
+        summary,
+        goalDefinition.currency || this.settings.defaultCurrency,
+        accommodationMetrics
+      );
+      this.renderPlannedExpenseCalendar(
+        wrapper,
+        plannedSummary,
+        plannedEntries.filter((entry) => core.isPlannedExpenseEntry(entry)),
+        holidayMeta
+      );
+      this.renderAllocatedExpenses(wrapper, allocatedSummary, goalDefinition.currency || this.settings.defaultCurrency);
+    } else {
+      this.renderSavingsSummary(wrapper, goalDefinition, summary, goalDefinition.currency || this.settings.defaultCurrency);
+    }
   }
 
   async renderHolidayDashboard(source, el, ctx) {
@@ -2711,7 +3212,6 @@ class FinanceTrackerPlugin extends Plugin {
         currency
       );
 
-      this.renderPlannedExpenses(wrapper, metrics.plannedSummary, currency);
       this.renderExchangeRates(wrapper, holidayMeta);
     } catch (error) {
       const wrapper = el.createDiv({ cls: "finance-tracker-dashboard" });
@@ -2880,7 +3380,8 @@ class FinanceTrackerPlugin extends Plugin {
       await this.openDefaultBudgetNote();
     });
 
-    const entries = (await this.collectTransactionsForRange(range)).filter(
+    const allEntries = await this.collectTransactionsForRange(range);
+    const entries = allEntries.filter(
       (entry) => !core.isPlannedExpenseEntry(entry) && !entry.isIncome && !entry.isGoalContribution && entry.entryType !== "goal-withdrawal"
     );
     this.renderSummary(wrapper, entries, currency, range);
@@ -2891,6 +3392,7 @@ class FinanceTrackerPlugin extends Plugin {
     const budgets = await this.loadBudgets("default");
     const budgetProgress = this.buildBudgetProgress(entries, budgets, range, groupBy, referenceDate);
     this.renderBudgets(wrapper, budgetProgress, currency);
+    await this.renderSavingsActivity(wrapper, allEntries, currency, range, referenceDate);
   }
 }
 

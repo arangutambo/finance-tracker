@@ -130,6 +130,69 @@
   gap: 12px;
 }
 
+.finance-tracker-calendar-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.finance-tracker-calendar-day {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  background: var(--background-primary);
+  padding: 10px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.finance-tracker-calendar-date {
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.finance-tracker-calendar-chips {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.finance-tracker-calendar-chip {
+  border-radius: 999px;
+  padding: 4px 8px;
+  font-size: 0.82em;
+  color: white;
+  background: #4a5568;
+}
+
+.finance-tracker-calendar-chip.is-flights {
+  background: #2b6cb0;
+}
+
+.finance-tracker-calendar-chip.is-accommodation {
+  background: #2f855a;
+}
+
+.finance-tracker-calendar-chip.is-recreation {
+  background: #d69e2e;
+}
+
+.finance-tracker-calendar-details {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.finance-tracker-calendar-details h5 {
+  margin: 0;
+}
+
+.finance-tracker-calendar-links {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .finance-tracker-planned-list {
   display: flex;
   flex-direction: column;

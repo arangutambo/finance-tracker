@@ -10,7 +10,7 @@ Finance Tracker is an Obsidian plugin for logging spending from Apple Shortcuts 
 - Writes entries as plain markdown using `#log/spending/{{category}}` tags.
 - Renders a weekly `finance-dashboard` code block with a pie chart and budget progress.
 - Renders a dedicated `holiday-dashboard` code block for trip spending and holiday budget progress.
-- Renders a `savings-dashboard` code block for savings goals and holiday funding.
+- Renders a `savings-dashboard` code block for savings goals and a holiday trip-preparation dashboard.
 - Adds a command to write flat or period-based exchange rates into a holiday budget note.
 - Adds a command to create standalone savings goal notes.
 - Exports parsed transactions to CSV.
@@ -115,7 +115,7 @@ Add this code block to a savings goal note or holiday budget note:
 ```savings-dashboard
 ```
 
-It shows:
+For normal savings goals it shows:
 
 - target amount
 - current saved
@@ -123,6 +123,17 @@ It shows:
 - required this period
 - saved percentage
 - current period contributions
+
+For holiday notes the same block renders a Trip Preparation dashboard that shows:
+
+- current account balance
+- paid planned expenses
+- saved progress
+- still need to save before departure
+- travel budget remaining after departure
+- required this period
+- a planned-expenses calendar
+- planned and allocated expense sections
 
 ## Holiday dashboard
 
@@ -167,7 +178,7 @@ Example:
 | All Spending | all | 450 | week | AUD |
 ```
 
-Holiday budget notes include frontmatter, savings fields, and a planned-expenses table. Example:
+Holiday budget notes include frontmatter, savings fields, a planned-expenses table, and an allocated-expenses table. Example:
 
 ```md
 ---
@@ -181,6 +192,7 @@ savings_due_date: 2026-09-10
 active_savings_goal: true
 carry_missed_savings: false
 savings_display_mode: dual-phase
+savings_progress_mode: account-plus-paid-planned
 currency: AUD
 start_date: 2026-09-10
 end_date: 2026-09-24
@@ -188,13 +200,17 @@ exchange_rates: JPY=0.0097, JPY CASH=0.0100, USD=1.53
 exchange_rate_periods: 2026-09-10..2026-09-14:JPY=0.0098, JPY CASH=0.0101; 2026-09-15..2026-09-24:JPY=0.0095
 ---
 
-| Item | Category | Planned | Booked | Fully Paid |
-| --- | --- | ---: | ---: | --- |
-| Flights | flights | 1200 | 1200 | false |
-| Accommodation | accommodation | 1800 | 900 | false |
-| Recreation | recreation | 700 | 0 | false |
-| Transport | transport | 250 | 0 | false |
-| Shopping | shopping | 400 | 0 | false |
+| Item | Category | Planned | Booked |
+| --- | --- | ---: | ---: |
+| Flights | flights | 1200 | 1200 |
+| Accommodation Total | accommodation | 1800 | 900 |
+| Recreation | recreation | 700 | 0 |
+
+| Item | Category | Allocated | Start | End | Link |
+| --- | --- | ---: | --- | --- | --- |
+| Transport | transport | 250 |  |  |  |
+| Shopping | shopping | 400 |  |  | [[_ Tokyo Shopping List]] |
+| Food | food | 600 |  |  | [[_ Japan Food Ideas]] |
 ```
 
 When you create a new holiday from settings, the modal now lets you set:
@@ -210,7 +226,7 @@ Holiday detection:
 - the plugin treats spending as holiday spending automatically when the transaction date falls between a holiday budget note's `start_date` and `end_date`
 - holiday budgets can still be created, selected, and archived from settings
 
-New holiday notes seed planned expenses with `flights`, `accommodation`, `recreation`, `transport`, and `shopping`.
+New holiday notes seed planned expenses with `flights`, `accommodation`, and `recreation`, and allocated expenses with `transport`, `shopping`, and `food`.
 
 Standalone savings goal notes:
 
@@ -274,7 +290,13 @@ Planned expense columns:
 
 - `Planned`: the fallback amount used for holiday planning
 - `Booked`: the committed amount that overrides `Planned` once it is above `0`
-- `Fully Paid`: derived by the dashboard when the sum of matching `#log/.../spending/planned/...` payments equals the `Booked` amount
+- these rows are for whole-trip planning metrics only and do not create calendar events
+
+Allocated expense columns:
+
+- `Allocated`: your predicted in-trip spend for that bucket
+- `Start` and `End`: optional span for that allocation; if blank it uses the whole trip
+- `Link`: optional supporting note or location link
 
 Planned-payment rules:
 
@@ -287,10 +309,42 @@ Savings frontmatter:
 - `active_savings_goal: true|false`
 - `carry_missed_savings: true|false`
 - `savings_display_mode: standard|dual-phase`
+- `savings_progress_mode: account-plus-paid-planned|account-only`
 - `savings_goal_key`
 - `savings_goal_amount`
 - `savings_starting_balance`
 - `savings_due_date`
+
+Holiday savings math:
+
+- `Current Account Balance` = starting balance + contributions - withdrawals
+- `Paid Planned Expenses` = paid amounts matched from planned-expense logs like `#log/spending/26/japanmidyear/planned/flights`
+- `Saved Progress` = current account balance + paid planned expenses when `savings_progress_mode: account-plus-paid-planned`
+- `Still Need To Save` = savings goal amount - saved progress before the trip
+
+Trip Preparation calendar:
+
+- the calendar is driven only by planned holiday log entries in daily notes
+- planned table rows do not create calendar events
+- use dated planned log entries like:
+
+```md
+- $1460.32 #log/26/japanmidyear/planned/flights 2026-06-18
+	- [[_ Brisbane Airport]]
+- $500 #log/26/japanmidyear/planned/accommodation 2026-06-18 2026-06-22
+	- [[_ Tokyo Hotel Example]]
+- $120 #log/26/japanmidyear/planned/recreation 2026-06-24
+	- [[_ Kyoto Tea Ceremony Example]]
+```
+
+- when you click a day in the Trip Preparation calendar, that day's matching flight, accommodation, and recreation entries appear underneath with their indented notes and clickable `[[...]]` links
+
+Example standalone savings goal:
+
+- `Utility/Budgets/Roadbike Savings Goal.md`
+- target amount `3000`
+- goal key `roadbike`
+- standard savings mode with a working `savings-dashboard` block
 
 ## Settings
 
