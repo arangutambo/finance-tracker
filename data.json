@@ -20,7 +20,7 @@
   "openDailyNoteAfterCapture": false,
   "dashboardDefaultGroupBy": "primary",
   "dashboardSliceLabelThreshold": 0.08,
-  "budgetCheckPeriod": "week",
+  "budgetCheckPeriod": "fortnight",
   "weekStartsOn": "monday",
   "csvExportFolder": "Utility/Exports",
   "categoryTagRoot": "#finance/category",

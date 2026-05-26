@@ -461,20 +461,6 @@ function extractNoteDate(content, filePath) {
   return null;
 }
 
-function extractMerchantFromChildLines(lines, startIndex) {
-  for (let index = startIndex + 1; index < lines.length; index += 1) {
-    const line = String(lines[index] || "");
-    if (/^\t\t- /.test(line) || /^\s{4,}- /.test(line)) {
-      const child = line.replace(/^\s*-\s*/, "").trim();
-      if (child && !child.startsWith("#")) return normalizeWhitespace(child);
-      continue;
-    }
-    if (!line.trim()) continue;
-    break;
-  }
-  return "";
-}
-
 function extractPlannedLogMetadata(childLines = []) {
   let startDate = "";
   let endDate = "";
@@ -567,6 +553,7 @@ function parseTransactionLine(line, noteDate, filePath, options = {}, childLines
 
   return {
     amount: Number(Number(amount).toFixed(2)),
+    card: "",
     category,
     categoryDisplay: displayCategoryPath(category),
     categoryPrimary: primaryCategory(category),
@@ -588,12 +575,14 @@ function parseTransactionLine(line, noteDate, filePath, options = {}, childLines
     plannedStartDate: plannedLogMeta.startDate || plannedLineDates.startDate,
     holidayYear: holidayContext.holidayYear,
     merchant,
+    name: merchant,
     originalAmount: Number.isFinite(originalAmount) ? Number(Number(originalAmount).toFixed(2)) : null,
     originalCurrency: originalSide ? originalDescriptor.currency : "",
     originalRateKey: originalSide ? originalDescriptor.rateKey : "",
     note,
     rawLine: text,
     source: "",
+    transaction: "",
   };
 }
 
@@ -1127,8 +1116,11 @@ function buildCsv(entries) {
     "currency",
     "category",
     "category_display",
+    "card",
     "merchant",
+    "name",
     "note",
+    "transaction",
     "source",
     "file_path",
   ];
@@ -1145,8 +1137,11 @@ function buildCsv(entries) {
     entry.currency || "",
     entry.category || "",
     entry.categoryDisplay || "",
+    entry.card || "",
     entry.merchant || "",
+    entry.name || "",
     entry.note || "",
+    entry.transaction || "",
     entry.source || "",
     entry.filePath || "",
   ]);

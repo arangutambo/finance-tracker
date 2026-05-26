@@ -470,6 +470,10 @@ const core = (() => {
         childLines.push(line.replace(/^\s*-\s*/, "").trim());
         continue;
       }
+      if ((/^\t- /.test(line) || /^\s{2,}- /.test(line)) && !/#log\//i.test(line)) {
+        childLines.push(line.replace(/^\s*-\s*/, "").trim());
+        continue;
+      }
       if (!line.trim()) continue;
       break;
     }
@@ -1087,6 +1091,7 @@ const core = (() => {
   }
 
   return {
+    addDays,
     buildCategoryTag,
     buildAllocatedExpenseSummary,
     buildCsv,
@@ -2657,10 +2662,11 @@ class FinanceTrackerPlugin extends Plugin {
       return;
     }
 
-    const list = section.createDiv({ cls: "finance-tracker-budget-list" });
+    const list = section.createDiv({ cls: `finance-tracker-budget-list${options.compact ? " is-compact" : ""}` });
     for (const budget of budgets) {
-      const item = list.createDiv({ cls: "finance-tracker-budget-card" });
+      const item = list.createDiv({ cls: `finance-tracker-budget-card${options.compact ? " is-compact" : ""}` });
       const status = budget.ratio > 1 ? "is-over" : budget.ratio > 0.8 ? "is-near" : "is-good";
+      item.addClass(status);
       item.createDiv({
         cls: "finance-tracker-budget-title",
         text: `${budget.name} - ${core.formatCurrency(budget.spent, currency)} / ${core.formatCurrency(budget.effectiveLimit || budget.limit, currency)}`,
@@ -2671,9 +2677,11 @@ class FinanceTrackerPlugin extends Plugin {
           : `${core.formatCurrency(Math.abs(budget.remaining), currency)} over budget`;
       item.createDiv({ cls: "finance-tracker-budget-meta", text: metaText });
 
-      const bar = item.createDiv({ cls: "finance-tracker-budget-bar" });
-      const fill = bar.createDiv({ cls: `finance-tracker-budget-fill ${status}` });
-      fill.style.width = `${Math.min(budget.ratio, 1.4) * 100}%`;
+      if (!options.compact) {
+        const bar = item.createDiv({ cls: "finance-tracker-budget-bar" });
+        const fill = bar.createDiv({ cls: `finance-tracker-budget-fill ${status}` });
+        fill.style.width = `${Math.min(budget.ratio, 1.4) * 100}%`;
+      }
     }
   }
 
@@ -2898,98 +2906,474 @@ class FinanceTrackerPlugin extends Plugin {
   renderPlannedExpenseCalendar(wrapper, plannedExpenses, plannedEntries, holidayMeta) {
     const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
     section.createEl("h4", { text: "Planned Expenses Calendar" });
-    const colorByCategory = {
-      accommodation: "is-accommodation",
-      flights: "is-flights",
-      recreation: "is-recreation",
-    };
-    const startDate = core.parseIsoDate(holidayMeta?.startDate || "");
-    const endDate = core.parseIsoDate(holidayMeta?.endDate || "");
-    const calendarEntries = (plannedEntries || []).filter((entry) => {
-      if (!core.isPlannedExpenseEntry(entry)) return false;
-      if (!["flights", "accommodation", "recreation"].includes(core.primaryCategory(entry.category))) return false;
-      return Boolean(entry.plannedStartDate || entry.plannedEndDate);
-    }).map((entry) => ({
-      category: entry.category,
-      displayAmount: entry.amount,
-      endDate: entry.plannedEndDate || entry.plannedStartDate,
-      item: entry.merchant || (entry.plannedDetailLinks?.[0]?.label) || core.displayCategoryPath(entry.category),
-      links: entry.plannedDetailLinks || [],
-      startDate: entry.plannedStartDate || entry.plannedEndDate,
-      textLines: entry.plannedDetailLines || [],
-    }));
-
-    if (!startDate || !endDate || !calendarEntries.length) {
-      section.createDiv({
-        cls: "finance-tracker-empty",
-        text: "Add dated planned log entries like `#log/26/japanmidyear/planned/accommodation 2026-06-18 2026-06-22` in your daily notes to populate the calendar.",
+    try {
+      const startDate = core.parseIsoDate(holidayMeta?.startDate || "");
+      const endDate = core.parseIsoDate(holidayMeta?.endDate || "");
+      const weekStartsOn = this.settings?.weekStartsOn === "sunday" ? "sunday" : "monday";
+      const weekdayLabels = weekStartsOn === "sunday"
+        ? ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        : ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+      const colorByCategory = {
+        accommodation: "is-accommodation",
+        flights: "is-flights",
+        recreation: "is-recreation",
+      };
+      const filterOptions = ["all", "accommodation", "flights", "recreation"];
+      const categoryLabel = (value) => {
+        const normalized = core.normalizeCategoryPath(value || "");
+        if (!normalized) return "Planned";
+        return normalized
+          .split("/")
+          .filter(Boolean)
+          .map((segment) => segment.charAt(0).toUpperCase() + segment.slice(1))
+          .join(" / ");
+      };
+      const getWeekdayIndex = (iso) => {
+        const weekday = new Date(`${iso}T12:00:00`).getDay();
+        return weekStartsOn === "sunday" ? weekday : (weekday + 6) % 7;
+      };
+      const getAccommodationNightlyRate = (item) => {
+        const start = item.startDate || "";
+        const end = item.endDate || start;
+        const nights = start && end ? Math.max(1, core.daysBetweenInclusive(start, end)) : 1;
+        return core.roundCurrencyAmount(Number(item.displayAmount || 0) / nights);
+      };
+      const isCategoryVisibleForDay = (items, activeFilter) => {
+        if (activeFilter === "all") return items.length > 0;
+        return items.some((item) => core.primaryCategory(item.category) === activeFilter);
+      };
+      const monthKeyForDay = (iso) => iso.slice(0, 7);
+      const monthLabelForDay = (iso) => new Date(`${iso}T12:00:00`).toLocaleDateString("en-AU", {
+        month: "long",
+        year: "numeric",
       });
-      return;
-    }
 
-    const days = [];
-    for (let day = startDate; day && day <= endDate; day = core.addDays(day, 1)) {
-      days.push(day);
-    }
-
-    const itemsByDay = new Map();
-    for (const day of days) {
-      const entryItems = calendarEntries.filter((item) => {
-        const itemStart = item.startDate || startDate;
-        const itemEnd = item.endDate || endDate;
-        return day >= itemStart && day <= itemEnd;
-      });
-      itemsByDay.set(day, entryItems);
-    }
-
-    const grid = section.createDiv({ cls: "finance-tracker-calendar-grid" });
-    const details = section.createDiv({ cls: "finance-tracker-calendar-details" });
-    const renderDayDetails = (day) => {
-      details.empty();
-      const matching = itemsByDay.get(day) || [];
-      details.createEl("h5", { text: day });
-      if (!matching.length) {
-        details.createDiv({ cls: "finance-tracker-empty", text: "No planned items for this day." });
+      const calendarEntries = (plannedEntries || []).filter((entry) => {
+        if (!core.isPlannedExpenseEntry(entry)) return false;
+        if (!["flights", "accommodation", "recreation"].includes(core.primaryCategory(entry.category))) return false;
+        return Boolean(entry.plannedStartDate || entry.plannedEndDate);
+      }).map((entry) => ({
+        category: entry.category,
+        displayAmount: entry.amount,
+        endDate: entry.plannedEndDate || entry.plannedStartDate,
+        item: entry.merchant || (entry.plannedDetailLinks?.[0]?.label) || core.displayCategoryPath(entry.category),
+        links: entry.plannedDetailLinks || [],
+        startDate: entry.plannedStartDate || entry.plannedEndDate,
+        textLines: entry.plannedDetailLines || [],
+      }));
+      if (!startDate || !endDate || !calendarEntries.length) {
+        section.createDiv({
+          cls: "finance-tracker-empty",
+          text: "Add dated planned log entries like `#log/26/japanmidyear/planned/accommodation 2026-06-18 2026-06-22` in your daily notes to populate the calendar.",
+        });
         return;
       }
-      for (const item of matching) {
-        const row = details.createDiv({ cls: "finance-tracker-budget-card" });
-        row.createDiv({ cls: "finance-tracker-budget-title", text: item.item });
-        row.createDiv({
-          cls: "finance-tracker-budget-meta",
-          text: `${core.titleCaseSegment(item.category)} · ${core.formatCurrency(item.displayAmount || 0, holidayMeta.currency)}`,
+
+      const tripDays = [];
+      for (let day = startDate; day && day <= endDate; day = core.addDays(day, 1)) {
+        tripDays.push(day);
+      }
+
+      const itemsByDay = new Map();
+      for (const day of tripDays) {
+        const entryItems = calendarEntries.filter((item) => {
+          const itemStart = item.startDate || startDate;
+          const itemEnd = item.endDate || endDate;
+          return day >= itemStart && day <= itemEnd;
         });
-        const links = item.links || [];
-        if (links.length) {
-          const linksEl = row.createDiv({ cls: "finance-tracker-calendar-links" });
-          for (const link of links) {
-            const button = linksEl.createEl("button", { text: link.label });
-            button.addEventListener("click", async () => {
-              await this.app.workspace.openLinkText(link.path, holidayMeta.filePath || "", true);
+        itemsByDay.set(day, entryItems);
+      }
+
+      const eventDays = tripDays.filter((day) => (itemsByDay.get(day) || []).length > 0);
+      if (!eventDays.length) {
+        section.createDiv({
+          cls: "finance-tracker-empty",
+          text: "No dated planned items matched the current trip range.",
+        });
+        return;
+      }
+
+      const tripWeeks = [];
+      let currentWeek = [];
+      for (const day of tripDays) {
+        if (!currentWeek.length) {
+          currentWeek.push(day);
+          continue;
+        }
+        const previousIndex = getWeekdayIndex(currentWeek[currentWeek.length - 1]);
+        const currentIndex = getWeekdayIndex(day);
+        if (currentIndex <= previousIndex) {
+          tripWeeks.push(currentWeek);
+          currentWeek = [day];
+        } else {
+          currentWeek.push(day);
+        }
+      }
+      if (currentWeek.length) {
+        tripWeeks.push(currentWeek);
+      }
+
+      const monthAccentPalette = [
+        "var(--h1-color, var(--text-accent))",
+        "var(--h2-color, var(--interactive-accent))",
+        "var(--h3-color, #2b6cb0)",
+        "var(--h4-color, #d53f8c)",
+        "var(--h5-color, #2f855a)",
+        "var(--h6-color, #d69e2e)",
+      ];
+      const monthMetaByKey = new Map();
+      for (let weekIndex = 0; weekIndex < tripWeeks.length; weekIndex += 1) {
+        const week = tripWeeks[weekIndex];
+        for (const day of week) {
+          const monthKey = monthKeyForDay(day);
+          if (!monthMetaByKey.has(monthKey)) {
+            monthMetaByKey.set(monthKey, {
+              accent: monthAccentPalette[monthMetaByKey.size % monthAccentPalette.length],
+              firstDay: day,
+              key: monthKey,
+              label: monthLabelForDay(day),
+              lastDay: day,
+            });
+          } else {
+            const monthMeta = monthMetaByKey.get(monthKey);
+            monthMeta.lastDay = day;
+          }
+        }
+      }
+
+      let activeFilter = "all";
+      let selectedDay = "";
+      const cellRefs = new Map();
+      const weekRefs = new Map();
+      const filterButtons = new Map();
+
+      const renderInlineDetails = (container, day, filterValue) => {
+        container.empty();
+        if (!day) return;
+        const dayItems = (itemsByDay.get(day) || []).filter((item) => {
+          if (filterValue === "all") return true;
+          return core.primaryCategory(item.category) === filterValue;
+        });
+        if (!dayItems.length) return;
+
+        const panel = container.createDiv({ cls: "finance-tracker-calendar-inline-details" });
+        panel.createDiv({ cls: "finance-tracker-calendar-inline-date", text: day });
+        const groupedItems = new Map();
+        for (const item of dayItems) {
+          const categoryKey = core.primaryCategory(item.category) || item.category || "other";
+          const existing = groupedItems.get(categoryKey) || {
+            amount: 0,
+            category: item.category,
+            item: categoryLabel(categoryKey),
+            links: [],
+            nightlyAmount: 0,
+            textLines: [],
+          };
+          existing.amount += Number(item.displayAmount || 0);
+          if (categoryKey === "accommodation") {
+            existing.nightlyAmount += getAccommodationNightlyRate(item);
+          }
+          for (const link of item.links || []) {
+            if (!existing.links.some((candidate) => candidate?.path === link?.path && candidate?.label === link?.label)) {
+              existing.links.push(link);
+            }
+          }
+          for (const line of item.textLines || []) {
+            if (!existing.textLines.includes(line)) existing.textLines.push(line);
+          }
+          groupedItems.set(categoryKey, existing);
+        }
+
+        for (const aggregatedItem of groupedItems.values()) {
+          const row = panel.createDiv({ cls: "finance-tracker-calendar-inline-item" });
+          const summary = row.createDiv({ cls: "finance-tracker-calendar-inline-summary" });
+          summary.createDiv({
+            cls: "finance-tracker-budget-title",
+            text: aggregatedItem.item,
+          });
+          const metaParts = [
+            core.formatCurrency(core.roundCurrencyAmount(aggregatedItem.amount), holidayMeta.currency),
+          ];
+          if ((core.primaryCategory(aggregatedItem.category) || aggregatedItem.category) === "accommodation" && aggregatedItem.nightlyAmount) {
+            metaParts.push(`${core.formatCurrency(core.roundCurrencyAmount(aggregatedItem.nightlyAmount), holidayMeta.currency)} / night`);
+          }
+          summary.createDiv({
+            cls: "finance-tracker-budget-meta",
+            text: metaParts.join(" · "),
+          });
+          const links = aggregatedItem.links || [];
+          if (links.length) {
+            const linksEl = row.createDiv({ cls: "finance-tracker-calendar-links" });
+            for (const link of links) {
+              const button = linksEl.createEl("button", {
+                cls: "finance-tracker-link-button",
+                text: link?.label || link?.path || "Open linked note",
+              });
+              button.addEventListener("click", async () => {
+                if (!link?.path) return;
+                await this.app.workspace.openLinkText(link.path, holidayMeta.filePath || "", true);
+              });
+            }
+          }
+          const extraLines = (aggregatedItem.textLines || []).filter((line) => {
+            if (/\b\d{4}-\d{2}-\d{2}\b/.test(line)) return false;
+            return !/\[\[.*\]\]/.test(line);
+          });
+          for (const line of extraLines) {
+            row.createDiv({ cls: "finance-tracker-budget-meta", text: line });
+          }
+        }
+      };
+
+      const refreshCalendarState = () => {
+        if (selectedDay && !isCategoryVisibleForDay(itemsByDay.get(selectedDay) || [], activeFilter)) {
+          selectedDay = "";
+        }
+        for (const [filterValue, button] of filterButtons.entries()) {
+          button.toggleClass("is-active", filterValue === activeFilter);
+        }
+        for (const [iso, ref] of cellRefs.entries()) {
+          const { cell, dots } = ref;
+          const dayItems = itemsByDay.get(iso) || [];
+          const matchesFilter = isCategoryVisibleForDay(dayItems, activeFilter);
+          const primaryCategories = [...new Set(dayItems.map((item) => core.primaryCategory(item.category)).filter(Boolean))];
+          const visibleCategories = activeFilter === "all"
+            ? primaryCategories
+            : primaryCategories.filter((category) => category === activeFilter);
+          cell.removeClass("filter-accommodation", "filter-flights", "filter-recreation");
+          if (activeFilter !== "all" && matchesFilter) {
+            cell.addClass(`filter-${activeFilter}`);
+          }
+          cell.toggleClass("is-filter-match", activeFilter !== "all" && matchesFilter);
+          cell.toggleClass("is-filter-dimmed", activeFilter !== "all" && !matchesFilter && dayItems.length > 0);
+          cell.toggleClass("is-selected", iso === selectedDay);
+          dots.empty();
+          for (const category of visibleCategories) {
+            dots.createSpan({
+              cls: `finance-tracker-calendar-dot ${colorByCategory[category] || ""}`,
             });
           }
         }
-        const extraLines = (item.textLines || []).filter((line) => !/\b\d{4}-\d{2}-\d{2}\b/.test(line));
-        for (const line of extraLines) {
-          row.createDiv({ cls: "finance-tracker-budget-meta", text: line });
+        for (const [, ref] of weekRefs.entries()) {
+          const detailDay = ref.days.includes(selectedDay) ? selectedDay : "";
+          renderInlineDetails(ref.detail, detailDay, activeFilter);
         }
-      }
-    };
+      };
 
-    for (const day of days) {
-      const button = grid.createEl("button", { cls: "finance-tracker-calendar-day" });
-      button.createDiv({ cls: "finance-tracker-calendar-date", text: day });
-      const chips = button.createDiv({ cls: "finance-tracker-calendar-chips" });
-      for (const item of itemsByDay.get(day) || []) {
-        chips.createDiv({
-          cls: `finance-tracker-calendar-chip ${colorByCategory[core.primaryCategory(item.category)] || ""}`,
-          text: item.item,
+      const headers = section.createDiv({ cls: "finance-tracker-calendar-weekdays" });
+      for (const label of weekdayLabels) {
+        headers.createDiv({ cls: "finance-tracker-calendar-weekday", text: label });
+      }
+
+      const calendarBody = section.createDiv({ cls: "finance-tracker-calendar-body" });
+      const overlayHost = calendarBody.createDiv({ cls: "finance-tracker-calendar-overlay-host" });
+      const calendarCellMeta = new Map();
+      for (let weekIndex = 0; weekIndex < tripWeeks.length; weekIndex += 1) {
+        const week = tripWeeks[weekIndex];
+        const weekBlock = calendarBody.createDiv({ cls: "finance-tracker-calendar-week-block" });
+        const weekGrid = weekBlock.createDiv({ cls: "finance-tracker-calendar-grid month-grid" });
+        const weekSegments = [];
+        let segmentStart = 0;
+        while (segmentStart < week.length) {
+          const segmentMonthKey = monthKeyForDay(week[segmentStart]);
+          let segmentEnd = segmentStart;
+          while (segmentEnd + 1 < week.length && monthKeyForDay(week[segmentEnd + 1]) === segmentMonthKey) {
+            segmentEnd += 1;
+          }
+          weekSegments.push({
+            end: segmentEnd,
+            monthKey: segmentMonthKey,
+            start: segmentStart,
+          });
+          segmentStart = segmentEnd + 1;
+        }
+
+        for (let index = 0; index < week.length; index += 1) {
+          const day = week[index];
+          const dayItems = itemsByDay.get(day) || [];
+          const cell = weekGrid.createEl("button", {
+            cls: "finance-tracker-calendar-day",
+            attr: { type: "button" },
+          });
+          const dots = cell.createDiv({ cls: "finance-tracker-calendar-dots" });
+          cellRefs.set(day, { cell, dots });
+          calendarCellMeta.set(day, { cell, weekIndex });
+          if (index === 0) {
+            cell.style.gridColumnStart = String(getWeekdayIndex(day) + 1);
+          }
+          if (!dayItems.length) cell.addClass("is-empty");
+          const dateText = cell.createSpan({ cls: "finance-tracker-calendar-date", text: day });
+          dateText.setAttr("data-short-date", day.slice(-2));
+          cell.addEventListener("click", () => {
+            if (!dayItems.length) return;
+            if (activeFilter !== "all" && !isCategoryVisibleForDay(dayItems, activeFilter)) return;
+            selectedDay = selectedDay === day ? "" : day;
+            refreshCalendarState();
+          });
+        }
+        const detail = weekBlock.createDiv({ cls: "finance-tracker-calendar-inline-host" });
+        weekRefs.set(`week:${weekIndex}:${week[0]}`, { detail, days: week });
+      }
+
+      const renderMonthOutlines = () => {
+        overlayHost.empty();
+        const bodyRect = calendarBody.getBoundingClientRect();
+        if (!bodyRect.width || !bodyRect.height) return;
+
+        const svg = overlayHost.createSvg("svg", { cls: "finance-tracker-calendar-overlay-svg" });
+        svg.setAttr("width", String(Math.ceil(bodyRect.width)));
+        svg.setAttr("height", String(Math.ceil(bodyRect.height)));
+        svg.setAttr("viewBox", `0 0 ${Math.ceil(bodyRect.width)} ${Math.ceil(bodyRect.height)}`);
+
+        const weekRowBounds = tripWeeks.map((week) => {
+          const firstDay = week[0];
+          const firstMeta = calendarCellMeta.get(firstDay);
+          const rect = firstMeta?.cell?.getBoundingClientRect();
+          return rect
+            ? {
+                bottom: rect.bottom - bodyRect.top,
+                top: rect.top - bodyRect.top,
+              }
+            : null;
+        });
+
+        const monthSegmentsByKey = new Map();
+        const outlineStrokeWidth = 2;
+        const outlineHalfStroke = outlineStrokeWidth / 2;
+        for (let weekIndex = 0; weekIndex < tripWeeks.length; weekIndex += 1) {
+          const week = tripWeeks[weekIndex];
+          let segmentStart = 0;
+          while (segmentStart < week.length) {
+            const segmentMonthKey = monthKeyForDay(week[segmentStart]);
+            let segmentEnd = segmentStart;
+            while (segmentEnd + 1 < week.length && monthKeyForDay(week[segmentEnd + 1]) === segmentMonthKey) {
+              segmentEnd += 1;
+            }
+
+            const startDay = week[segmentStart];
+            const endDay = week[segmentEnd];
+            const startMeta = calendarCellMeta.get(startDay);
+            const endMeta = calendarCellMeta.get(endDay);
+            if (startMeta?.cell && endMeta?.cell) {
+              const startRect = startMeta.cell.getBoundingClientRect();
+              const endRect = endMeta.cell.getBoundingClientRect();
+              const outerInset = 2;
+              const previousDay = segmentStart > 0 ? week[segmentStart - 1] : "";
+              const nextDay = segmentEnd < week.length - 1 ? week[segmentEnd + 1] : "";
+              const previousRect = previousDay ? calendarCellMeta.get(previousDay)?.cell?.getBoundingClientRect() : null;
+              const nextRect = nextDay ? calendarCellMeta.get(nextDay)?.cell?.getBoundingClientRect() : null;
+              const monthMeta = monthMetaByKey.get(segmentMonthKey);
+              const currentRow = weekRowBounds[weekIndex];
+              const previousRow = weekIndex > 0 ? weekRowBounds[weekIndex - 1] : null;
+              const nextRow = weekIndex < weekRowBounds.length - 1 ? weekRowBounds[weekIndex + 1] : null;
+              const segments = monthSegmentsByKey.get(segmentMonthKey) || [];
+              segments.push({
+                accent: monthMeta?.accent || "var(--h1-color, var(--text-accent))",
+                bottom: currentRow && nextRow
+                  ? ((currentRow.bottom + nextRow.top) / 2) - outlineHalfStroke
+                  : startRect.bottom - bodyRect.top + outerInset,
+                isMonthStart: startDay === monthMeta?.firstDay,
+                label: monthMeta?.label || "",
+                left: previousRect
+                  ? (((previousRect.right + startRect.left) / 2) - bodyRect.left) + outlineHalfStroke
+                  : startRect.left - bodyRect.left - outerInset,
+                right: nextRect
+                  ? (((endRect.right + nextRect.left) / 2) - bodyRect.left) - outlineHalfStroke
+                  : endRect.right - bodyRect.left + outerInset,
+                top: currentRow && previousRow
+                  ? ((previousRow.bottom + currentRow.top) / 2) + outlineHalfStroke
+                  : startRect.top - bodyRect.top - outerInset,
+              });
+              monthSegmentsByKey.set(segmentMonthKey, segments);
+            }
+            segmentStart = segmentEnd + 1;
+          }
+        }
+
+        const buildMonthPath = (segments) => {
+          if (!segments.length) return "";
+          const ordered = segments.slice().sort((left, right) => left.top - right.top);
+          const points = [];
+          const first = ordered[0];
+          points.push([first.left, first.top], [first.right, first.top]);
+          for (let index = 0; index < ordered.length; index += 1) {
+            const current = ordered[index];
+            points.push([current.right, current.bottom]);
+            if (index < ordered.length - 1) {
+              const next = ordered[index + 1];
+              if (next.right !== current.right) {
+                points.push([next.right, current.bottom]);
+              }
+              if (next.top !== current.bottom) {
+                points.push([next.right, next.top]);
+              }
+            }
+          }
+          const last = ordered[ordered.length - 1];
+          points.push([last.left, last.bottom]);
+          for (let index = ordered.length - 1; index >= 0; index -= 1) {
+            const current = ordered[index];
+            points.push([current.left, current.top]);
+            if (index > 0) {
+              const previous = ordered[index - 1];
+              if (previous.left !== current.left) {
+                points.push([previous.left, current.top]);
+              }
+              if (previous.bottom !== current.top) {
+                points.push([previous.left, previous.bottom]);
+              }
+            }
+          }
+          return points.map(([x, y], index) => `${index === 0 ? "M" : "L"} ${x} ${y}`).join(" ") + " Z";
+        };
+
+        for (const [, segments] of monthSegmentsByKey.entries()) {
+          if (!segments.length) continue;
+          const ordered = segments.slice().sort((left, right) => left.top - right.top);
+          const path = svg.createSvg("path", { cls: "finance-tracker-calendar-month-path" });
+          path.setAttr("d", buildMonthPath(ordered));
+          path.setAttr("stroke", ordered[0].accent);
+          path.setAttr("fill", "none");
+          const labelSegment = ordered.find((segment) => segment.isMonthStart) || ordered[0];
+          if (labelSegment.label) {
+            const label = overlayHost.createDiv({ cls: "finance-tracker-calendar-month-label", text: labelSegment.label });
+            label.style.left = `${labelSegment.left + 14}px`;
+            label.style.top = `${labelSegment.top + 10}px`;
+            label.style.color = labelSegment.accent;
+          }
+        }
+      };
+
+      const filterBar = section.createDiv({ cls: "finance-tracker-calendar-filter-bar" });
+      for (const filterValue of filterOptions) {
+        const button = filterBar.createEl("button", {
+          cls: "finance-tracker-calendar-filter-button",
+          text: filterValue === "all" ? "All" : categoryLabel(filterValue),
+        });
+        filterButtons.set(filterValue, button);
+        button.addEventListener("click", () => {
+          activeFilter = filterValue;
+          selectedDay = "";
+          refreshCalendarState();
         });
       }
-      button.addEventListener("click", () => renderDayDetails(day));
-    }
 
-    renderDayDetails(days[0]);
+      refreshCalendarState();
+      requestAnimationFrame(renderMonthOutlines);
+      const calendarResizeObserver = new ResizeObserver(() => {
+        if (!calendarBody.isConnected) {
+          calendarResizeObserver.disconnect();
+          return;
+        }
+        renderMonthOutlines();
+      });
+      calendarResizeObserver.observe(calendarBody);
+    } catch (error) {
+      section.createDiv({
+        cls: "finance-tracker-empty",
+        text: `Calendar render failed: ${error?.message || error}`,
+      });
+    }
   }
 
   renderExchangeRates(wrapper, holidayMeta) {
@@ -3121,7 +3505,7 @@ class FinanceTrackerPlugin extends Plugin {
       const holidayMeta = this.parseHolidayBudgetContent(await this.app.vault.cachedRead(sourceFile), sourceFile.path);
       const plannedEntries = await this.collectTransactionsForHoliday(holidayMeta.holidayKey, {
         start: "1900-01-01",
-        end: referenceDate,
+        end: "2999-12-31",
       });
       const plannedSummary = core.buildPlannedExpenseSummary(
         holidayMeta.plannedExpenses || [],
@@ -3312,6 +3696,7 @@ class FinanceTrackerPlugin extends Plugin {
     } else {
       for (const section of sectionResults) {
         this.renderBudgets(wrapper, section.progress, currency, {
+          compact: true,
           hideEmptyState: true,
           title: `${core.titleCaseSegment(section.period)} Budget Progress`,
         });
