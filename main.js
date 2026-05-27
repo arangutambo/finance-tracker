@@ -1,6 +1,6 @@
 "use strict";
 
-const { Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, normalizePath } = require("obsidian");
+const { ItemView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, normalizePath } = require("obsidian");
 const PERIOD_ORDER = ["day", "week", "fortnight", "month", "bimonth", "quarter", "year"];
 
 const core = (() => {
@@ -1167,8 +1167,8 @@ const DEFAULT_SETTINGS = {
 const FINANCE_CAPTURE_ACTION = "finance-capture";
 const DASHBOARD_BLOCK = "finance-dashboard";
 const HOLIDAY_DASHBOARD_BLOCK = "holiday-dashboard";
-const DAILY_BUDGET_CHECK_BLOCK = "daily-budget-check";
 const SAVINGS_DASHBOARD_BLOCK = "savings-dashboard";
+const DAILY_BUDGET_VIEW = "finance-tracker-daily";
 const PIE_COLORS = [
   "#2B6CB0",
   "#2F855A",
@@ -1551,6 +1551,153 @@ class FinanceTrackerPlugin extends Plugin {
     this.registerMarkdownCodeBlockProcessor(SAVINGS_DASHBOARD_BLOCK, async (source, el, ctx) => {
       await this.renderSavingsDashboard(source, el, ctx);
     });
+
+    this.registerView(DAILY_BUDGET_VIEW, (leaf) => new DailyBudgetView(leaf, this));
+
+    this.addRibbonIcon("coins", "Daily Budget", () => this.activateDailyBudgetView());
+
+    this.addCommand({
+      id: "finance-tracker-open-daily-budget",
+      name: "Open daily budget",
+      callback: () => this.activateDailyBudgetView(),
+    });
+
+    this.app.workspace.onLayoutReady(() => this.activateDailyBudgetView());
+
+    this.setupJournalCalendarIntegration();
+  }
+
+  async activateDailyBudgetView() {
+    const { workspace } = this.app;
+    const existing = workspace.getLeavesOfType(DAILY_BUDGET_VIEW);
+    if (existing.length) {
+      workspace.revealLeaf(existing[0]);
+      return;
+    }
+    const leaf = workspace.getRightLeaf(false);
+    if (leaf) {
+      await leaf.setViewState({ type: DAILY_BUDGET_VIEW, active: true });
+      workspace.revealLeaf(leaf);
+    }
+  }
+
+  onunload() {
+    clearTimeout(this._calendarDecorationTimer);
+    if (this._journalCalendarObservers) {
+      for (const observer of this._journalCalendarObservers.values()) {
+        observer.disconnect();
+      }
+      this._journalCalendarObservers.clear();
+    }
+  }
+
+  setupJournalCalendarIntegration() {
+    this._journalCalendarObservers = new Map();
+    this._calendarDecorationTimer = null;
+
+    this.registerEvent(
+      this.app.workspace.on("layout-change", () => this._scheduleCalendarDecoration())
+    );
+    this.registerEvent(
+      this.app.vault.on("modify", (file) => {
+        const prefix = normalizePath(this.settings.dailyNotesFolder + "/");
+        if (file.path.startsWith(prefix)) {
+          this._scheduleCalendarDecoration();
+        }
+      })
+    );
+
+    this._scheduleCalendarDecoration();
+  }
+
+  _scheduleCalendarDecoration() {
+    clearTimeout(this._calendarDecorationTimer);
+    this._calendarDecorationTimer = setTimeout(() => this.decorateJournalCalendar(), 400);
+  }
+
+  async decorateJournalCalendar() {
+    const leaves = this.app.workspace.getLeavesOfType("journal-calendar");
+    for (const leaf of leaves) {
+      const containerEl = leaf.view?.containerEl;
+      if (!containerEl) continue;
+      await this.decorateJournalCalendarLeaf(containerEl);
+      this._watchJournalCalendarGrid(containerEl);
+    }
+  }
+
+  _watchJournalCalendarGrid(containerEl) {
+    if (!this._journalCalendarObservers || this._journalCalendarObservers.has(containerEl)) return;
+    const grid = containerEl.querySelector(".calendar-grid");
+    if (!grid) return;
+    const observer = new MutationObserver((mutations) => {
+      const hasExternalChange = mutations.some((m) =>
+        Array.from(m.addedNodes).some((n) => n.nodeType === 1 && !n.classList?.contains("finance-tracker-spend-badge")) ||
+        Array.from(m.removedNodes).some((n) => n.nodeType === 1 && !n.classList?.contains("finance-tracker-spend-badge"))
+      );
+      if (hasExternalChange) this._scheduleCalendarDecoration();
+    });
+    observer.observe(grid, { childList: true, subtree: false });
+    this._journalCalendarObservers.set(containerEl, observer);
+  }
+
+  async decorateJournalCalendarLeaf(containerEl) {
+    const grid = containerEl.querySelector(".calendar-grid");
+    if (!grid) return;
+
+    const monthHeader = containerEl.querySelector(".month-header");
+    if (!monthHeader) return;
+
+    const headerButtons = Array.from(monthHeader.querySelectorAll("button.calendar-button"));
+    const monthText = headerButtons[0]?.textContent?.trim();
+    const yearText = headerButtons[1]?.textContent?.trim();
+    if (!monthText || !yearText) return;
+
+    const year = parseInt(yearText, 10);
+    const monthIndex = new Date(`${monthText} 1 2000`).getMonth();
+    if (isNaN(year) || isNaN(monthIndex)) return;
+
+    const month = monthIndex + 1;
+    const monthStr = String(month).padStart(2, "0");
+    const start = `${year}-${monthStr}-01`;
+    const end = `${year}-${monthStr}-31`;
+
+    const entries = await this.collectTransactionsForRange({ start, end });
+    const spendByDate = new Map();
+    for (const entry of entries) {
+      if (entry.isIncome || entry.isGoalContribution || entry.isPlannedExpense || entry.entryType === "goal-withdrawal") continue;
+      const iso = String(entry.date || "");
+      if (iso) spendByDate.set(iso, (spendByDate.get(iso) || 0) + Number(entry.amount || 0));
+    }
+
+    const dayCells = grid.querySelectorAll("button.calendar-button:not([data-outside]):not(.week-number)");
+    for (const cell of dayCells) {
+      cell.querySelector(".finance-tracker-spend-badge")?.remove();
+
+      let iso = null;
+      try {
+        const vueInstance = cell.__vueParentComponent?.parent;
+        const dateProp = vueInstance?.props?.date;
+        if (dateProp && /^\d{4}-\d{2}-\d{2}$/.test(dateProp)) iso = dateProp;
+      } catch (_) {}
+
+      if (!iso) {
+        const daySpan = cell.querySelector(".decoration-content span");
+        const day = parseInt((daySpan || cell).textContent?.trim(), 10);
+        if (!day || day > 31) continue;
+        iso = `${year}-${monthStr}-${String(day).padStart(2, "0")}`;
+      }
+
+      const totalSpend = spendByDate.get(iso);
+      if (!totalSpend) continue;
+
+      const dollars = Math.round(totalSpend);
+      const label = dollars >= 1000 ? `$${(dollars / 1000).toFixed(1)}k` : `$${dollars}`;
+      const decoration = cell.querySelector(".calendar-decoration");
+      const badge = document.createElement("span");
+      badge.className = "finance-tracker-spend-badge";
+      badge.textContent = label;
+      (decoration || cell).appendChild(badge);
+    }
   }
 
   async loadSettings() {
@@ -3225,6 +3372,12 @@ class FinanceTrackerPlugin extends Plugin {
         svg.setAttr("height", String(Math.ceil(bodyRect.height)));
         svg.setAttr("viewBox", `0 0 ${Math.ceil(bodyRect.width)} ${Math.ceil(bodyRect.height)}`);
 
+        // Use the cell's own rect (not adjacent-week midpoint) when a detail panel
+        // is open — otherwise the midpoint falls inside the expanded panel area.
+        const selectedWeekIndex = (selectedDay && calendarCellMeta.get(selectedDay) != null)
+          ? calendarCellMeta.get(selectedDay).weekIndex
+          : -1;
+
         const weekRowBounds = tripWeeks.map((week) => {
           const firstDay = week[0];
           const firstMeta = calendarCellMeta.get(firstDay);
@@ -3270,7 +3423,9 @@ class FinanceTrackerPlugin extends Plugin {
               segments.push({
                 accent: monthMeta?.accent || "var(--h1-color, var(--text-accent))",
                 bottom: currentRow && nextRow
-                  ? ((currentRow.bottom + nextRow.top) / 2) - outlineHalfStroke
+                  ? weekIndex === selectedWeekIndex
+                    ? currentRow.bottom - outlineHalfStroke
+                    : ((currentRow.bottom + nextRow.top) / 2) - outlineHalfStroke
                   : startRect.bottom - bodyRect.top + outerInset,
                 isMonthStart: startDay === monthMeta?.firstDay,
                 label: monthMeta?.label || "",
@@ -3281,7 +3436,9 @@ class FinanceTrackerPlugin extends Plugin {
                   ? (((endRect.right + nextRect.left) / 2) - bodyRect.left) - outlineHalfStroke
                   : endRect.right - bodyRect.left + outerInset,
                 top: currentRow && previousRow
-                  ? ((previousRow.bottom + currentRow.top) / 2) + outlineHalfStroke
+                  ? (weekIndex - 1) === selectedWeekIndex
+                    ? currentRow.top + outlineHalfStroke
+                    : ((previousRow.bottom + currentRow.top) / 2) + outlineHalfStroke
                   : startRect.top - bodyRect.top - outerInset,
               });
               monthSegmentsByKey.set(segmentMonthKey, segments);
@@ -3607,26 +3764,21 @@ class FinanceTrackerPlugin extends Plugin {
     }
   }
 
-  async renderDailyBudgetCheck(source, el, ctx) {
+  async renderDailyBudgetCheckInto(el, referenceDate, groupBy = "full") {
     if (typeof el.empty === "function") {
       el.empty();
     } else {
       el.innerHTML = "";
     }
 
-    const config = parseConfigBlock(source);
-    const referenceDate = this.getReferenceDateForSource(ctx.sourcePath);
-    const basePeriod = config.period || this.settings.budgetCheckPeriod || "week";
+    const basePeriod = this.settings.budgetCheckPeriod || "week";
     const range = core.toPeriodRange({
       period: basePeriod,
       referenceDate,
-      start: config.start,
-      end: config.end,
       weekStartsOn: this.settings.weekStartsOn,
     });
 
-    const currency = core.normalizeCurrency(config.currency || this.settings.defaultCurrency);
-    const groupBy = String(config.groupby || "full").toLowerCase();
+    const currency = core.normalizeCurrency(this.settings.defaultCurrency);
     const budgets = await this.loadBudgets("default");
     const sectionPeriods = core.getDailyBudgetSectionPeriods(basePeriod);
     const normalizedBasePeriod = core.normalizeBudgetPeriod(basePeriod);
@@ -3657,9 +3809,7 @@ class FinanceTrackerPlugin extends Plugin {
 
     const wrapper = el.createDiv({ cls: "finance-tracker-dashboard" });
     const header = wrapper.createDiv({ cls: "finance-tracker-header" });
-    header.createEl("h3", {
-      text: config.title || `Budget Check: ${range.start} to ${range.end}`,
-    });
+    header.createEl("h3", { text: `Budget Check` });
 
     const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
     const budgetsButton = headerActions.createEl("button", { text: "Budgets" });
@@ -3726,6 +3876,27 @@ class FinanceTrackerPlugin extends Plugin {
         });
       }
     }
+
+    // Today's individual entries
+    const todayEntries = (await this.collectTransactionsForRange({ start: referenceDate, end: referenceDate }))
+      .filter((e) => !e.isIncome && !e.isGoalContribution && !e.isPlannedExpense && e.entryType !== "goal-withdrawal");
+    if (todayEntries.length) {
+      const todaySection = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
+      todaySection.createEl("h4", { text: "Today" });
+      for (const entry of todayEntries) {
+        const row = todaySection.createDiv({ cls: "finance-tracker-budget-card" });
+        const title = row.createDiv({ cls: "finance-tracker-budget-title" });
+        title.createSpan({ text: core.formatCurrency(entry.amount, currency) });
+        if (entry.merchant) title.createSpan({ cls: "finance-tracker-budget-meta", text: ` · ${entry.merchant}` });
+        row.createDiv({
+          cls: "finance-tracker-budget-meta",
+          text: core.displayCategoryPath(entry.category) || entry.category || "Uncategorised",
+        });
+      }
+      const todayTotal = todayEntries.reduce((sum, e) => sum + Number(e.amount || 0), 0);
+      const totalRow = todaySection.createDiv({ cls: "finance-tracker-budget-card" });
+      totalRow.createDiv({ cls: "finance-tracker-budget-title", text: `Total: ${core.formatCurrency(core.roundCurrencyAmount(todayTotal), currency)}` });
+    }
   }
 
   async renderDashboard(source, el, ctx) {
@@ -3778,6 +3949,45 @@ class FinanceTrackerPlugin extends Plugin {
     const budgetProgress = this.buildBudgetProgress(entries, budgets, range, groupBy, referenceDate);
     this.renderBudgets(wrapper, budgetProgress, currency);
     await this.renderSavingsActivity(wrapper, allEntries, currency, range, referenceDate);
+  }
+}
+
+class DailyBudgetView extends ItemView {
+  constructor(leaf, plugin) {
+    super(leaf);
+    this.plugin = plugin;
+    this._refreshTimer = null;
+  }
+
+  getViewType() { return DAILY_BUDGET_VIEW; }
+  getDisplayText() { return "Daily Budget"; }
+  getIcon() { return "coins"; }
+
+  async onOpen() {
+    this.registerEvent(
+      this.app.vault.on("modify", (file) => {
+        const prefix = normalizePath(this.plugin.settings.dailyNotesFolder + "/");
+        if (file.path.startsWith(prefix)) {
+          clearTimeout(this._refreshTimer);
+          this._refreshTimer = setTimeout(() => this.refresh(), 400);
+        }
+      })
+    );
+    await this.refresh();
+  }
+
+  async onClose() {
+    clearTimeout(this._refreshTimer);
+  }
+
+  async refresh() {
+    try {
+      const today = core.todayIsoLocal();
+      await this.plugin.renderDailyBudgetCheckInto(this.contentEl, today, "full");
+    } catch (error) {
+      this.contentEl.empty();
+      this.contentEl.createDiv({ cls: "finance-tracker-empty", text: `Daily budget failed to render: ${error?.message || error}` });
+    }
   }
 }
 

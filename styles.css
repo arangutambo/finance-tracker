@@ -582,3 +582,19 @@
     font-size: 11px;
   }
 }
+
+/* Journal calendar integration — daily spend badge */
+.finance-tracker-spend-badge {
+  position: absolute;
+  bottom: 1px;
+  left: 0;
+  right: 0;
+  font-size: 0.5em;
+  line-height: 1;
+  text-align: center;
+  color: var(--text-muted);
+  pointer-events: none;
+  z-index: 3;
+  white-space: nowrap;
+  overflow: hidden;
+}
