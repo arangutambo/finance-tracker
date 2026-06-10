@@ -1559,6 +1559,8 @@ const core = (() => {
     computeBudgetPace,
     replaceTransactionBlock,
     removeTransactionBlock,
+    canonicalizeFinanceTag,
+    migrateFinanceTagsInContent,
     buildCategoryTag,
     buildAllocatedExpenseSummary,
     buildCsv,
@@ -2059,6 +2061,12 @@ class FinanceTrackerPlugin extends Plugin {
       id: "finance-tracker-reconcile-csv",
       name: "Reconcile bank/Wise CSV against logged spending",
       callback: () => new BankReconcileModal(this.app, this).open(),
+    });
+
+    this.addCommand({
+      id: "finance-tracker-migrate-tags",
+      name: "Migrate legacy holiday tags to canonical form",
+      callback: () => new TagMigrationModal(this.app, this).open(),
     });
 
     this.app.workspace.onLayoutReady(() => {
@@ -2597,6 +2605,51 @@ class FinanceTrackerPlugin extends Plugin {
       lines.push("", "| Merchant | Category |", "| --- | --- |", row);
     }
     await this.app.vault.modify(file, lines.join("\n"));
+  }
+
+  // Dry run: which daily notes contain legacy holiday tags, with a few samples.
+  async scanLegacyTags() {
+    const files = this.getDailyNoteFiles();
+    const changed = [];
+    const samples = [];
+    let totalLines = 0;
+    for (const file of files) {
+      const content = await this.app.vault.cachedRead(file);
+      const result = core.migrateFinanceTagsInContent(content);
+      if (result.changedLines > 0) {
+        changed.push({ path: file.path, count: result.changedLines });
+        totalLines += result.changedLines;
+        if (samples.length < 6) {
+          for (const match of content.matchAll(/#([^\s#\]]+)/g)) {
+            const canonical = core.canonicalizeFinanceTag(match[1]);
+            if (canonical) {
+              samples.push({ before: `#${match[1]}`, after: `#${canonical}` });
+              if (samples.length >= 6) break;
+            }
+          }
+        }
+      }
+    }
+    return { files: changed, totalFiles: changed.length, totalLines, samples };
+  }
+
+  async applyTagMigration() {
+    const files = this.getDailyNoteFiles();
+    let changedFiles = 0;
+    let changedLines = 0;
+    for (const file of files) {
+      const content = await this.app.vault.cachedRead(file);
+      const result = core.migrateFinanceTagsInContent(content);
+      if (result.changedLines > 0) {
+        await this.app.vault.modify(file, result.content);
+        this.invalidateIndexEntry(file.path);
+        changedFiles += 1;
+        changedLines += result.changedLines;
+      }
+    }
+    this._scheduleStatusBarUpdate();
+    this.refreshDailyBudgetView();
+    return { changedFiles, changedLines };
   }
 
   countPendingCaptures() {
@@ -5394,6 +5447,71 @@ class BankReconcileModal extends Modal {
       } catch (error) {
         new Notice(`Could not queue charges: ${error.message}`);
         sendBtn.disabled = false;
+      }
+    });
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+class TagMigrationModal extends Modal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+    this.scan = null;
+  }
+
+  async onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("finance-migrate");
+    contentEl.createEl("h3", { text: "Migrate legacy holiday tags" });
+    contentEl.createEl("p", {
+      cls: "finance-reconcile-hint",
+      text: "Rewrites old holiday tag orderings to the canonical #log/spending/<year>/<key>/<category> form across your daily notes. This edits your journal — back up or commit first.",
+    });
+
+    const status = contentEl.createDiv({ cls: "finance-migrate-status", text: "Scanning…" });
+    const preview = contentEl.createDiv({ cls: "finance-migrate-preview" });
+    const buttons = contentEl.createDiv({ cls: "finance-reconcile-buttons" });
+
+    try {
+      this.scan = await this.plugin.scanLegacyTags();
+    } catch (error) {
+      status.setText(`Scan failed: ${error.message}`);
+      return;
+    }
+
+    if (!this.scan.totalFiles) {
+      status.setText("No legacy holiday tags found. Nothing to migrate. ✅");
+      return;
+    }
+
+    status.setText(
+      `${this.scan.totalLines} tag${this.scan.totalLines === 1 ? "" : "s"} in ${this.scan.totalFiles} note${this.scan.totalFiles === 1 ? "" : "s"} will be rewritten.`
+    );
+    if (this.scan.samples.length) {
+      const list = preview.createEl("ul", { cls: "finance-migrate-samples" });
+      for (const sample of this.scan.samples) {
+        list.createEl("li").setText(`${sample.before}  →  ${sample.after}`);
+      }
+    }
+
+    const applyButton = buttons.createEl("button", {
+      text: `Migrate ${this.scan.totalFiles} note${this.scan.totalFiles === 1 ? "" : "s"}`,
+      cls: "mod-cta",
+    });
+    applyButton.addEventListener("click", async () => {
+      applyButton.disabled = true;
+      try {
+        const result = await this.plugin.applyTagMigration();
+        new Notice(`Migrated ${result.changedLines} tag${result.changedLines === 1 ? "" : "s"} in ${result.changedFiles} note${result.changedFiles === 1 ? "" : "s"}`);
+        this.close();
+      } catch (error) {
+        new Notice(`Migration failed: ${error.message}`);
+        applyButton.disabled = false;
       }
     });
   }
