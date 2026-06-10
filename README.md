@@ -1,389 +1,157 @@
 # Finance Tracker
 
-Finance Tracker is an Obsidian plugin for logging spending from Apple Shortcuts straight into your daily note, keeping the `#log/spending` total updated, and turning those notes into spending, holiday, and savings-goal dashboards.
+An Obsidian plugin that logs spending as tagged bullets inside your daily notes,
+keeps a running total, and turns those notes into spending, budget, holiday and
+savings dashboards. Your markdown notes stay the source of truth — no database.
 
-## What it does
+## How logging works
 
-- Captures spending through a custom `obsidian://finance-capture` URL.
-- Appends each transaction to your `## Spending` section.
-- Recalculates the running total next to `#log/spending` every time.
-- Writes entries as plain markdown using `#log/spending/{{category}}` tags.
-- Renders a weekly `finance-dashboard` code block with a pie chart and budget progress.
-- Renders a dedicated `holiday-dashboard` code block for trip spending and holiday budget progress.
-- Renders a `savings-dashboard` code block for savings goals and a holiday trip-preparation dashboard.
-- Adds a command to write flat or period-based exchange rates into a holiday budget note.
-- Adds a command to create standalone savings goal notes.
-- Exports parsed transactions to CSV.
-
-## Entry format
-
-New spending payments are written in this shape:
+Every transaction is a bullet under a `## Finance` heading in a daily note
+(`…/YYYY/MM/YYYY-MM-DD.md`). The plugin maintains the checkbox total automatically:
 
 ```md
 ## Finance
-- [ ] #log/spending 18.48
-	- $18.48 #log/spending/food/groceries
-		- Woolworths
+- [ ] #log/spending 16.20
+	- $12.00 #log/spending/food/restaurants
+		- Nobu
+	- $4.20 #log/spending/food/snacks
 ```
 
-You can also track income and savings-goal activity in the same section:
+You rarely type this by hand. Four ways to log, fastest first:
 
-```md
-## Finance
-- $1200 #log/income/pay
-	- Salary
-- $300 #log/income/japanmidyear
-	- Transfer to Japan fund
-- $90 #log/spending/goal/rainy-day-fund/emergency
-	- Car battery
+| Method | Use it for |
+| --- | --- |
+| **Apple Shortcuts → capture inbox** | logging from your phone / Apple Pay, no Obsidian launch |
+| **Quick add modal** (command or status bar) | logging while you're in Obsidian |
+| **`obsidian://finance-capture?…` URL** | a Shortcut that wants the instant dashboard update |
+| **Type the bullet yourself** | edge cases; the total self-heals on note open |
+
+### Apple Shortcuts (capture inbox)
+A Shortcut drops a one-line file into `Utility/Finance/Inbox/`; the plugin drains it
+into the right daily note on arrival and on launch. Full step-by-step setup
+(manual, Apple Pay automation, Wise sync, ANZ reconcile) lives in
+`Utility/Finance/Apple Shortcuts - Finance Capture.md`. Capture line format:
+
+```
+amount=12 | cat=food/restaurants | merchant=Nobu | date=2026-06-10 | source=apple-pay
 ```
 
-Travel and historical notes using paths such as `#log/25/japan/spending/food/snacks` are also parsed by the dashboard.
+Only `amount` is required; omit `cat` to log as `uncategorized` and categorise later.
+Bad files are moved to `Inbox/_failed/` with the error, never dropped.
 
-Holiday notes can use tags like:
+### Quick add modal
+Command **Quick add transaction** (bind a hotkey) or click the status bar. One field,
+natural language, live preview:
 
-```md
-#log/spending/2026/japan/food/restaurants
-#log/spending/2026/japan/accommodation
-#log/spending/2026/japan/shopping
-#log/spending/26/japanmidyear/planned/flights
+```
+12 nobu restaurants        $8 #transport Lime        4.50 coffee snacks @yesterday
 ```
 
-The plugin also parses older travel-note styles like `#log/25/japan/spending/food/snacks` and planned-payment tags like `#log/spending/26/japanmidyear/planned/flights`.
+First number = amount · a `cat/sub`, `#tag` or known category word = category ·
+`@date` (ISO, `yesterday`, weekday, or anything the Natural Language Dates plugin parses) ·
+the rest = merchant.
 
-## Apple Shortcuts URL
+## Tag language
 
-The plugin accepts this URL shape:
+| Kind | Tag | Example bullet |
+| --- | --- | --- |
+| Spending | `#log/spending/<category>[/<sub>]` | `- $12 #log/spending/food/restaurants` |
+| Income | `#log/income/<key>` | `- $2400 #log/income/salary` |
+| Savings contribution | `#log/income/<goalKey>` | `- $500 #log/income/japanmidyear` |
+| Savings withdrawal | `#log/spending/goal/<goalKey>/<category>` | `- $90 #log/spending/goal/rainy-day/medical` |
+| Holiday spend | `#log/spending/<year>/<key>/<category>` | `- $40 #log/spending/26/japanmidyear/food` |
 
-```text
-obsidian://finance-capture?vault=<vault>&amount=12.50&merchant=Coles&name=Coles&card=Visa&category=food/groceries&source=apple-pay
-```
-
-Expected fields:
-
-- `amount`: numeric amount to log
-- `merchant`: merchant shown under the payment line
-- `name`: optional display name from Shortcuts
-- `card`: optional card or pass name
-- `category`: category path such as `food/groceries`
-- `source`: optional source, for example `apple-pay`
-
-Suggested day-to-day categories:
-
-- `groceries`
-- `restaurants`
-- `snacks`
-- `transport`
-- `subscription`
-- `medical`
-- `clothes`
-- `uncategorized`
-
-## Weekly dashboard
-
-Add this code block to your weekly note:
-
-```finance-dashboard
-period: week
-groupBy: primary
-```
-
-Supported options:
-
-- `period`: `day`, `week`, `fortnight`, `month`, `bimonth`, `quarter`, or `year`
-- `groupBy`: `primary` or `full`
-- `currency`: override display currency
-- `start` and `end`: explicit date range in `YYYY-MM-DD`
-
-## Daily budget check
-
-Add this code block to your daily note template:
-
-```daily-budget-check
-groupBy: full
-```
-
-This block evaluates your budgeting progress over the current budget period and highlights overspent categories in red.
-It uses your configured `Week starts on` setting and your chosen `Budget check period` setting by default, so it can check a week, fortnight, month, bi-month, quarter, or year.
-If the daily note falls inside a holiday budget date range, this block also shows `Can Spend / Day` from the active holiday plan.
-If you mark savings goals as active, it also shows the required savings target for the current period.
-
-## Savings dashboard
-
-Add this code block to a savings goal note or holiday budget note:
-
-```savings-dashboard
-```
-
-For normal savings goals it shows:
-
-- target amount
-- current saved
-- amount remaining
-- required this period
-- saved percentage
-- current period contributions
-
-For holiday notes the same block renders a Trip Preparation dashboard that shows:
-
-- current account balance
-- paid planned expenses
-- saved progress
-- still need to save before departure
-- travel budget remaining after departure
-- required this period
-- a planned-expenses calendar
-- planned and allocated expense sections
-
-## Holiday dashboard
-
-Add this code block to your holiday daily note template:
-
-```holiday-dashboard
-holiday: 2026/japan
-```
-
-Supported options:
-
-- `holiday`: the holiday tag root after `#log/spending/`, for example `2026/japan`
-- `budget`: optional path to the holiday budget note
-- `currency`: optional display currency override
-- `start` and `end`: optional date limits in `YYYY-MM-DD`
-
-The holiday dashboard shows:
-
-- holiday budget
-- total spent
-- total spent as a percentage of the holiday budget
-- remaining amount after planned and booked commitments
-- can spend per day based on remaining amount and remaining trip days
-- trip days so far
-- average spend per day excluding accommodation
-- average accommodation spend per day
-- average transport spend per day
-- average food spend per day
-- foldable planned-expense items with their matched payment logs
+The amount is a `$`-prefixed number on the bullet; a child line is the merchant, a
+second child is a note. Categories are slash paths (`food/restaurants`).
 
 ## Budgets
 
-The plugin reads budgets from a markdown table, by default in `Utility/Budgets/💸 Budgets.md`.
-
-Example:
+Budgets are a markdown table in `Utility/Budgets/💸 Budgets.md`:
 
 ```md
-| Name | Category | Limit | Period | Currency |
-| --- | --- | ---: | --- | --- |
-| Groceries | food/groceries | 120 | week | AUD |
-| Restaurants | food/restaurants | 80 | week | AUD |
-| All Spending | all | 450 | week | AUD |
+| Name         | Category   | Limit | Period | Currency |
+| ------------ | ---------- | ----: | ------ | -------- |
+| Groceries    | groceries  |   140 | week   | AUD      |
+| Shopping     | shopping   |   200 | month  | AUD      |
+| All Spending | all        |   250 | week   | AUD      |
 ```
 
-Holiday budget notes include frontmatter, savings fields, a planned-expenses table, and an allocated-expenses table. Example:
+- **Category** is a top-level group (`food`) or a path (`food/restaurants`); `all`
+  budgets everything.
+- **Period**: `day`, `week`, `fortnight`, `month`, `bimonth`, `quarter`, `year`.
+  Limits scale by calendar days when shown over a different range (a weekly $140
+  shows as ~$600 on a monthly dashboard).
+- Bars are **pace-aware**: a marker shows where you should be today, the colour
+  reflects whether you're ahead of pace (not just over the cap), and each bar
+  shows the projected end-of-period spend and a safe `$/day` for the days left.
+- An `all` budget also drives the **Left / Day** card and the daily-spend trend line.
 
-```md
----
-holiday_name: Japan 2026
-holiday_tag: 2026/japan
-total_budget: 5000
-savings_goal_key: japanmidyear
-savings_goal_amount: 5000
-savings_starting_balance: 0
-savings_due_date: 2026-09-10
-active_savings_goal: true
-carry_missed_savings: false
-savings_display_mode: dual-phase
-savings_progress_mode: account-plus-paid-planned
-currency: AUD
-start_date: 2026-09-10
-end_date: 2026-09-24
-exchange_rates: JPY=0.0097, JPY CASH=0.0100, USD=1.53
-exchange_rate_periods: 2026-09-10..2026-09-14:JPY=0.0098, JPY CASH=0.0101; 2026-09-15..2026-09-24:JPY=0.0095
----
+## Dashboards
 
-| Item | Category | Planned | Booked |
-| --- | --- | ---: | ---: |
-| Flights | flights | 1200 | 1200 |
-| Accommodation Total | accommodation | 1800 | 900 |
-| Recreation | recreation | 700 | 0 |
+Add a fenced code block to any note; each reads transactions from your daily notes.
 
-| Item | Category | Allocated | Start | End | Link |
-| --- | --- | ---: | --- | --- | --- |
-| Transport | transport | 250 |  |  |  |
-| Shopping | shopping | 400 |  |  | [[_ Tokyo Shopping List]] |
-| Food | food | 600 |  |  | [[_ Japan Food Ideas]] |
+````md
+```finance-dashboard
+period: week        # day | week | fortnight | month | bimonth | quarter | year
+groupBy: primary    # primary | full
+currency: AUD       # optional override
+start: 2026-06-01   # optional explicit range (needs end)
+end: 2026-06-30
+title: June Spending
 ```
+````
 
-When you create a new holiday from settings, the modal now lets you set:
+Shows summary cards (total, avg/day, vs previous period, top category), a category
+pie, a daily-spend sparkline with your budget line, pace-aware budget bars, and
+savings activity. Export CSV from the header.
 
-- the holiday tracking tag, for example `2026/japan`
-- the start date as a date property
-- the end date as a date property
-- the file is saved with `Budget` appended to the holiday name automatically
+`holiday-dashboard` — planned vs actual trip spend, per-day budget remaining, and a
+trip calendar. Reads a holiday budget note (frontmatter `holiday_tag`,
+`total_budget`, `start_date`, `end_date`, plus Planned/Allocated tables).
 
-Holiday detection:
+`savings-dashboard` — per-goal progress, contributions, projected completion. Reads
+a savings goal note (frontmatter `goal_key`, `target_amount`, `due_date`, …).
 
-- you do not need to turn a holiday mode on or off
-- the plugin treats spending as holiday spending automatically when the transaction date falls between a holiday budget note's `start_date` and `end_date`
-- holiday budgets can still be created, selected, and archived from settings
+## Daily Budget sidebar & status bar
 
-New holiday notes seed planned expenses with `flights`, `accommodation`, and `recreation`, and allocated expenses with `transport`, `shopping`, and `food`.
+The **Daily Budget** sidebar (ribbon coin icon) shows today + period spend, a
+Left/Day card, a mini pie, pace-aware budget bars, savings goals, a **Needs a
+Category** triage list, and today's entries. Tap any entry to edit its amount,
+category or merchant, delete it, or tick "remember this merchant → category" to
+teach `Utility/Finance/Merchant Map.md`. Captures with a known merchant
+auto-categorise from that file.
 
-Standalone savings goal notes:
+The **status bar** shows `💸 Today $X · Week $Y · 📥 N` (N = pending captures);
+click it to quick-add.
 
-- Use the command palette action `Create savings goal`
-- Log contributions with `#log/income/{goal_key}`
-- Log non-holiday withdrawals with `#log/spending/goal/{goal_key}/{category}`
+## Reconciling against the bank
 
-Exchange rate rules:
+Command **Reconcile bank/Wise CSV against logged spending**: paste an ANZ or Wise
+export. Rows are matched by date+amount (so merchant-name differences don't cause
+duplicates); unmatched charges can be sent to the capture inbox to log and triage.
 
-- `currency` is the budget and dashboard currency the plugin should use, for example `AUD`
-- `exchange_rates` is the flat fallback rate map for the whole trip, and can include several source currencies
-- `exchange_rate_periods` lets you override rates for specific date ranges
-- rates are interpreted as `1 foreign currency unit = X budget currency units`
-- cash can use a separate rate key like `JPY CASH`
+## Commands
 
-Frontmatter format:
+- Quick add transaction
+- Drain capture inbox now
+- Reconcile bank/Wise CSV against logged spending
+- Open daily budget · Open finance budgets note
+- Add holiday exchange rate · Create savings goal
+- Export finance transactions to CSV
 
-- `exchange_rates` format: `SOURCE=RATE, SOURCE CASH=RATE, OTHER=RATE`
-- `exchange_rate_periods` format: `YYYY-MM-DD..YYYY-MM-DD:SOURCE=RATE, SOURCE CASH=RATE; YYYY-MM-DD..YYYY-MM-DD:SOURCE=RATE`
-- use commas to separate multiple rate keys inside one period
-- use semicolons to separate different periods
-- period-specific rates override the flat `exchange_rates` values for matching dates
+## Key settings
 
-Frontmatter examples:
-
-```md
-exchange_rates: JPY=0.0097, JPY CASH=0.0100, USD=1.53
-exchange_rate_periods: 2026-06-18..2026-06-24:JPY=0.0098, JPY CASH=0.0101; 2026-06-25..2026-07-02:JPY=0.0095, USD=1.50
-```
-
-Example:
-
-- `exchange_rates: JPY=0.0097, JPY CASH=0.0100, USD=1.53` means the same holiday can convert card yen, cash yen, and USD into the holiday budget currency
-- `exchange_rate_periods: 2026-06-18..2026-06-24:JPY=0.0098, JPY CASH=0.0101; 2026-06-25..2026-07-02:JPY=0.0095` uses different rates during different parts of the trip
-
-Exchange-rate command:
-
-- Run `Add holiday exchange rate` from the command palette.
-- Pick the holiday budget note you want to update.
-- Choose `Whole holiday` for a flat rate or `Date range` for a period override.
-- Enter the source currency, target currency, and rate.
-- Period rates are written into `exchange_rate_periods`, and flat rates are written into `exchange_rates`.
-
-When a captured holiday spend arrives in another currency and a matching exchange rate exists, the daily note line is written like:
-
-```md
-- ¥1,800 JPY : $17.46 AUD #log/spending/2026/japan/food/restaurants
-	- Ichiran
-```
-
-For cash, the currency input can be something like `YEN CASH`, which writes:
-
-```md
-- ¥1,800 JPY CASH : $18.10 AUD #log/spending/2026/japan/food/restaurants
-	- Cash ramen
-```
-
-If no currency is supplied, the plugin assumes your normal default currency, which is usually `AUD`.
-
-Planned expense columns:
-
-- `Planned`: the fallback amount used for holiday planning
-- `Booked`: the committed amount that overrides `Planned` once it is above `0`
-- these rows are for whole-trip planning metrics only and do not create calendar events
-
-Allocated expense columns:
-
-- `Allocated`: your predicted in-trip spend for that bucket
-- `Start` and `End`: optional span for that allocation; if blank it uses the whole trip
-- `Link`: optional supporting note or location link
-
-Planned-payment rules:
-
-- Log planned holiday payments in the daily note with tags like `#log/spending/26/japanmidyear/planned/flights`
-- These planned-payment entries are used by the holiday dashboard only
-- They do not count toward normal weekly, monthly, quarterly, or yearly budget checks
-
-Savings frontmatter:
-
-- `active_savings_goal: true|false`
-- `carry_missed_savings: true|false`
-- `savings_display_mode: standard|dual-phase`
-- `savings_progress_mode: account-plus-paid-planned|account-only`
-- `savings_goal_key`
-- `savings_goal_amount`
-- `savings_starting_balance`
-- `savings_due_date`
-
-Holiday savings math:
-
-- `Current Account Balance` = starting balance + contributions - withdrawals
-- `Paid Planned Expenses` = paid amounts matched from planned-expense logs like `#log/spending/26/japanmidyear/planned/flights`
-- `Saved Progress` = current account balance + paid planned expenses when `savings_progress_mode: account-plus-paid-planned`
-- `Still Need To Save` = savings goal amount - saved progress before the trip
-
-Trip Preparation calendar:
-
-- the calendar is driven only by planned holiday log entries in daily notes
-- planned table rows do not create calendar events
-- use dated planned log entries like:
-
-```md
-- $1460.32 #log/26/japanmidyear/planned/flights 2026-06-18
-	- [[_ Brisbane Airport]]
-- $500 #log/26/japanmidyear/planned/accommodation 2026-06-18 2026-06-22
-	- [[_ Tokyo Hotel Example]]
-- $120 #log/26/japanmidyear/planned/recreation 2026-06-24
-	- [[_ Kyoto Tea Ceremony Example]]
-```
-
-- when you click a day in the Trip Preparation calendar, that day's matching flight, accommodation, and recreation entries appear underneath with their indented notes and clickable `[[...]]` links
-
-Example standalone savings goal:
-
-- `Utility/Budgets/Roadbike Savings Goal.md`
-- target amount `3000`
-- goal key `roadbike`
-- standard savings mode with a working `savings-dashboard` block
-
-## Settings
-
-The settings tab lets you configure:
-
-- daily notes folder
-- spending heading and root tag
-- default currency
-- shortcut category list
-- dashboard grouping defaults
-- pie chart label threshold
-- week start day
-- budget check period
-- budgets folder and archive folder
-
-## CSV export
-
-Every time you export, the plugin asks which folder you want to save the CSV into before writing the file.
+`dailyNotesFolder`, `spendingHeading` (`## Finance`), `defaultCurrency`,
+`budgetsFolderPath` / `defaultBudgetNoteName`, `captureInboxFolder`,
+`merchantMapPath`, `autoDrainInbox`, `budgetCheckPeriod`, `weekStartsOn`,
+`activeHolidayBudgetPath`.
 
 ## Development
 
-Run tests with:
-
 ```bash
-npm test
+npm test   # node --test, runs tests/*.test.js
 ```
 
-Plugin files:
-
-- `main.js`: plugin entrypoint
-- `styles.css`: dashboard and settings styles
-- `manifest.json`: Obsidian plugin manifest
-- `versions.json`: minimum Obsidian version map
-- `tests/`: parser and formatting tests
-
-## Publishing notes
-
-Before publishing to GitHub or the Obsidian community plugin ecosystem:
-
-- keep `manifest.json`, `package.json`, and `versions.json` on the same release version
-- tag releases with the plugin version, for example `0.1.0`
-- include `manifest.json`, `main.js`, and `styles.css` in the release assets if you publish binaries
+Shared logic lives in `finance-core.js` (unit-tested) and is mirrored into a `core`
+IIFE inside `main.js`, which Obsidian loads directly (no build step). A change to a
+core function must be made in **both** places.

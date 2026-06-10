@@ -583,6 +583,24 @@
   }
 }
 
+/* Mini pie chart (sidebar Daily Budget view) */
+.finance-tracker-pie-svg--mini {
+  width: min(100%, 160px);
+  height: auto;
+  display: block;
+  margin: 0 auto;
+}
+
+.finance-tracker-legend--mini {
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.finance-tracker-legend--mini .finance-tracker-legend-label {
+  font-size: 0.82em;
+}
+
 /* Journal calendar integration — daily spend badge */
 .finance-tracker-spend-badge {
   position: absolute;
@@ -598,3 +616,91 @@
   white-space: nowrap;
   overflow: hidden;
 }
+
+/* ---- Quick add modal ---- */
+.finance-quick-add h3 { margin-top: 0; }
+.finance-quick-add-input {
+  width: 100%;
+  font-size: 1.1em;
+  padding: 0.5em 0.6em;
+  margin-bottom: 0.5em;
+}
+.finance-quick-add-preview {
+  min-height: 1.4em;
+  padding: 0.35em 0.5em;
+  border-radius: 6px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.finance-quick-add-preview.is-ready {
+  color: var(--text-normal);
+  background: var(--background-secondary);
+}
+.finance-quick-add-daterow {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  margin: 0.6em 0;
+  color: var(--text-muted);
+}
+.finance-quick-add-buttons {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75em;
+  margin-top: 0.5em;
+}
+.finance-quick-add-keep { color: var(--text-muted); font-size: 0.9em; }
+
+/* ---- Reconcile modal ---- */
+.finance-reconcile-hint { color: var(--text-muted); }
+.finance-reconcile-order { margin-bottom: 0.5em; color: var(--text-muted); }
+.finance-reconcile-input { width: 100%; font-family: var(--font-monospace); font-size: 0.85em; }
+.finance-reconcile-results { margin-top: 0.75em; }
+.finance-reconcile-counts { font-weight: 600; margin-bottom: 0.5em; }
+.finance-reconcile-missing { max-height: 240px; overflow-y: auto; font-variant-numeric: tabular-nums; }
+.finance-reconcile-buttons { margin-top: 0.75em; }
+
+/* ---- Status bar ---- */
+.finance-status-bar { cursor: pointer; font-variant-numeric: tabular-nums; }
+
+/* ---- Budget pace marker ---- */
+.finance-tracker-budget-bar { position: relative; }
+.finance-tracker-budget-pace-marker {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 2px;
+  background: var(--text-normal);
+  opacity: 0.65;
+  pointer-events: none;
+}
+.finance-tracker-budget-list.is-compact .finance-tracker-budget-bar { height: 6px; }
+.finance-tracker-budget-meta.is-pace { opacity: 0.8; font-style: italic; }
+
+/* ---- Summary delta cards ---- */
+.finance-tracker-summary-card.is-up .finance-tracker-summary-value { color: var(--color-red, #c0392b); }
+.finance-tracker-summary-card.is-down .finance-tracker-summary-value { color: var(--color-green, #2f855a); }
+.finance-tracker-summary-card.is-over .finance-tracker-summary-value { color: var(--color-red, #c0392b); }
+
+/* ---- Spend trend sparkline ---- */
+.finance-tracker-spark { width: 100%; }
+.ft-spark-svg { width: 100%; height: 120px; display: block; }
+.ft-spark-bar { fill: var(--interactive-accent); opacity: 0.55; }
+.ft-spark-today { fill: var(--interactive-accent); opacity: 1; }
+.ft-spark-budget { stroke: var(--text-muted); stroke-width: 1.5; stroke-dasharray: 4 3; }
+
+/* ---- Triage / clickable entries ---- */
+.finance-tracker-budget-card.is-clickable { cursor: pointer; }
+.finance-tracker-budget-card.is-clickable:hover { background: var(--background-modifier-hover); }
+.finance-tracker-budget-card.is-uncategorized { border-left: 3px solid var(--color-orange, #dd6b20); padding-left: 6px; }
+.finance-tracker-triage h4 { color: var(--color-orange, #dd6b20); }
+
+/* ---- Edit transaction modal ---- */
+.finance-edit-row { display: flex; align-items: center; gap: 0.6em; margin: 0.4em 0; }
+.finance-edit-row label { width: 5.5em; color: var(--text-muted); }
+.finance-edit-row input { flex: 1; }
+.finance-edit-chips { display: flex; flex-wrap: wrap; gap: 0.35em; margin: 0.4em 0 0.6em; }
+.finance-edit-chip { font-size: 0.8em; padding: 0.2em 0.55em; }
+.finance-edit-remember { display: block; color: var(--text-muted); font-size: 0.9em; margin: 0.4em 0; }
+.finance-edit-buttons { display: flex; justify-content: space-between; margin-top: 0.75em; }

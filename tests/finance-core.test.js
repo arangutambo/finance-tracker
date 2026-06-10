@@ -479,3 +479,218 @@ test("summarizes dual-phase holiday savings goals", () => {
   assert.equal(beforeTrip.amountRemaining, 4239.68);
   assert.equal(beforeTrip.amountRemainingLabel, "Still Need To Save");
 });
+
+test("parseInboxLine reads pipe-delimited capture payloads", () => {
+  const params = core.parseInboxLine("amount=12 | cat=food/restaurants | merchant=Nobu | date=2026-06-08 | source=apple-pay");
+  assert.equal(params.amount, "12");
+  assert.equal(params.category, "food/restaurants");
+  assert.equal(params.merchant, "Nobu");
+  assert.equal(params.name, "Nobu");
+  assert.equal(params.date, "2026-06-08");
+  assert.equal(params.source, "apple-pay");
+});
+
+test("parseInboxLine reads obsidian capture URLs and aliases", () => {
+  const params = core.parseInboxLine("obsidian://finance-capture?vault=Brain&amount=8.50&category=transport&payee=Lime&wiseid=ABC123");
+  assert.equal(params.amount, "8.50");
+  assert.equal(params.category, "transport");
+  assert.equal(params.merchant, "Lime");
+  assert.equal(params.externalid, "ABC123");
+});
+
+test("parseInboxLine reads bullet and positional shorthand", () => {
+  const bullet = core.parseInboxLine("- $12 #log/spending/food/restaurants Nobu");
+  assert.equal(bullet.amount, 12);
+  assert.equal(bullet.category, "food/restaurants");
+  assert.equal(bullet.merchant, "Nobu");
+
+  const positional = core.parseInboxLine("12 food/snacks Morning Coffee");
+  assert.equal(positional.amount, 12);
+  assert.equal(positional.category, "food/snacks");
+  assert.equal(positional.merchant, "Morning Coffee");
+
+  assert.equal(core.parseInboxLine("# a comment"), null);
+  assert.equal(core.parseInboxLine("no amount here"), null);
+});
+
+test("buildInboxLine round-trips through parseInboxLine", () => {
+  const line = core.buildInboxLine({ amount: 12.5, category: "food/restaurants", merchant: "Nobu", date: "2026-06-08", currency: "AUD", source: "manual" });
+  const params = core.parseInboxLine(line);
+  assert.equal(core.parseNumber(params.amount), 12.5);
+  assert.equal(params.category, "food/restaurants");
+  assert.equal(params.merchant, "Nobu");
+  assert.equal(params.date, "2026-06-08");
+});
+
+test("parseQuickAddInput extracts amount, category, merchant and date token", () => {
+  const a = core.parseQuickAddInput("12 nobu restaurants", ["food/restaurants", "transport"]);
+  assert.equal(a.amount, 12);
+  assert.equal(a.category, "food/restaurants");
+  assert.equal(a.merchant, "nobu");
+
+  const b = core.parseQuickAddInput("12.50 coffee snacks @sat", ["food/snacks"]);
+  assert.equal(b.amount, 12.5);
+  assert.equal(b.category, "food/snacks");
+  assert.equal(b.merchant, "coffee");
+  assert.equal(b.dateToken, "sat");
+
+  const c = core.parseQuickAddInput("$8 #transport/rideshare Lime");
+  assert.equal(c.amount, 8);
+  assert.equal(c.category, "transport/rideshare");
+  assert.equal(c.merchant, "Lime");
+});
+
+test("transactionFingerprint is stable across merchant casing and currency formatting", () => {
+  const a = core.transactionFingerprint({ date: "2026-06-08", amount: 12, merchant: "NOBU Sydney" });
+  const b = core.transactionFingerprint({ date: "2026-06-08", amount: 12.0, merchant: "nobu sydney" });
+  assert.equal(a, b);
+  assert.equal(a, "2026-06-08|12.00|nobusydney");
+});
+
+test("parseBankCsv reads a single signed-amount statement (ANZ-style)", () => {
+  const csv = [
+    "Date,Amount,Description",
+    "08/06/2026,-12.50,NOBU SYDNEY",
+    "08/06/2026,2400.00,SALARY ACME",
+    "09/06/2026,-4.20,COFFEE CLUB",
+  ].join("\n");
+  const rows = core.parseBankCsv(csv, { dateOrder: "DMY" });
+  assert.equal(rows.length, 2); // income row skipped
+  assert.equal(rows[0].date, "2026-06-08");
+  assert.equal(rows[0].amount, 12.5);
+  assert.equal(rows[0].merchant, "NOBU SYDNEY");
+  assert.equal(rows[1].amount, 4.2);
+});
+
+test("parseBankCsv reads separate debit/credit columns (Wise-style) with currency", () => {
+  const csv = [
+    "Date,Merchant,Debit,Credit,Currency",
+    "2026-06-21,FamilyMart,330,,JPY",
+    "2026-06-21,Refund,,500,JPY",
+  ].join("\n");
+  const rows = core.parseBankCsv(csv);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].amount, 330);
+  assert.equal(rows[0].currency, "JPY");
+  assert.equal(rows[0].merchant, "FamilyMart");
+});
+
+test("recomputeSpendingTotals heals a stale running total but preserves correct ones", () => {
+  const settings = { spendingHeading: "## Finance", spendingRootTag: "#log/spending", defaultCurrency: "AUD" };
+  const stale = [
+    "---",
+    "date: 2026-06-10",
+    "---",
+    "",
+    "## Finance",
+    "- [ ] #log/spending 999",
+    "\t- $12.00 #log/spending/food/restaurants",
+    "\t\t- Nobu",
+    "\t- $4.20 #log/spending/food/snacks",
+    "",
+    "## Notes",
+  ].join("\n");
+  const healed = core.recomputeSpendingTotals(stale, settings);
+  assert.match(healed, /- \[ \] #log\/spending 16\.2\b/);
+  // checkbox state is preserved
+  const checked = stale.replace("- [ ]", "- [x]");
+  const healedChecked = core.recomputeSpendingTotals(checked, settings);
+  assert.match(healedChecked, /- \[x\] #log\/spending 16\.2\b/);
+  // already-correct totals return the input unchanged (no spurious writes)
+  assert.equal(core.recomputeSpendingTotals(healed, settings), healed);
+});
+
+test("computeBudgetPace projects overspend and a safe per-day amount mid-period", () => {
+  const pace = core.computeBudgetPace({
+    limit: 140,
+    spent: 90,
+    periodStart: "2026-06-08", // Monday
+    periodEnd: "2026-06-14",   // Sunday
+    referenceDate: "2026-06-10", // Wednesday, day 3 of 7
+  });
+  assert.equal(pace.totalDays, 7);
+  assert.equal(pace.elapsedDays, 3);
+  assert.equal(pace.pacedSpend, 60); // 140 * 3/7
+  assert.equal(pace.projected, 210); // 90 / (3/7)
+  assert.equal(pace.onPace, false);
+  assert.equal(pace.remainingDays, 5); // Wed..Sun inclusive
+  assert.equal(pace.perDayRemaining, 10); // (140-90)/5
+});
+
+test("computeBudgetPace reports on-pace when under the time-scaled line", () => {
+  const pace = core.computeBudgetPace({
+    limit: 140, spent: 30,
+    periodStart: "2026-06-08", periodEnd: "2026-06-14", referenceDate: "2026-06-10",
+  });
+  assert.equal(pace.onPace, true);
+  assert.equal(pace.projected, 70);
+  assert.equal(pace.perDayRemaining, 22); // (140-30)/5
+});
+
+test("replaceTransactionBlock rewrites an entry in place and fixes the total", () => {
+  const settings = { spendingHeading: "## Finance", spendingRootTag: "#log/spending", defaultCurrency: "AUD" };
+  const content = [
+    "---", "date: 2026-06-10", "---", "",
+    "## Finance",
+    "- [ ] #log/spending 16.2",
+    "\t- $12.00 #log/spending/food/restaurants",
+    "\t\t- Nobu",
+    "\t- $4.20 #log/spending/food/snacks",
+  ].join("\n");
+  const oldLine = "\t- $12.00 #log/spending/food/restaurants";
+  const next = core.replaceTransactionBlock(content, oldLine, {
+    amount: 20, category: "food/restaurants", merchant: "Nobu", currency: "AUD",
+  }, settings);
+  assert.ok(next.includes("#log/spending/food/restaurants"));
+  assert.match(next, /- \[ \] #log\/spending 24\.2\b/); // 20 + 4.20
+  assert.equal(core.replaceTransactionBlock(content, "\t- $999 #log/spending/x", {}, settings), null);
+});
+
+test("removeTransactionBlock deletes an entry and its children, fixing the total", () => {
+  const settings = { spendingHeading: "## Finance", spendingRootTag: "#log/spending", defaultCurrency: "AUD" };
+  const content = [
+    "## Finance",
+    "- [ ] #log/spending 16.2",
+    "\t- $12.00 #log/spending/food/restaurants",
+    "\t\t- Nobu",
+    "\t- $4.20 #log/spending/food/snacks",
+  ].join("\n");
+  const next = core.removeTransactionBlock(content, "\t- $12.00 #log/spending/food/restaurants", settings);
+  assert.ok(!next.includes("Nobu"));
+  assert.match(next, /- \[ \] #log\/spending 4\.2\b/);
+});
+
+test("canonicalizeFinanceTag rewrites legacy holiday orderings to the canonical form", () => {
+  assert.equal(core.canonicalizeFinanceTag("#log/25/japan/spending/food/snacks"), "log/spending/25/japan/food/snacks");
+  assert.equal(core.canonicalizeFinanceTag("log/26/japanmidyear/spending/planned/flights"), "log/spending/26/japanmidyear/planned/flights");
+  assert.equal(core.canonicalizeFinanceTag("log/26/japanmidyear/planned/accommodation"), "log/spending/26/japanmidyear/planned/accommodation");
+  // already canonical, plain spending, income, and goal tags are left alone
+  assert.equal(core.canonicalizeFinanceTag("#log/spending/26/japanmidyear/food"), null);
+  assert.equal(core.canonicalizeFinanceTag("#log/spending/food/restaurants"), null);
+  assert.equal(core.canonicalizeFinanceTag("#log/income/salary"), null);
+  assert.equal(core.canonicalizeFinanceTag("#log/spending/goal/rainy-day/medical"), null);
+});
+
+test("migrated legacy tags parse identically to before the refactor", () => {
+  const legacy = core.extractFinanceTagContext("- $22 #log/25/japan/spending/food/snacks");
+  const canonical = core.extractFinanceTagContext("- $22 #log/spending/25/japan/food/snacks");
+  assert.deepEqual(legacy, canonical);
+  assert.equal(legacy.holidayKey, "25/japan");
+  assert.equal(legacy.category, "food/snacks");
+});
+
+test("migrateFinanceTagsInContent rewrites only legacy tags and counts changed lines", () => {
+  const before = [
+    "## Finance",
+    "- [ ] #log/spending 62",
+    "\t- $22 #log/25/japan/spending/food/snacks",
+    "\t- $40 #log/spending/food/groceries",
+    "\t- $90 #log/26/japanmidyear/planned/flights",
+  ].join("\n");
+  const { content, changedLines } = core.migrateFinanceTagsInContent(before);
+  assert.equal(changedLines, 2);
+  assert.ok(content.includes("#log/spending/25/japan/food/snacks"));
+  assert.ok(content.includes("#log/spending/26/japanmidyear/planned/flights"));
+  assert.ok(content.includes("#log/spending/food/groceries")); // untouched
+  assert.equal(core.migrateFinanceTagsInContent(content).changedLines, 0); // idempotent
+});

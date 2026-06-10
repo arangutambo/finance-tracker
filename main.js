@@ -335,10 +335,52 @@ const core = (() => {
     return "";
   }
 
+  function canonicalizeFinanceTag(tag) {
+    const normalized = normalizeCategoryPath(String(tag || "").replace(/^#/, ""));
+    const parts = normalized.split("/").filter(Boolean);
+    if (parts.length < 4 || parts[0] !== "log") return null;
+    const isYear = (value) => /^(?:\d{2}|\d{4})$/.test(value);
+    if (!isYear(parts[1]) || !parts[2]) return null;
+
+    if (parts[3] === "spending") {
+      const remainder = parts.slice(4);
+      const planned = String(remainder[0] || "").toLowerCase() === "planned";
+      const category = planned ? remainder.slice(1) : remainder;
+      return ["log", "spending", parts[1], parts[2], ...(planned ? ["planned"] : []), ...category].join("/");
+    }
+    if (parts[3] === "planned") {
+      return ["log", "spending", parts[1], parts[2], "planned", ...parts.slice(4)].join("/");
+    }
+    return null;
+  }
+
+  function migrateFinanceTagsInLine(line) {
+    let changed = false;
+    const result = String(line).replace(/#([^\s#\]]+)/g, (whole, tagBody) => {
+      const canonical = canonicalizeFinanceTag(tagBody);
+      if (!canonical) return whole;
+      changed = true;
+      return `#${canonical}`;
+    });
+    return { line: result, changed };
+  }
+
+  function migrateFinanceTagsInContent(content) {
+    const lines = splitLines(content);
+    let changedLines = 0;
+    const out = lines.map((line) => {
+      const result = migrateFinanceTagsInLine(line);
+      if (result.changed) changedLines += 1;
+      return result.line;
+    });
+    return { content: out.join("\n"), changedLines };
+  }
+
   function extractFinanceTagContext(line) {
     const matches = Array.from(String(line || "").matchAll(/#([^\s#\]]+)/gi));
     for (let index = matches.length - 1; index >= 0; index -= 1) {
-      const fullTag = normalizeCategoryPath(matches[index][1]);
+      const canonical = canonicalizeFinanceTag(matches[index][1]);
+      const fullTag = canonical || normalizeCategoryPath(matches[index][1]);
       const parts = fullTag.split("/").filter(Boolean);
       if (!parts.length || parts[0] !== "log") continue;
 
@@ -402,39 +444,6 @@ const core = (() => {
         };
       }
 
-      if (parts[1] && /^(?:\d{2}|\d{4})$/.test(parts[1]) && parts[3] === "spending" && parts[2]) {
-        const holidayKey = `${parts[1]}/${parts[2]}`;
-        const remainder = parts.slice(4);
-        const isPlannedExpense = String(remainder[0] || "").toLowerCase() === "planned";
-        const category = normalizeCategoryPath((isPlannedExpense ? remainder.slice(1) : remainder).join("/")) || "uncategorized";
-        return {
-          category,
-          entryType: "holiday-spending",
-          goalKey: normalizeCategoryPath(parts[2]),
-          holidayKey,
-          isGoalContribution: false,
-          isGoalWithdrawal: true,
-          isIncome: false,
-          isPlannedExpense,
-          plannedCategory: isPlannedExpense ? category : "",
-        };
-      }
-
-      if (parts[1] && /^(?:\d{2}|\d{4})$/.test(parts[1]) && parts[2] && parts[3] === "planned") {
-        const holidayKey = `${parts[1]}/${parts[2]}`;
-        const category = normalizeCategoryPath(parts.slice(4).join("/")) || "uncategorized";
-        return {
-          category,
-          entryType: "holiday-spending",
-          goalKey: normalizeCategoryPath(parts[2]),
-          holidayKey,
-          isGoalContribution: false,
-          isGoalWithdrawal: true,
-          isIncome: false,
-          isPlannedExpense: true,
-          plannedCategory: category,
-        };
-      }
     }
 
     return {
@@ -1090,12 +1099,478 @@ const core = (() => {
     return [headers, ...rows].map((row) => row.map(escapeCell).join(",")).join("\n");
   }
 
+  const INBOX_ALIASES = {
+    amt: "amount", amount: "amount", total: "amount", value: "amount",
+    cat: "category", category: "category", tag: "tag",
+    cur: "currency", currency: "currency", ccy: "currency",
+    merchant: "merchant", payee: "merchant", vendor: "merchant", name: "name",
+    memo: "note", note: "note", desc: "note", description: "note",
+    date: "date", when: "date",
+    origamt: "originalamount", originalamount: "originalamount", foreignamount: "originalamount",
+    origcur: "originalcurrency", originalcurrency: "originalcurrency", foreigncurrency: "originalcurrency",
+    src: "source", source: "source",
+    card: "card", pass: "card",
+    id: "externalid", ref: "externalid", reference: "externalid", wiseid: "externalid", txnid: "externalid",
+    transaction: "transaction",
+  };
+
+  function normalizeInboxParams(params) {
+    const out = {};
+    for (const [rawKey, rawValue] of Object.entries(params || {})) {
+      const key = INBOX_ALIASES[String(rawKey).toLowerCase()] || String(rawKey).toLowerCase();
+      const value = typeof rawValue === "string" ? rawValue.trim() : rawValue;
+      if (value === "" || value === null || value === undefined) continue;
+      out[key] = value;
+    }
+    if (out.merchant && !out.name) out.name = out.merchant;
+    if (out.name && !out.merchant) out.merchant = out.name;
+    return out;
+  }
+
+  function parseInboxLine(raw) {
+    const text = String(raw || "").replace(/^﻿/, "").trim();
+    if (!text || /^(#|\/\/)/.test(text)) return null;
+
+    const urlMatch = text.match(/[?]([^#\s]+)/);
+    if (/^obsidian:\/\//i.test(text) && urlMatch) {
+      const params = {};
+      for (const pair of urlMatch[1].split("&")) {
+        const eq = pair.indexOf("=");
+        if (eq < 0) continue;
+        const key = decodeURIComponent(pair.slice(0, eq)).trim();
+        const value = decodeURIComponent(pair.slice(eq + 1).replace(/\+/g, " "));
+        if (key) params[key] = value;
+      }
+      return Number.isFinite(parseNumber(params.amount || params.total)) ? normalizeInboxParams(params) : null;
+    }
+
+    if (text.includes("=")) {
+      const params = {};
+      for (const segment of text.replace(/\r\n/g, "\n").split(/\n|\|/)) {
+        const eq = segment.indexOf("=");
+        if (eq < 0) continue;
+        const key = segment.slice(0, eq).trim();
+        const value = segment.slice(eq + 1).trim();
+        if (key) params[key] = value;
+      }
+      return Number.isFinite(parseNumber(params.amount || params.amt || params.total)) ? normalizeInboxParams(params) : null;
+    }
+
+    if (/#log\//i.test(text)) {
+      const amount = extractVisibleAmount(text);
+      if (!Number.isFinite(amount)) return null;
+      const category = extractCategoryFromLogSpendingTag(text);
+      const merchant = normalizeWhitespace(
+        text
+          .replace(/^\s*-\s*(?:\[[^\]]\]\s*)?/, "")
+          .replace(/#[^\s#\]]+/g, "")
+          .replace(/-?\$?\d[\d,]*(?:\.\d+)?/g, "")
+          .replace(/:/g, " ")
+      );
+      return normalizeInboxParams({ amount, category, merchant });
+    }
+
+    const tokens = text.split(/\s+/);
+    const amount = parseNumber(tokens[0]);
+    if (!Number.isFinite(amount)) return null;
+    let category = "";
+    const rest = [];
+    for (const token of tokens.slice(1)) {
+      if (!category && (token.includes("/") || /^#/.test(token))) category = token;
+      else rest.push(token);
+    }
+    return normalizeInboxParams({ amount, category, merchant: rest.join(" ") });
+  }
+
+  function buildInboxLine(expense) {
+    const entry = expense || {};
+    const parts = [`amount=${formatPlainNumber(entry.amount || 0)}`];
+    const category = normalizeCategoryPath(entry.category || "");
+    if (category) parts.push(`cat=${category}`);
+    const merchant = normalizeWhitespace(entry.merchant || entry.name || "");
+    if (merchant) parts.push(`merchant=${merchant}`);
+    parts.push(`date=${parseIsoDate(entry.date) || todayIsoLocal()}`);
+    const currency = normalizeCurrency(entry.currency || "", "");
+    if (currency) parts.push(`cur=${currency}`);
+    if (Number.isFinite(entry.originalAmount) && entry.originalCurrency) {
+      parts.push(`origamt=${formatPlainNumber(entry.originalAmount)}`);
+      parts.push(`origcur=${normalizeCurrency(entry.originalCurrency)}`);
+    }
+    if (entry.source) parts.push(`source=${normalizeWhitespace(entry.source)}`);
+    if (entry.externalId) parts.push(`id=${normalizeWhitespace(entry.externalId)}`);
+    return parts.join(" | ");
+  }
+
+  function parseQuickAddInput(text, knownCategories = []) {
+    let working = ` ${String(text || "").trim()} `;
+
+    let dateToken = "";
+    working = working.replace(/(^|\s)@(\S+)/, (_match, pre, token) => {
+      dateToken = token;
+      return pre;
+    });
+
+    let category = "";
+    const tagMatch = working.match(/(^|\s)#(\S+)/);
+    if (tagMatch) {
+      category = tagMatch[2];
+      working = working.replace(tagMatch[0], " ");
+    }
+    if (!category) {
+      const pathMatch = working.match(/(^|\s)([a-z][a-z0-9_-]*\/[a-z0-9/_-]+)(?=\s|$)/i);
+      if (pathMatch) {
+        category = pathMatch[2];
+        working = working.replace(pathMatch[2], " ");
+      }
+    }
+
+    let amount = null;
+    const amountMatch = working.match(/-?\$?\s?(-?\d[\d,]*(?:\.\d+)?)/);
+    if (amountMatch) {
+      amount = Number(amountMatch[1].replace(/,/g, ""));
+      working = working.replace(amountMatch[0], " ");
+    }
+
+    if (!category && knownCategories.length) {
+      const map = new Map();
+      for (const known of knownCategories) {
+        const full = normalizeCategoryPath(known);
+        if (!full) continue;
+        map.set(full, full);
+        const leaf = full.split("/").pop();
+        if (leaf && !map.has(leaf)) map.set(leaf, full);
+      }
+      const remaining = working.split(/\s+/).filter(Boolean);
+      const index = remaining.findIndex((token) => map.has(normalizeCategoryPath(token)));
+      if (index >= 0) {
+        category = map.get(normalizeCategoryPath(remaining[index]));
+        remaining.splice(index, 1);
+        working = ` ${remaining.join(" ")} `;
+      }
+    }
+
+    const normalizedCategory = /log\/spending/i.test(category)
+      ? extractCategoryFromLogSpendingTag(`#${String(category).replace(/^#/, "")}`)
+      : normalizeCategoryPath(category);
+
+    return {
+      amount: Number.isFinite(amount) ? Number(amount.toFixed(2)) : null,
+      category: normalizedCategory,
+      dateToken,
+      merchant: normalizeWhitespace(working),
+    };
+  }
+
+  function normalizeMerchant(value) {
+    return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+  }
+
+  function transactionFingerprint(entry) {
+    const data = entry || {};
+    const date = parseIsoDate(data.date) || "";
+    const amount = Number(Number(data.amount || 0).toFixed(2)).toFixed(2);
+    return `${date}|${amount}|${normalizeMerchant(data.merchant || data.name || "")}`;
+  }
+
+  function parseCsvRows(text) {
+    const source = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    const rows = [];
+    let row = [];
+    let field = "";
+    let inQuotes = false;
+    for (let index = 0; index < source.length; index += 1) {
+      const char = source[index];
+      if (inQuotes) {
+        if (char === '"') {
+          if (source[index + 1] === '"') {
+            field += '"';
+            index += 1;
+          } else {
+            inQuotes = false;
+          }
+        } else {
+          field += char;
+        }
+      } else if (char === '"') {
+        inQuotes = true;
+      } else if (char === ",") {
+        row.push(field);
+        field = "";
+      } else if (char === "\n") {
+        row.push(field);
+        rows.push(row);
+        row = [];
+        field = "";
+      } else {
+        field += char;
+      }
+    }
+    if (field.length || row.length) {
+      row.push(field);
+      rows.push(row);
+    }
+    return rows.filter((cells) => cells.some((cell) => String(cell).trim() !== ""));
+  }
+
+  function parseFlexibleDate(value, order = "DMY") {
+    const iso = parseIsoDate(value);
+    if (iso) return iso;
+    const match = String(value || "").trim().match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})$/);
+    if (!match) return null;
+    let first = Number(match[1]);
+    let second = Number(match[2]);
+    let year = Number(match[3]);
+    if (year < 100) year += 2000;
+    let day;
+    let month;
+    if (String(order).toUpperCase() === "MDY") {
+      month = first;
+      day = second;
+    } else {
+      day = first;
+      month = second;
+    }
+    if (month > 12 && day <= 12) {
+      const swap = month;
+      month = day;
+      day = swap;
+    }
+    if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+    return `${year}-${pad(month)}-${pad(day)}`;
+  }
+
+  function parseBankCsv(content, options = {}) {
+    const rows = parseCsvRows(content);
+    if (rows.length < 2) return [];
+    const order = options.dateOrder || "DMY";
+    const onlyDebits = options.onlyDebits !== false;
+    const fallbackCurrency = normalizeCurrency(options.defaultCurrency || "AUD");
+    const header = rows[0].map((cell) => normalizeWhitespace(cell).toLowerCase());
+
+    const findColumn = (candidates) => {
+      for (const candidate of candidates) {
+        const exact = header.findIndex((name) => name === candidate);
+        if (exact >= 0) return exact;
+      }
+      for (const candidate of candidates) {
+        const partial = header.findIndex((name) => name.includes(candidate));
+        if (partial >= 0) return partial;
+      }
+      return -1;
+    };
+
+    const dateCol = findColumn(options.dateColumns || ["transaction date", "completed date", "date", "posted", "created on"]);
+    const amountCol = findColumn(options.amountColumns || ["amount", "value"]);
+    const debitCol = findColumn(options.debitColumns || ["debit", "withdrawal", "money out", "paid out"]);
+    const creditCol = findColumn(options.creditColumns || ["credit", "deposit", "money in", "paid in"]);
+    const merchantCol = findColumn(options.merchantColumns || ["description", "merchant", "details", "narrative", "payee", "reference", "name"]);
+    const currencyCol = findColumn(options.currencyColumns || ["currency", "ccy"]);
+    const idCol = findColumn(options.idColumns || ["transaction id", "reference number", "id"]);
+
+    const result = [];
+    for (let index = 1; index < rows.length; index += 1) {
+      const cells = rows[index];
+      const cell = (position) => (position >= 0 && position < cells.length ? normalizeWhitespace(cells[position]) : "");
+      const date = parseFlexibleDate(cell(dateCol), order);
+      if (!date) continue;
+
+      let amount = null;
+      let isDebit = true;
+      if (debitCol >= 0 || creditCol >= 0) {
+        const debit = parseNumber(cell(debitCol));
+        const credit = parseNumber(cell(creditCol));
+        if (Number.isFinite(debit) && debit !== 0) {
+          amount = Math.abs(debit);
+          isDebit = true;
+        } else if (Number.isFinite(credit) && credit !== 0) {
+          amount = Math.abs(credit);
+          isDebit = false;
+        }
+      } else {
+        const raw = parseNumber(cell(amountCol));
+        if (Number.isFinite(raw)) {
+          amount = Math.abs(raw);
+          isDebit = raw < 0;
+        }
+      }
+      if (!Number.isFinite(amount) || amount === 0) continue;
+      if (onlyDebits && !isDebit) continue;
+
+      result.push({
+        amount: Number(amount.toFixed(2)),
+        currency: currencyCol >= 0 ? normalizeCurrency(cell(currencyCol), fallbackCurrency) : fallbackCurrency,
+        date,
+        externalId: cell(idCol),
+        isDebit,
+        merchant: cell(merchantCol),
+        raw: cells.join(","),
+      });
+    }
+    return result;
+  }
+
+  function recomputeSpendingTotals(content, settings = {}) {
+    const lines = splitLines(content);
+    const noteDate = extractNoteDate(content, "");
+    const spendingHeading = normalizeWhitespace(settings.spendingHeading || "## Spending");
+    const rootTag = normalizeWhitespace(settings.spendingRootTag || "#log/spending");
+    const headingIndex = lines.findIndex(
+      (line) => normalizeWhitespace(line).toLowerCase() === spendingHeading.toLowerCase()
+    );
+    if (headingIndex === -1) return content;
+
+    let sectionEnd = lines.length;
+    for (let index = headingIndex + 1; index < lines.length; index += 1) {
+      const trimmed = lines[index].trim();
+      if (/^#{1,6}\s+/.test(trimmed) || /^---\s*$/.test(trimmed)) {
+        sectionEnd = index;
+        break;
+      }
+    }
+
+    const rootRe = new RegExp(`^- \\[[^\\]]\\] ${rootTag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\\s|$)`, "i");
+    let rootLineIndex = -1;
+    for (let index = headingIndex + 1; index < sectionEnd; index += 1) {
+      if (rootRe.test(lines[index].trim())) {
+        rootLineIndex = index;
+        break;
+      }
+    }
+    if (rootLineIndex === -1) return content;
+
+    const total = calculateSpendingSectionTotal(lines.slice(rootLineIndex + 1, sectionEnd), noteDate, {
+      defaultCurrency: settings.defaultCurrency || "AUD",
+    });
+    const line = lines[rootLineIndex];
+    const tagPos = line.toLowerCase().indexOf(rootTag.toLowerCase());
+    if (tagPos === -1) return content;
+    const prefix = line.slice(0, tagPos + rootTag.length);
+    const desired = `${prefix} ${formatPlainNumber(total)}`;
+    if (line === desired) return content;
+    lines[rootLineIndex] = desired;
+    return lines.join("\n");
+  }
+
+  function computeBudgetPace(input = {}) {
+    const limit = Number(input.limit || 0);
+    const spent = Number(input.spent || 0);
+    const start = parseIsoDate(input.periodStart || input.start || "");
+    const end = parseIsoDate(input.periodEnd || input.end || "");
+    const reference = parseIsoDate(input.referenceDate || "") || todayIsoLocal();
+    const base = {
+      totalDays: 0,
+      elapsedDays: 0,
+      elapsedFraction: 0,
+      pacedSpend: 0,
+      projected: roundCurrencyAmount(spent),
+      paceRatio: 0,
+      onPace: true,
+      remainingDays: 0,
+      perDayRemaining: 0,
+    };
+    if (!start || !end || limit <= 0) return base;
+
+    const totalDays = daysBetweenInclusive(start, end);
+    let elapsedDays;
+    let remainingDays;
+    if (reference < start) {
+      elapsedDays = 0;
+      remainingDays = totalDays;
+    } else if (reference >= end) {
+      elapsedDays = totalDays;
+      remainingDays = 0;
+    } else {
+      elapsedDays = daysBetweenInclusive(start, reference);
+      remainingDays = daysBetweenInclusive(reference, end);
+    }
+
+    const elapsedFraction = totalDays > 0 ? Math.min(1, elapsedDays / totalDays) : 0;
+    const pacedSpend = roundCurrencyAmount(limit * elapsedFraction);
+    const projected = elapsedFraction > 0 ? roundCurrencyAmount(spent / elapsedFraction) : 0;
+    const rawPaceRatio = pacedSpend > 0 ? spent / pacedSpend : spent > 0 ? 999 : 0;
+    const perDayRemaining = remainingDays > 0
+      ? roundCurrencyAmount(Math.max(0, limit - spent) / remainingDays)
+      : roundCurrencyAmount(Math.max(0, limit - spent));
+
+    return {
+      totalDays,
+      elapsedDays,
+      elapsedFraction: Number(elapsedFraction.toFixed(4)),
+      pacedSpend,
+      projected,
+      paceRatio: Number(rawPaceRatio.toFixed(3)),
+      onPace: spent <= pacedSpend * 1.001,
+      remainingDays,
+      perDayRemaining,
+    };
+  }
+
+  function replaceTransactionBlock(content, oldRawLine, newExpense, settings = {}) {
+    const lines = splitLines(content);
+    const target = String(oldRawLine);
+    const index = lines.findIndex((line) => line === target);
+    if (index < 0) return null;
+
+    const indent = (target.match(/^\s*/) || [""])[0].length;
+    let end = index + 1;
+    while (end < lines.length) {
+      const line = lines[end];
+      if (!line.trim()) break;
+      const lineIndent = (line.match(/^\s*/) || [""])[0].length;
+      if (lineIndent > indent && /^\s*-\s/.test(line)) {
+        end += 1;
+        continue;
+      }
+      break;
+    }
+
+    const expense = { ...newExpense, date: newExpense.date || extractNoteDate(content, "") };
+    const block = buildTransactionBlock(expense, settings);
+    lines.splice(index, end - index, ...block);
+    return recomputeSpendingTotals(lines.join("\n"), settings);
+  }
+
+  function removeTransactionBlock(content, oldRawLine, settings = {}) {
+    const lines = splitLines(content);
+    const target = String(oldRawLine);
+    const index = lines.findIndex((line) => line === target);
+    if (index < 0) return null;
+
+    const indent = (target.match(/^\s*/) || [""])[0].length;
+    let end = index + 1;
+    while (end < lines.length) {
+      const line = lines[end];
+      if (!line.trim()) break;
+      const lineIndent = (line.match(/^\s*/) || [""])[0].length;
+      if (lineIndent > indent && /^\s*-\s/.test(line)) {
+        end += 1;
+        continue;
+      }
+      break;
+    }
+
+    lines.splice(index, end - index);
+    return recomputeSpendingTotals(lines.join("\n"), settings);
+  }
+
   return {
     addDays,
+    recomputeSpendingTotals,
+    computeBudgetPace,
+    replaceTransactionBlock,
+    removeTransactionBlock,
     buildCategoryTag,
     buildAllocatedExpenseSummary,
     buildCsv,
     buildIncomeTag,
+    buildInboxLine,
+    parseInboxLine,
+    parseQuickAddInput,
+    parseBankCsv,
+    parseCsvRows,
+    parseFlexibleDate,
+    normalizeMerchant,
+    transactionFingerprint,
     canRollBudgetPeriodIntoSection,
     calculateSpendingSectionTotal,
     daysBetweenInclusive,
@@ -1162,6 +1637,10 @@ const DEFAULT_SETTINGS = {
   dashboardSliceLabelThreshold: 0.08,
   budgetCheckPeriod: "week",
   weekStartsOn: "monday",
+  captureInboxFolder: "Utility/Finance/Inbox",
+  merchantMapPath: "Utility/Finance/Merchant Map.md",
+  autoDrainInbox: true,
+  processedExternalIds: [],
 };
 
 const FINANCE_CAPTURE_ACTION = "finance-capture";
@@ -1544,10 +2023,6 @@ class FinanceTrackerPlugin extends Plugin {
       await this.renderHolidayDashboard(source, el, ctx);
     });
 
-    this.registerMarkdownCodeBlockProcessor(DAILY_BUDGET_CHECK_BLOCK, async (source, el, ctx) => {
-      await this.renderDailyBudgetCheck(source, el, ctx);
-    });
-
     this.registerMarkdownCodeBlockProcessor(SAVINGS_DASHBOARD_BLOCK, async (source, el, ctx) => {
       await this.renderSavingsDashboard(source, el, ctx);
     });
@@ -1555,6 +2030,12 @@ class FinanceTrackerPlugin extends Plugin {
     this.registerView(DAILY_BUDGET_VIEW, (leaf) => new DailyBudgetView(leaf, this));
 
     this.addRibbonIcon("coins", "Daily Budget", () => this.activateDailyBudgetView());
+    this.addRibbonIcon("circle-plus", "Quick add transaction", () => new QuickAddTransactionModal(this.app, this).open());
+
+    this._statusBarItem = this.addStatusBarItem();
+    this._statusBarItem.addClass("finance-status-bar");
+    this._statusBarItem.setText("💸 …");
+    this._statusBarItem.addEventListener("click", () => new QuickAddTransactionModal(this.app, this).open());
 
     this.addCommand({
       id: "finance-tracker-open-daily-budget",
@@ -1562,9 +2043,53 @@ class FinanceTrackerPlugin extends Plugin {
       callback: () => this.activateDailyBudgetView(),
     });
 
-    this.app.workspace.onLayoutReady(() => this.activateDailyBudgetView());
+    this.addCommand({
+      id: "finance-tracker-quick-add",
+      name: "Quick add transaction",
+      callback: () => new QuickAddTransactionModal(this.app, this).open(),
+    });
+
+    this.addCommand({
+      id: "finance-tracker-drain-inbox",
+      name: "Drain capture inbox now",
+      callback: () => this.drainCaptureInbox({ notify: true }),
+    });
+
+    this.addCommand({
+      id: "finance-tracker-reconcile-csv",
+      name: "Reconcile bank/Wise CSV against logged spending",
+      callback: () => new BankReconcileModal(this.app, this).open(),
+    });
+
+    this.app.workspace.onLayoutReady(() => {
+      this.activateDailyBudgetView();
+      this.setupCaptureInbox();
+      this.setupIndexAndTotals();
+      this.updateStatusBar().catch(() => {});
+    });
 
     this.setupJournalCalendarIntegration();
+  }
+
+  async setupCaptureInbox() {
+    try {
+      if (this.settings.captureInboxFolder) {
+        await this.ensureFolder(normalizePath(this.settings.captureInboxFolder));
+      }
+    } catch (_error) {
+      // folder creation is best-effort; the Shortcut can create it on first write
+    }
+    const prefix = normalizePath(`${this.settings.captureInboxFolder}/`);
+    const onInboxEvent = (file) => {
+      if (file && file.path && file.path.startsWith(prefix) && !file.path.includes("/_failed/")) {
+        this._scheduleInboxDrain();
+      }
+    };
+    this.registerEvent(this.app.vault.on("create", onInboxEvent));
+    this.registerEvent(this.app.vault.on("modify", onInboxEvent));
+    this.drainCaptureInbox({ notify: true }).catch((error) =>
+      console.warn("[finance-tracker] initial inbox drain failed", error)
+    );
   }
 
   async activateDailyBudgetView() {
@@ -1583,6 +2108,8 @@ class FinanceTrackerPlugin extends Plugin {
 
   onunload() {
     clearTimeout(this._calendarDecorationTimer);
+    clearTimeout(this._inboxDrainTimer);
+    clearTimeout(this._statusBarTimer);
     if (this._journalCalendarObservers) {
       for (const observer of this._journalCalendarObservers.values()) {
         observer.disconnect();
@@ -1830,64 +2357,487 @@ class FinanceTrackerPlugin extends Plugin {
       originalAmount: core.parseNumber(params.originalamount || params.originalAmount),
       originalCurrency: String(params.originalcurrency || params.originalCurrency || "").trim(),
       source: String(params.source || "apple-pay").trim(),
+      externalId: String(params.externalid || params.externalId || params.id || "").trim(),
       transaction: String(params.transaction || "").trim(),
     };
   }
 
   async handleCapture(params) {
     try {
-      let expense = this.parseCaptureParams(params);
-      const holidayContext = await this.findHolidayContextForDate(expense.date);
-      if (holidayContext?.holidayKey) {
-        expense.holidayKey = holidayContext.holidayKey;
-        expense = this.applyHolidayCurrencyContext(expense, holidayContext);
+      const expense = this.parseCaptureParams(params);
+      const result = await this.handleCaptureExpense(expense, { notify: true });
+      if (result.skipped) {
+        new Notice(`Finance: skipped duplicate capture (${expense.externalId})`);
       }
-      const notePath = this.getDailyNotePath(expense.date);
-      const file =
-        this.app.vault.getAbstractFileByPath(notePath) instanceof TFile
-          ? this.app.vault.getAbstractFileByPath(notePath)
-          : await this.ensureTextFile(notePath, () => this.buildMinimalDailyNote(expense.date));
-
-      const currentContent = await this.app.vault.cachedRead(file);
-      const nextContent = core.insertTransactionIntoDailyNote(currentContent, expense, this.settings);
-      await this.app.vault.modify(file, nextContent);
-
-      if (this.settings.openDailyNoteAfterCapture) {
-        await this.app.workspace.getLeaf(true).openFile(file);
-      }
-
-      new Notice(`Logged ${core.formatCurrency(expense.amount, expense.currency)} to ${expense.date}`);
     } catch (error) {
       new Notice(`Finance capture failed: ${error.message}`);
     }
   }
 
-  async collectTransactionsForRange(range) {
-    const prefix = normalizePath(`${this.settings.dailyNotesFolder}/`);
+  // Single write path shared by the URL handler, the inbox drainer, and the
+  // quick-add modal. Applies merchant->category guessing, holiday context, and
+  // external-id de-duplication, then inserts into the routed daily note.
+  async handleCaptureExpense(expenseInput, options = {}) {
+    let expense = { ...expenseInput };
+
+    if (expense.externalId && this.isExternalIdProcessed(expense.externalId)) {
+      return { skipped: true, reason: "duplicate", expense };
+    }
+
+    if ((!expense.category || expense.category === "uncategorized") && expense.merchant) {
+      const guessed = await this.guessCategoryForMerchant(expense.merchant);
+      if (guessed) expense.category = guessed;
+    }
+
+    const holidayContext = await this.findHolidayContextForDate(expense.date);
+    if (holidayContext?.holidayKey) {
+      expense.holidayKey = holidayContext.holidayKey;
+      expense = this.applyHolidayCurrencyContext(expense, holidayContext);
+    }
+
+    const notePath = this.getDailyNotePath(expense.date);
+    const file =
+      this.app.vault.getAbstractFileByPath(notePath) instanceof TFile
+        ? this.app.vault.getAbstractFileByPath(notePath)
+        : await this.ensureTextFile(notePath, () => this.buildMinimalDailyNote(expense.date));
+
+    const currentContent = await this.app.vault.cachedRead(file);
+    const nextContent = core.insertTransactionIntoDailyNote(currentContent, expense, this.settings);
+    await this.app.vault.modify(file, nextContent);
+
+    if (expense.externalId) {
+      await this.markExternalIdProcessed(expense.externalId);
+    }
+    this.invalidateIndexEntry(file.path);
+    this._scheduleStatusBarUpdate();
+
+    const shouldOpen = options.openNote ?? this.settings.openDailyNoteAfterCapture;
+    if (shouldOpen) {
+      await this.app.workspace.getLeaf(true).openFile(file);
+    }
+
+    if (options.notify) {
+      new Notice(`Logged ${core.formatCurrency(expense.amount, expense.currency)} to ${expense.date}`);
+    }
+
+    return { skipped: false, file, expense };
+  }
+
+  isExternalIdProcessed(id) {
+    const key = String(id || "").trim();
+    if (!key) return false;
+    return Array.isArray(this.settings.processedExternalIds) && this.settings.processedExternalIds.includes(key);
+  }
+
+  async markExternalIdProcessed(id) {
+    const key = String(id || "").trim();
+    if (!key) return;
+    if (!Array.isArray(this.settings.processedExternalIds)) this.settings.processedExternalIds = [];
+    if (this.settings.processedExternalIds.includes(key)) return;
+    this.settings.processedExternalIds.push(key);
+    // keep only the most recent 1000 ids so data.json stays small
+    if (this.settings.processedExternalIds.length > 1000) {
+      this.settings.processedExternalIds = this.settings.processedExternalIds.slice(-1000);
+    }
+    await this.saveSettings();
+  }
+
+  async loadMerchantMap() {
+    const path = normalizePath(this.settings.merchantMapPath || "");
+    const map = new Map();
+    if (!path) return map;
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) return map;
+    const content = await this.app.vault.cachedRead(file);
+    for (const rows of core.parseMarkdownTable(content)) {
+      for (const row of rows) {
+        const merchant = core.normalizeMerchant(row.merchant || row.payee || row.name || "");
+        const category = core.normalizeCategoryPath(row.category || row.cat || "");
+        if (merchant && category) map.set(merchant, category);
+      }
+    }
+    return map;
+  }
+
+  async guessCategoryForMerchant(merchant) {
+    const key = core.normalizeMerchant(merchant);
+    if (!key) return "";
+    const map = await this.loadMerchantMap();
+    return map.get(key) || "";
+  }
+
+  // Compares a statement CSV against logged spending. A row counts as already
+  // logged if it matches an entry by exact fingerprint (date+amount+merchant) or,
+  // failing that, by date+amount alone (merchant names differ across sources).
+  async reconcileBankCsv(content, options = {}) {
+    const rows = core.parseBankCsv(content, {
+      dateOrder: options.dateOrder || "DMY",
+      defaultCurrency: this.settings.defaultCurrency,
+    });
+    if (!rows.length) {
+      return { rows: [], matched: [], missing: [] };
+    }
+
+    const sortedDates = rows.map((row) => row.date).sort();
+    const logged = await this.collectTransactionsForRange({
+      period: "all",
+      start: sortedDates[0],
+      end: sortedDates[sortedDates.length - 1],
+    });
+
+    const byFingerprint = new Map();
+    const byDateAmount = new Map();
+    for (const entry of logged) {
+      if (entry.isIncome || entry.isGoalContribution) continue;
+      const fingerprint = core.transactionFingerprint(entry);
+      byFingerprint.set(fingerprint, (byFingerprint.get(fingerprint) || 0) + 1);
+      const key = `${entry.date}|${Number(entry.amount).toFixed(2)}`;
+      byDateAmount.set(key, (byDateAmount.get(key) || 0) + 1);
+    }
+
+    const matched = [];
+    const missing = [];
+    for (const row of rows) {
+      const fingerprint = core.transactionFingerprint(row);
+      const dateAmountKey = `${row.date}|${Number(row.amount).toFixed(2)}`;
+      if ((byFingerprint.get(fingerprint) || 0) > 0) {
+        byFingerprint.set(fingerprint, byFingerprint.get(fingerprint) - 1);
+        byDateAmount.set(dateAmountKey, Math.max(0, (byDateAmount.get(dateAmountKey) || 0) - 1));
+        matched.push(row);
+      } else if ((byDateAmount.get(dateAmountKey) || 0) > 0) {
+        byDateAmount.set(dateAmountKey, byDateAmount.get(dateAmountKey) - 1);
+        matched.push(row);
+      } else {
+        missing.push(row);
+      }
+    }
+    return { rows, matched, missing };
+  }
+
+  // Writes statement rows as capture-inbox files (uncategorized) so the normal
+  // drain + triage flow logs and categorizes them.
+  async sendRowsToInbox(rows) {
+    const folder = normalizePath(this.settings.captureInboxFolder || "");
+    if (!folder) throw new Error("No capture inbox folder configured.");
+    await this.ensureFolder(folder);
+    let count = 0;
+    for (const row of rows || []) {
+      const line = core.buildInboxLine({
+        amount: row.amount,
+        category: "",
+        merchant: row.merchant,
+        date: row.date,
+        currency: row.currency,
+        source: "csv-reconcile",
+        externalId: row.externalId ? `csv:${row.externalId}` : "",
+      });
+      const stamp = `${String(row.date || core.todayIsoLocal()).replace(/-/g, "")}-${Math.random().toString(36).slice(2, 6)}`;
+      await this.app.vault.create(normalizePath(`${folder}/reconcile-${stamp}.txt`), `${line}\n`);
+      count += 1;
+    }
+    return count;
+  }
+
+  async updateTransactionEntry(entry, patch) {
+    const file = this.app.vault.getAbstractFileByPath(entry.filePath);
+    if (!(file instanceof TFile)) throw new Error("Could not find the note for this entry.");
+    const content = await this.app.vault.cachedRead(file);
+    const newExpense = {
+      amount: Number.isFinite(patch.amount) ? patch.amount : entry.amount,
+      category: patch.category ?? entry.category,
+      currency: entry.currency,
+      date: entry.date,
+      holidayKey: entry.holidayKey,
+      merchant: patch.merchant ?? entry.merchant,
+      note: patch.note ?? entry.note,
+      originalAmount: entry.originalAmount,
+      originalCurrency: entry.originalCurrency,
+      originalRateKey: entry.originalRateKey,
+    };
+    const next = core.replaceTransactionBlock(content, entry.rawLine, newExpense, this.settings);
+    if (next == null) throw new Error("Could not locate that entry (the note may have changed).");
+    await this.app.vault.modify(file, next);
+    this.invalidateIndexEntry(file.path);
+    this._scheduleStatusBarUpdate();
+    this.refreshDailyBudgetView();
+  }
+
+  async deleteTransactionEntry(entry) {
+    const file = this.app.vault.getAbstractFileByPath(entry.filePath);
+    if (!(file instanceof TFile)) throw new Error("Could not find the note for this entry.");
+    const content = await this.app.vault.cachedRead(file);
+    const next = core.removeTransactionBlock(content, entry.rawLine, this.settings);
+    if (next == null) throw new Error("Could not locate that entry in the note.");
+    await this.app.vault.modify(file, next);
+    this.invalidateIndexEntry(file.path);
+    this._scheduleStatusBarUpdate();
+    this.refreshDailyBudgetView();
+  }
+
+  async rememberMerchantCategory(merchant, category) {
+    const cleanMerchant = String(merchant || "").replace(/\s+/g, " ").trim();
+    const cleanCategory = core.normalizeCategoryPath(category);
+    if (!cleanMerchant || !cleanCategory) return;
+    const path = normalizePath(this.settings.merchantMapPath || "");
+    if (!path) return;
+    const existing = await this.loadMerchantMap();
+    if (existing.get(core.normalizeMerchant(cleanMerchant)) === cleanCategory) return;
+    const row = `| ${cleanMerchant} | ${cleanCategory} |`;
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) {
+      await this.upsertFile(path, `# Merchant Map\n\n| Merchant | Category |\n| --- | --- |\n${row}\n`);
+      return;
+    }
+    const content = await this.app.vault.cachedRead(file);
+    const lines = content.split("\n");
+    const sepIndex = lines.findIndex((line) => /^\s*\|[\s:\-|]+\|\s*$/.test(line));
+    if (sepIndex >= 0) {
+      lines.splice(sepIndex + 1, 0, row);
+    } else {
+      lines.push("", "| Merchant | Category |", "| --- | --- |", row);
+    }
+    await this.app.vault.modify(file, lines.join("\n"));
+  }
+
+  countPendingCaptures() {
+    const folderPath = normalizePath(this.settings.captureInboxFolder || "");
+    if (!folderPath) return 0;
+    const prefix = `${folderPath}/`;
+    return this.app.vault
+      .getFiles()
+      .filter((file) => file.path.startsWith(prefix) && !file.path.includes("/_failed/"))
+      .filter((file) => file.extension === "txt" || file.extension === "md").length;
+  }
+
+  // Drains every capture file the Shortcuts dropped into the inbox folder into
+  // the correct daily notes, then deletes them. Unparseable files are moved to
+  // an `_failed` subfolder with the error noted, never silently dropped.
+  async drainCaptureInbox(options = {}) {
+    const folderPath = normalizePath(this.settings.captureInboxFolder || "");
+    if (!folderPath) return 0;
+    const prefix = `${folderPath}/`;
     const files = this.app.vault
+      .getFiles()
+      .filter((file) => file.path.startsWith(prefix) && !file.path.includes("/_failed/"))
+      .filter((file) => file.extension === "txt" || file.extension === "md");
+
+    let processed = 0;
+    let failed = 0;
+    for (const file of files) {
+      let raw = "";
+      try {
+        raw = await this.app.vault.cachedRead(file);
+      } catch (_error) {
+        continue; // likely an iCloud placeholder not yet downloaded; retry next pass
+      }
+      if (!String(raw || "").trim()) continue;
+
+      const params = core.parseInboxLine(raw);
+      if (!params) {
+        await this.quarantineCapture(file, raw, "Could not parse a transaction from this file");
+        failed += 1;
+        continue;
+      }
+      try {
+        const expense = this.parseCaptureParams(params);
+        const result = await this.handleCaptureExpense(expense, { notify: false });
+        await this.app.vault.delete(file);
+        if (!result.skipped) processed += 1;
+      } catch (error) {
+        await this.quarantineCapture(file, raw, error?.message || String(error));
+        failed += 1;
+      }
+    }
+
+    if (options.notify !== false) {
+      if (processed > 0) {
+        new Notice(`Finance: logged ${processed} capture${processed === 1 ? "" : "s"} from the inbox`);
+      }
+      if (failed > 0) {
+        new Notice(`Finance: ${failed} capture${failed === 1 ? "" : "s"} need attention in ${folderPath}/_failed`);
+      }
+    }
+    if (processed > 0) this.refreshDailyBudgetView();
+    this._scheduleStatusBarUpdate();
+    return processed;
+  }
+
+  async quarantineCapture(file, raw, reason) {
+    try {
+      const failedFolder = normalizePath(`${this.settings.captureInboxFolder}/_failed`);
+      await this.ensureFolder(failedFolder);
+      const target = normalizePath(`${failedFolder}/${file.name}`);
+      const body = `<!-- finance-capture error: ${String(reason || "").replace(/--+>/g, "->")} -->\n${raw}`;
+      await this.upsertFile(target, body);
+      await this.app.vault.delete(file);
+    } catch (error) {
+      console.warn("[finance-tracker] failed to quarantine capture", error);
+    }
+  }
+
+  _scheduleInboxDrain() {
+    if (!this.settings.autoDrainInbox) return;
+    clearTimeout(this._inboxDrainTimer);
+    this._inboxDrainTimer = setTimeout(() => {
+      this.drainCaptureInbox({ notify: true }).catch((error) =>
+        console.warn("[finance-tracker] inbox drain failed", error)
+      );
+    }, 1500);
+  }
+
+  refreshDailyBudgetView() {
+    const leaves = this.app.workspace.getLeavesOfType(DAILY_BUDGET_VIEW);
+    for (const leaf of leaves) {
+      if (leaf.view && typeof leaf.view.refresh === "function") {
+        leaf.view.refresh();
+      }
+    }
+  }
+
+  _scheduleStatusBarUpdate() {
+    clearTimeout(this._statusBarTimer);
+    this._statusBarTimer = setTimeout(() => {
+      this.updateStatusBar().catch(() => {});
+    }, 500);
+  }
+
+  async updateStatusBar() {
+    if (!this._statusBarItem) return;
+    const sumSpend = (entries) =>
+      entries.filter((entry) => !entry.isIncome && !entry.isGoalContribution).reduce((total, entry) => total + Number(entry.amount || 0), 0);
+    const currency = this.settings.defaultCurrency;
+    const today = core.todayIsoLocal();
+    const todaySpend = sumSpend(await this.collectTransactionsForRange({ period: "day", start: today, end: today }));
+    const period = core.normalizeBudgetPeriod(this.settings.budgetCheckPeriod || "week");
+    const range = core.toPeriodRange({ period, referenceDate: today, weekStartsOn: this.settings.weekStartsOn });
+    const periodSpend = sumSpend(await this.collectTransactionsForRange(range));
+    const parts = [
+      `Today ${core.formatCurrency(todaySpend, currency)}`,
+      `${period[0].toUpperCase()}${period.slice(1)} ${core.formatCurrency(periodSpend, currency)}`,
+    ];
+    const pending = this.countPendingCaptures();
+    if (pending > 0) parts.push(`📥 ${pending}`);
+    this._statusBarItem.setText(`💸 ${parts.join("  ·  ")}`);
+    this._statusBarItem.setAttribute("aria-label", "Finance Tracker — click to quick add");
+  }
+
+  // Resolves quick-add @date tokens: ISO dates, today/yesterday/tomorrow,
+  // weekday names (most recent past occurrence), or anything the natural-language
+  // dates plugin understands when it is installed.
+  resolveDateToken(token) {
+    const raw = String(token || "").trim();
+    if (!raw) return "";
+    const iso = core.parseIsoDate(raw);
+    if (iso) return iso;
+    const lower = raw.toLowerCase();
+    const today = core.todayIsoLocal();
+    if (lower === "today") return today;
+    if (lower === "yesterday" || lower === "yest") return core.addDays(today, -1);
+    if (lower === "tomorrow") return core.addDays(today, 1);
+
+    const nld = this.app.plugins?.plugins?.["nldates-obsidian"];
+    if (nld && typeof nld.parseDate === "function") {
+      try {
+        const result = nld.parseDate(raw);
+        if (result && result.date instanceof Date && !Number.isNaN(result.date.getTime())) {
+          return core.todayIsoLocal(result.date);
+        }
+      } catch (_error) {
+        // fall through to weekday handling
+      }
+    }
+
+    const weekdays = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+    const index = weekdays.findIndex((day) => day.startsWith(lower));
+    if (index >= 0) {
+      const diff = (new Date().getDay() - index + 7) % 7;
+      return core.addDays(today, -diff);
+    }
+    return "";
+  }
+
+  getDailyNoteFiles(range) {
+    const prefix = normalizePath(`${this.settings.dailyNotesFolder}/`);
+    return this.app.vault
       .getMarkdownFiles()
       .filter((file) => file.path.startsWith(prefix))
       .filter((file) => {
+        if (!range) return true;
         const pathDate = core.extractNoteDate("", file.path);
         if (!pathDate) return true;
         return core.isDateInRange(pathDate, range);
       });
+  }
 
+  // Returns parsed transactions for a daily note, reusing the in-memory index
+  // when the file's mtime is unchanged so unedited notes are never re-parsed.
+  async getIndexedEntriesForFile(file) {
+    if (!this._txnIndex) this._txnIndex = new Map();
+    const mtime = file.stat ? file.stat.mtime : 0;
+    const cached = this._txnIndex.get(file.path);
+    if (cached && cached.mtime === mtime) return cached.entries;
+    const content = await this.app.vault.cachedRead(file);
+    const entries = core.parseTransactionsFromNoteContent(content, file.path, {
+      defaultCurrency: this.settings.defaultCurrency,
+      financeHeading: this.settings.spendingHeading,
+      spendingHeading: this.settings.spendingHeading,
+    });
+    this._txnIndex.set(file.path, { mtime, entries });
+    return entries;
+  }
+
+  invalidateIndexEntry(path) {
+    if (this._txnIndex) this._txnIndex.delete(path);
+  }
+
+  async collectTransactionsForRange(range) {
+    const files = this.getDailyNoteFiles(range);
     const entries = [];
     for (const file of files) {
-      const content = await this.app.vault.cachedRead(file);
-      const parsed = core.parseTransactionsFromNoteContent(content, file.path, {
-        defaultCurrency: this.settings.defaultCurrency,
-        financeHeading: this.settings.spendingHeading,
-        spendingHeading: this.settings.spendingHeading,
-      }).filter((entry) => core.isDateInRange(entry.date, range));
-      entries.push(...parsed);
+      const parsed = await this.getIndexedEntriesForFile(file);
+      for (const entry of parsed) {
+        if (core.isDateInRange(entry.date, range)) entries.push(entry);
+      }
     }
-
     return entries.sort((left, right) => {
       if (left.date === right.date) return (left.filePath || "").localeCompare(right.filePath || "");
       return String(left.date || "").localeCompare(String(right.date || ""));
     });
+  }
+
+  // Keeps the transaction index fresh on file events and heals stale running
+  // totals when a daily note is opened (deliberately not on every keystroke, so
+  // it never fights the active editor).
+  setupIndexAndTotals() {
+    this.registerEvent(
+      this.app.vault.on("modify", (file) => {
+        const prefix = normalizePath(`${this.settings.dailyNotesFolder}/`);
+        if (file.path.startsWith(prefix)) {
+          this.invalidateIndexEntry(file.path);
+          this._scheduleStatusBarUpdate();
+        }
+      })
+    );
+    this.registerEvent(this.app.vault.on("delete", (file) => this.invalidateIndexEntry(file.path)));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.invalidateIndexEntry(oldPath)));
+    this.registerEvent(
+      this.app.workspace.on("file-open", (file) => {
+        if (!file || !file.path) return;
+        const prefix = normalizePath(`${this.settings.dailyNotesFolder}/`);
+        if (!file.path.startsWith(prefix)) return;
+        window.setTimeout(() => this.reconcileDailyNoteTotal(file).catch(() => {}), 300);
+      })
+    );
+  }
+
+  async reconcileDailyNoteTotal(target) {
+    const file = target instanceof TFile ? target : this.app.vault.getAbstractFileByPath(target?.path || "");
+    if (!(file instanceof TFile)) return;
+    const content = await this.app.vault.cachedRead(file);
+    const next = core.recomputeSpendingTotals(content, this.settings);
+    if (next !== content) {
+      await this.app.vault.modify(file, next);
+    }
   }
 
   async collectTransactionsForHoliday(holidayKey, range = {}) {
@@ -2689,36 +3639,96 @@ class FinanceTrackerPlugin extends Plugin {
           this.settings.weekStartsOn
         );
         const ratio = limit > 0 ? spent / limit : 0;
+        const pace = core.computeBudgetPace({
+          limit,
+          spent,
+          periodStart: range.start,
+          periodEnd: range.end,
+          referenceDate: referenceDate || range.start,
+        });
         return {
           ...budget,
           effectiveLimit: limit,
           remaining: Number((limit - spent).toFixed(2)),
           ratio,
           spent: Number(spent.toFixed(2)),
+          pace,
         };
       })
       .filter((budget) => Number.isFinite(budget.effectiveLimit) && budget.effectiveLimit > 0);
   }
 
-  renderSummary(wrapper, entries, currency, range) {
+  renderSummary(wrapper, entries, currency, range, options = {}) {
     const cards = wrapper.createDiv({ cls: "finance-tracker-summary" });
     const total = entries.reduce((sum, entry) => sum + Number(entry.amount || 0), 0);
-    const count = entries.length;
+    const days = core.daysBetweenInclusive(range.start, range.end);
+    const avgPerDay = days > 0 ? total / days : total;
     const grouped = core.groupTransactionsByCategory(entries, "primary");
     const topCategory = grouped[0]?.label || "None";
-    const periodLabel = range.start === range.end ? range.start : `${range.start} to ${range.end}`;
 
     const cardData = [
       { label: "Total", value: core.formatCurrency(total, currency) },
-      { label: "Transactions", value: String(count) },
-      { label: "Top Category", value: topCategory },
-      { label: "Period", value: periodLabel },
+      { label: "Avg / Day", value: core.formatCurrency(core.roundCurrencyAmount(avgPerDay), currency) },
     ];
 
+    if (Number.isFinite(options.previousTotal)) {
+      const delta = total - options.previousTotal;
+      const pct = options.previousTotal > 0 ? Math.round((delta / options.previousTotal) * 100) : null;
+      const arrow = delta > 0 ? "▲" : delta < 0 ? "▼" : "—";
+      const pctText = pct === null ? "" : ` (${delta >= 0 ? "+" : ""}${pct}%)`;
+      cardData.push({
+        label: `vs Prev ${core.titleCaseSegment(range.period || "period")}`,
+        value: `${arrow} ${core.formatCurrency(Math.abs(delta), currency)}${pctText}`,
+        cls: delta > 0 ? "is-up" : delta < 0 ? "is-down" : "",
+      });
+    }
+    cardData.push({ label: "Top Category", value: topCategory });
+
     for (const card of cardData) {
-      const element = cards.createDiv({ cls: "finance-tracker-summary-card" });
+      const element = cards.createDiv({ cls: `finance-tracker-summary-card${card.cls ? ` ${card.cls}` : ""}` });
       element.createDiv({ cls: "finance-tracker-summary-label", text: card.label });
       element.createDiv({ cls: "finance-tracker-summary-value", text: card.value });
+    }
+  }
+
+  renderSpendTrend(wrapper, entries, range, currency, options = {}) {
+    const dayCount = core.daysBetweenInclusive(range.start, range.end);
+    if (dayCount < 2 || dayCount > 62) return;
+    const totals = [];
+    for (let i = 0; i < dayCount; i += 1) {
+      const date = core.addDays(range.start, i);
+      const sum = entries
+        .filter((entry) => entry.date === date)
+        .reduce((acc, entry) => acc + Number(entry.amount || 0), 0);
+      totals.push({ date, sum: core.roundCurrencyAmount(sum) });
+    }
+    const perDayBudget = Number(options.perDayBudget || 0);
+    const maxValue = Math.max(1, perDayBudget, ...totals.map((t) => t.sum));
+    const W = 600;
+    const H = 120;
+    const pad = 4;
+    const gap = totals.length > 30 ? 1 : 2;
+    const barWidth = (W - pad * 2 - gap * (totals.length - 1)) / totals.length;
+    const today = core.todayIsoLocal();
+    let bars = "";
+    totals.forEach((entry, index) => {
+      const height = (entry.sum / maxValue) * (H - pad * 2);
+      const x = pad + index * (barWidth + gap);
+      const y = H - pad - height;
+      const cls = entry.date === today ? "ft-spark-today" : "ft-spark-bar";
+      bars += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${Math.max(0.5, barWidth).toFixed(1)}" height="${Math.max(0, height).toFixed(1)}" rx="1" class="${cls}"></rect>`;
+    });
+    let budgetLine = "";
+    if (perDayBudget > 0) {
+      const lineY = H - pad - (perDayBudget / maxValue) * (H - pad * 2);
+      budgetLine = `<line x1="${pad}" y1="${lineY.toFixed(1)}" x2="${W - pad}" y2="${lineY.toFixed(1)}" class="ft-spark-budget"></line>`;
+    }
+    const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
+    section.createEl("h4", { text: "Daily Spend" });
+    const holder = section.createDiv({ cls: "finance-tracker-spark" });
+    holder.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" class="ft-spark-svg" role="img">${budgetLine}${bars}</svg>`;
+    if (perDayBudget > 0) {
+      section.createDiv({ cls: "finance-tracker-budget-meta", text: `Line = ${core.formatCurrency(perDayBudget, currency)}/day budget` });
     }
   }
 
@@ -2798,6 +3808,53 @@ class FinanceTrackerPlugin extends Plugin {
     }
   }
 
+  renderPieChartMini(wrapper, groups, currency) {
+    const total = groups.reduce((sum, group) => sum + group.total, 0);
+    if (!total) return;
+
+    const pieSection = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
+    pieSection.createEl("h4", { text: "By Category" });
+
+    const size = 200;
+    const center = size / 2;
+    const radius = 80;
+    let angle = 0;
+
+    const slices = groups.map((group, index) => {
+      const ratio = group.total / total;
+      const angleSize = ratio * 360;
+      const startAngle = angle;
+      angle += angleSize;
+      return { ...group, color: PIE_COLORS[index % PIE_COLORS.length], ratio, startAngle, endAngle: angle };
+    });
+
+    const svgParts = [
+      `<svg viewBox="0 0 ${size} ${size}" class="finance-tracker-pie-svg finance-tracker-pie-svg--mini" role="img" aria-label="Spending by category">`,
+    ];
+    for (const slice of slices) {
+      if (slice.ratio >= 0.999) {
+        svgParts.push(`<circle cx="${center}" cy="${center}" r="${radius}" fill="${slice.color}" class="finance-tracker-pie-slice"></circle>`);
+      } else {
+        svgParts.push(`<path d="${describePieSlice(center, center, radius, slice.startAngle, slice.endAngle)}" fill="${slice.color}" class="finance-tracker-pie-slice"></path>`);
+      }
+    }
+    svgParts.push("</svg>");
+
+    const chartHost = pieSection.createDiv({ cls: "finance-tracker-pie-host" });
+    chartHost.innerHTML = svgParts.join("");
+
+    const legend = pieSection.createDiv({ cls: "finance-tracker-legend finance-tracker-legend--mini" });
+    for (const slice of slices) {
+      const item = legend.createDiv({ cls: "finance-tracker-legend-item" });
+      const swatch = item.createDiv({ cls: "finance-tracker-legend-swatch" });
+      swatch.style.backgroundColor = slice.color;
+      item.createDiv({
+        cls: "finance-tracker-legend-label",
+        text: `${slice.label} · ${core.formatCurrency(slice.total, currency)} (${Math.round(slice.ratio * 100)}%)`,
+      });
+    }
+  }
+
   renderBudgets(wrapper, budgets, currency, options = {}) {
     const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
     section.createEl("h4", { text: options.title || "Budget Progress" });
@@ -2812,7 +3869,9 @@ class FinanceTrackerPlugin extends Plugin {
     const list = section.createDiv({ cls: `finance-tracker-budget-list${options.compact ? " is-compact" : ""}` });
     for (const budget of budgets) {
       const item = list.createDiv({ cls: `finance-tracker-budget-card${options.compact ? " is-compact" : ""}` });
-      const status = budget.ratio > 1 ? "is-over" : budget.ratio > 0.8 ? "is-near" : "is-good";
+      const pace = budget.pace;
+      const behindPace = pace && pace.totalDays > 0 && !pace.onPace;
+      const status = budget.ratio > 1 ? "is-over" : behindPace ? "is-near" : "is-good";
       item.addClass(status);
       item.createDiv({
         cls: "finance-tracker-budget-title",
@@ -2820,14 +3879,24 @@ class FinanceTrackerPlugin extends Plugin {
       });
       const metaText =
         budget.remaining >= 0
-          ? `${core.formatCurrency(budget.remaining, currency)} remaining`
+          ? `${core.formatCurrency(budget.remaining, currency)} left`
           : `${core.formatCurrency(Math.abs(budget.remaining), currency)} over budget`;
       item.createDiv({ cls: "finance-tracker-budget-meta", text: metaText });
 
-      if (!options.compact) {
-        const bar = item.createDiv({ cls: "finance-tracker-budget-bar" });
-        const fill = bar.createDiv({ cls: `finance-tracker-budget-fill ${status}` });
-        fill.style.width = `${Math.min(budget.ratio, 1.4) * 100}%`;
+      if (pace && pace.totalDays > 0 && pace.remainingDays > 0 && budget.remaining >= 0) {
+        const paceText = pace.projected > (budget.effectiveLimit || 0)
+          ? `On pace for ${core.formatCurrency(pace.projected, currency)} · keep to ${core.formatCurrency(pace.perDayRemaining, currency)}/day`
+          : `${core.formatCurrency(pace.perDayRemaining, currency)}/day for ${pace.remainingDays} day${pace.remainingDays === 1 ? "" : "s"}`;
+        item.createDiv({ cls: "finance-tracker-budget-meta is-pace", text: paceText });
+      }
+
+      const bar = item.createDiv({ cls: "finance-tracker-budget-bar" });
+      const fill = bar.createDiv({ cls: `finance-tracker-budget-fill ${status}` });
+      fill.style.width = `${Math.min(budget.ratio, 1.4) * 100}%`;
+      if (pace && pace.elapsedFraction > 0 && pace.elapsedFraction < 1) {
+        const marker = bar.createDiv({ cls: "finance-tracker-budget-pace-marker" });
+        marker.style.left = `${(pace.elapsedFraction * 100).toFixed(1)}%`;
+        marker.setAttribute("aria-label", "Pace marker — where you should be today");
       }
     }
   }
@@ -3356,6 +4425,7 @@ class FinanceTrackerPlugin extends Plugin {
             if (activeFilter !== "all" && !isCategoryVisibleForDay(dayItems, activeFilter)) return;
             selectedDay = selectedDay === day ? "" : day;
             refreshCalendarState();
+            requestAnimationFrame(renderMonthOutlines);
           });
         }
         const detail = weekBlock.createDiv({ cls: "finance-tracker-calendar-inline-host" });
@@ -3512,6 +4582,7 @@ class FinanceTrackerPlugin extends Plugin {
           activeFilter = filterValue;
           selectedDay = "";
           refreshCalendarState();
+          requestAnimationFrame(renderMonthOutlines);
         });
       }
 
@@ -3772,17 +4843,97 @@ class FinanceTrackerPlugin extends Plugin {
     }
 
     const basePeriod = this.settings.budgetCheckPeriod || "week";
-    const range = core.toPeriodRange({
+    const currency = core.normalizeCurrency(this.settings.defaultCurrency);
+    const budgets = await this.loadBudgets("default");
+
+    // Entries for the full budget period (capped to today)
+    const periodRange = core.toPeriodRange({
       period: basePeriod,
       referenceDate,
       weekStartsOn: this.settings.weekStartsOn,
     });
+    const periodEntries = await this.collectTransactionsForRange({
+      ...periodRange,
+      end: referenceDate < periodRange.end ? referenceDate : periodRange.end,
+    });
+    const spendEntries = periodEntries.filter(
+      (e) => !e.isIncome && !e.isGoalContribution && !e.isPlannedExpense && e.entryType !== "goal-withdrawal"
+    );
 
-    const currency = core.normalizeCurrency(this.settings.defaultCurrency);
-    const budgets = await this.loadBudgets("default");
+    // Today's entries
+    const todayEntries = (await this.collectTransactionsForRange({ start: referenceDate, end: referenceDate }))
+      .filter((e) => !e.isIncome && !e.isGoalContribution && !e.isPlannedExpense && e.entryType !== "goal-withdrawal");
+
+    const periodTotal = spendEntries.reduce((sum, e) => sum + Number(e.amount || 0), 0);
+    const todayTotal = todayEntries.reduce((sum, e) => sum + Number(e.amount || 0), 0);
+
+    const wrapper = el.createDiv({ cls: "finance-tracker-dashboard" });
+
+    // Header
+    const header = wrapper.createDiv({ cls: "finance-tracker-header" });
+    header.createEl("h3", { text: "Daily Budget" });
+    const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
+    const budgetsButton = headerActions.createEl("button", { text: "Budgets" });
+    budgetsButton.addEventListener("click", async () => {
+      await this.openDefaultBudgetNote();
+    });
+
+    // Summary cards: Today + This Period (+ holiday if active)
+    const summaryGrid = wrapper.createDiv({ cls: "finance-tracker-summary" });
+
+    const todayCard = summaryGrid.createDiv({ cls: "finance-tracker-summary-card" });
+    todayCard.createDiv({ cls: "finance-tracker-summary-label", text: "Today" });
+    todayCard.createDiv({ cls: "finance-tracker-summary-value", text: core.formatCurrency(core.roundCurrencyAmount(todayTotal), currency) });
+
+    const periodCard = summaryGrid.createDiv({ cls: "finance-tracker-summary-card" });
+    periodCard.createDiv({ cls: "finance-tracker-summary-label", text: core.titleCaseSegment(basePeriod) });
+    periodCard.createDiv({ cls: "finance-tracker-summary-value", text: core.formatCurrency(core.roundCurrencyAmount(periodTotal), currency) });
+
+    // Safe-to-spend per remaining day, derived from the "all" budget for this period.
+    const allBudget = budgets.find(
+      (budget) => budget.category === "all" && core.normalizeBudgetPeriod(budget.period) === core.normalizeBudgetPeriod(basePeriod)
+    );
+    if (allBudget) {
+      const scaledLimit = core.scaleBudgetLimit(Number(allBudget.limit || 0), allBudget.period, periodRange, referenceDate, this.settings.weekStartsOn);
+      const pace = core.computeBudgetPace({ limit: scaledLimit, spent: periodTotal, periodStart: periodRange.start, periodEnd: periodRange.end, referenceDate });
+      const leftCard = summaryGrid.createDiv({ cls: "finance-tracker-summary-card" });
+      if (pace.projected > scaledLimit) leftCard.addClass("is-over");
+      leftCard.createDiv({ cls: "finance-tracker-summary-label", text: "Left / Day" });
+      leftCard.createDiv({ cls: "finance-tracker-summary-value", text: core.formatCurrency(pace.perDayRemaining, currency) });
+    }
+
+    const holidayContext = await this.findHolidayContextForDate(referenceDate);
+    if (holidayContext?.holidayKey) {
+      const holidayEntries = await this.collectTransactionsForHoliday(holidayContext.holidayKey, {
+        start: holidayContext.startDate || "1900-01-01",
+        end: (holidayContext.endDate && holidayContext.endDate < referenceDate) ? holidayContext.endDate : referenceDate,
+      });
+      const splitEntries = core.splitHolidayEntries(holidayEntries);
+      const actualEntries = splitEntries.actual.filter((entry) => !holidayContext.startDate || String(entry.date || "") >= holidayContext.startDate);
+      const metrics = this.buildHolidayMetrics(
+        holidayContext,
+        actualEntries,
+        splitEntries.planned,
+        referenceDate,
+        Number(holidayContext.totalBudget || 0)
+      );
+      const dailyCanSpend = metrics.remainingTripDays > 0
+        ? core.roundCurrencyAmount(metrics.spendableRemaining / metrics.remainingTripDays)
+        : 0;
+      const holidayCard = summaryGrid.createDiv({ cls: "finance-tracker-summary-card" });
+      holidayCard.createDiv({ cls: "finance-tracker-summary-label", text: `${holidayContext.name || "Trip"} / Day` });
+      holidayCard.createDiv({ cls: "finance-tracker-summary-value", text: core.formatCurrency(dailyCanSpend, holidayContext.currency || currency) });
+    }
+
+    // Mini pie chart (sidebar-friendly: SVG centred + compact legend below)
+    const grouped = core.groupTransactionsByCategory(spendEntries, "primary");
+    if (grouped.length) {
+      this.renderPieChartMini(wrapper, grouped, currency);
+    }
+
+    // Compact budget bars per section period
     const sectionPeriods = core.getDailyBudgetSectionPeriods(basePeriod);
     const normalizedBasePeriod = core.normalizeBudgetPeriod(basePeriod);
-    const sectionResults = [];
     for (const sectionPeriod of sectionPeriods) {
       const sectionRange = core.toPeriodRange({
         period: sectionPeriod,
@@ -3799,92 +4950,56 @@ class FinanceTrackerPlugin extends Plugin {
         sectionPeriod,
       });
       if (progress.length) {
-        sectionResults.push({
-          period: sectionPeriod,
-          progress,
-          range: sectionRange,
-        });
-      }
-    }
-
-    const wrapper = el.createDiv({ cls: "finance-tracker-dashboard" });
-    const header = wrapper.createDiv({ cls: "finance-tracker-header" });
-    header.createEl("h3", { text: `Budget Check` });
-
-    const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
-    const budgetsButton = headerActions.createEl("button", { text: "Budgets" });
-    budgetsButton.addEventListener("click", async () => {
-      await this.openDefaultBudgetNote();
-    });
-
-    const holidayContext = await this.findHolidayContextForDate(referenceDate);
-      if (holidayContext?.holidayKey) {
-        const holidayEntries = await this.collectTransactionsForHoliday(holidayContext.holidayKey, {
-          start: holidayContext.startDate || "1900-01-01",
-          end: (holidayContext.endDate && holidayContext.endDate < referenceDate) ? holidayContext.endDate : referenceDate,
-        });
-      const splitEntries = core.splitHolidayEntries(holidayEntries);
-      const actualEntries = splitEntries.actual.filter((entry) => !holidayContext.startDate || String(entry.date || "") >= holidayContext.startDate);
-      const metrics = this.buildHolidayMetrics(
-        holidayContext,
-        actualEntries,
-        splitEntries.planned,
-        referenceDate,
-        Number(holidayContext.totalBudget || 0)
-      );
-      const dailyAdjustedCanSpend = metrics.remainingTripDays > 0
-        ? core.roundCurrencyAmount(metrics.spendableRemaining / metrics.remainingTripDays)
-        : 0;
-      const summary = wrapper.createDiv({ cls: "finance-tracker-summary" });
-      const card = summary.createDiv({ cls: "finance-tracker-summary-card" });
-      card.createDiv({ cls: "finance-tracker-summary-label", text: "Can Spend / Day" });
-      card.createDiv({ cls: "finance-tracker-summary-value", text: core.formatCurrency(dailyAdjustedCanSpend, holidayContext.currency || currency) });
-    }
-
-    if (!sectionResults.length) {
-      this.renderBudgets(wrapper, [], currency);
-    } else {
-      for (const section of sectionResults) {
-        this.renderBudgets(wrapper, section.progress, currency, {
+        this.renderBudgets(wrapper, progress, currency, {
           compact: true,
           hideEmptyState: true,
-          title: `${core.titleCaseSegment(section.period)} Budget Progress`,
+          title: `${core.titleCaseSegment(sectionPeriod)} Budgets`,
         });
       }
     }
 
+    // Active savings goals (compact with progress bar)
     const savingsGoals = (await this.collectSavingsGoalDefinitions()).filter((goal) => goal.activeSavingsGoal);
     if (savingsGoals.length) {
-      const activeGoalsSection = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
-      activeGoalsSection.createEl("h4", { text: "Active Savings Goals" });
+      const goalsSection = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
+      goalsSection.createEl("h4", { text: "Savings Goals" });
       for (const goal of savingsGoals) {
         const summary = await this.buildSavingsGoalSummary(goal, referenceDate);
-        const row = activeGoalsSection.createDiv({ cls: "finance-tracker-budget-card" });
-        row.createDiv({
-          cls: "finance-tracker-budget-title",
-          text: `${goal.goalName} - ${core.formatCurrency(summary.requiredPerPeriod, goal.currency || currency)} this ${this.settings.budgetCheckPeriod}`,
-        });
-        row.createDiv({
-          cls: "finance-tracker-budget-meta",
-          text: `${core.formatCurrency(summary.currentSaved, goal.currency || currency)} saved · ${core.formatCurrency(summary.amountRemaining, goal.currency || currency)} remaining`,
-        });
+        const goalTotal = summary.currentSaved + summary.amountRemaining;
+        const fillRatio = goalTotal > 0 ? summary.currentSaved / goalTotal : 0;
+        const row = goalsSection.createDiv({ cls: "finance-tracker-budget-card" });
+        row.createDiv({ cls: "finance-tracker-budget-title", text: goal.goalName });
         row.createDiv({
           cls: "finance-tracker-budget-meta",
-          text: summary.currentPeriodContribution >= summary.requiredPerPeriod
-            ? "On track for this period."
-            : "Still below this period's target.",
+          text: `${core.formatCurrency(summary.currentSaved, goal.currency || currency)} of ${core.formatCurrency(goalTotal, goal.currency || currency)}`,
         });
+        const bar = row.createDiv({ cls: "finance-tracker-budget-bar" });
+        const fillEl = bar.createDiv({ cls: "finance-tracker-budget-fill is-good" });
+        fillEl.style.width = `${Math.min(fillRatio * 100, 100)}%`;
       }
     }
 
-    // Today's individual entries
-    const todayEntries = (await this.collectTransactionsForRange({ start: referenceDate, end: referenceDate }))
-      .filter((e) => !e.isIncome && !e.isGoalContribution && !e.isPlannedExpense && e.entryType !== "goal-withdrawal");
+    // Triage: period entries still needing a category (tap to fix).
+    const needsCategory = spendEntries.filter((entry) => !entry.category || entry.category === "uncategorized");
+    if (needsCategory.length) {
+      const triage = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-tracker-triage" });
+      triage.createEl("h4", { text: `Needs a Category (${needsCategory.length})` });
+      for (const entry of needsCategory.slice(0, 12)) {
+        const row = triage.createDiv({ cls: "finance-tracker-budget-card is-clickable is-uncategorized" });
+        const title = row.createDiv({ cls: "finance-tracker-budget-title" });
+        title.createSpan({ text: core.formatCurrency(entry.amount, currency) });
+        title.createSpan({ cls: "finance-tracker-budget-meta", text: ` · ${entry.merchant || entry.date}` });
+        row.addEventListener("click", () => new EditTransactionModal(this.app, this, entry).open());
+      }
+    }
+
+    // Today's individual entries (tap to edit / recategorise / delete).
     if (todayEntries.length) {
       const todaySection = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
-      todaySection.createEl("h4", { text: "Today" });
+      todaySection.createEl("h4", { text: "Today's Entries" });
       for (const entry of todayEntries) {
-        const row = todaySection.createDiv({ cls: "finance-tracker-budget-card" });
+        const row = todaySection.createDiv({ cls: "finance-tracker-budget-card is-clickable" });
+        if (!entry.category || entry.category === "uncategorized") row.addClass("is-uncategorized");
         const title = row.createDiv({ cls: "finance-tracker-budget-title" });
         title.createSpan({ text: core.formatCurrency(entry.amount, currency) });
         if (entry.merchant) title.createSpan({ cls: "finance-tracker-budget-meta", text: ` · ${entry.merchant}` });
@@ -3892,10 +5007,8 @@ class FinanceTrackerPlugin extends Plugin {
           cls: "finance-tracker-budget-meta",
           text: core.displayCategoryPath(entry.category) || entry.category || "Uncategorised",
         });
+        row.addEventListener("click", () => new EditTransactionModal(this.app, this, entry).open());
       }
-      const todayTotal = todayEntries.reduce((sum, e) => sum + Number(e.amount || 0), 0);
-      const totalRow = todaySection.createDiv({ cls: "finance-tracker-budget-card" });
-      totalRow.createDiv({ cls: "finance-tracker-budget-title", text: `Total: ${core.formatCurrency(core.roundCurrencyAmount(todayTotal), currency)}` });
     }
   }
 
@@ -3937,16 +5050,35 @@ class FinanceTrackerPlugin extends Plugin {
     });
 
     const allEntries = await this.collectTransactionsForRange(range);
-    const entries = allEntries.filter(
-      (entry) => !core.isPlannedExpenseEntry(entry) && !entry.isIncome && !entry.isGoalContribution && entry.entryType !== "goal-withdrawal"
-    );
-    this.renderSummary(wrapper, entries, currency, range);
+    const filterReal = (list) =>
+      list.filter(
+        (entry) => !core.isPlannedExpenseEntry(entry) && !entry.isIncome && !entry.isGoalContribution && entry.entryType !== "goal-withdrawal"
+      );
+    const entries = filterReal(allEntries);
+
+    // Previous comparable period (same length, immediately before) for the delta card.
+    const spanDays = core.daysBetweenInclusive(range.start, range.end);
+    const prevEnd = core.addDays(range.start, -1);
+    const prevStart = core.addDays(prevEnd, -(spanDays - 1));
+    const prevEntries = filterReal(await this.collectTransactionsForRange({ period: range.period, start: prevStart, end: prevEnd }));
+    const previousTotal = core.roundCurrencyAmount(prevEntries.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
+
+    this.renderSummary(wrapper, entries, currency, range, { previousTotal });
 
     const grouped = core.groupTransactionsByCategory(entries, groupBy);
     this.renderPieChart(wrapper, grouped, currency, Number(this.settings.dashboardSliceLabelThreshold || 0.08));
 
     const budgets = await this.loadBudgets("default");
     const budgetProgress = this.buildBudgetProgress(entries, budgets, range, groupBy, referenceDate);
+
+    const allBudget = budgets.find((budget) => budget.category === "all");
+    let perDayBudget = 0;
+    if (allBudget) {
+      const scaled = core.scaleBudgetLimit(Number(allBudget.limit || 0), allBudget.period, range, referenceDate || range.start, this.settings.weekStartsOn);
+      perDayBudget = spanDays > 0 ? core.roundCurrencyAmount(scaled / spanDays) : 0;
+    }
+    this.renderSpendTrend(wrapper, entries, range, currency, { perDayBudget });
+
     this.renderBudgets(wrapper, budgetProgress, currency);
     await this.renderSavingsActivity(wrapper, allEntries, currency, range, referenceDate);
   }
@@ -3988,6 +5120,286 @@ class DailyBudgetView extends ItemView {
       this.contentEl.empty();
       this.contentEl.createDiv({ cls: "finance-tracker-empty", text: `Daily budget failed to render: ${error?.message || error}` });
     }
+  }
+}
+
+class QuickAddTransactionModal extends Modal {
+  constructor(app, plugin, options = {}) {
+    super(app);
+    this.plugin = plugin;
+    this.date = core.parseIsoDate(options.date || "") || core.todayIsoLocal();
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("finance-quick-add");
+    contentEl.createEl("h3", { text: "Quick add transaction" });
+
+    const input = contentEl.createEl("input", {
+      type: "text",
+      cls: "finance-quick-add-input",
+      attr: { placeholder: "12 nobu restaurants   ·   $8 #transport Lime   ·   4.50 coffee snacks @yesterday" },
+    });
+
+    const preview = contentEl.createDiv({ cls: "finance-quick-add-preview" });
+
+    const dateRow = contentEl.createDiv({ cls: "finance-quick-add-daterow" });
+    dateRow.createSpan({ text: "Date " });
+    const dateInput = dateRow.createEl("input", { type: "date" });
+    dateInput.value = this.date;
+    dateInput.addEventListener("change", () => {
+      this.date = core.parseIsoDate(dateInput.value) || this.date;
+      update();
+    });
+
+    const buttons = contentEl.createDiv({ cls: "finance-quick-add-buttons" });
+    const keepOpenLabel = buttons.createEl("label", { cls: "finance-quick-add-keep" });
+    const keepOpen = keepOpenLabel.createEl("input", { type: "checkbox" });
+    keepOpenLabel.appendText(" Keep open for next entry");
+    const submit = buttons.createEl("button", { text: "Add", cls: "mod-cta" });
+
+    const parseCurrent = () => {
+      const parsed = core.parseQuickAddInput(input.value, this.plugin.settings.categoryOptions || []);
+      let date = this.date;
+      if (parsed.dateToken) {
+        const resolved = this.plugin.resolveDateToken(parsed.dateToken);
+        if (resolved) {
+          date = resolved;
+          this.date = resolved;
+          dateInput.value = resolved;
+        }
+      }
+      return { parsed, date };
+    };
+
+    const update = () => {
+      const { parsed, date } = parseCurrent();
+      if (!Number.isFinite(parsed.amount)) {
+        preview.setText("Type an amount to begin…");
+        preview.removeClass("is-ready");
+        submit.disabled = true;
+        return;
+      }
+      const category = parsed.category || "uncategorized";
+      const merchant = parsed.merchant ? `  ·  ${parsed.merchant}` : "";
+      preview.setText(`${core.formatCurrency(parsed.amount, this.plugin.settings.defaultCurrency)}  ·  ${core.displayCategoryPath(category)}${merchant}  ·  ${date}`);
+      preview.addClass("is-ready");
+      submit.disabled = false;
+    };
+
+    const commit = async () => {
+      const { parsed, date } = parseCurrent();
+      if (!Number.isFinite(parsed.amount)) return;
+      submit.disabled = true;
+      try {
+        await this.plugin.handleCaptureExpense(
+          {
+            amount: parsed.amount,
+            category: parsed.category || "uncategorized",
+            currency: this.plugin.settings.defaultCurrency,
+            date,
+            merchant: parsed.merchant,
+            name: parsed.merchant,
+            source: "quick-add",
+          },
+          { notify: true }
+        );
+        input.value = "";
+        update();
+        if (keepOpen.checked) {
+          input.focus();
+        } else {
+          this.close();
+        }
+      } catch (error) {
+        new Notice(`Quick add failed: ${error.message}`);
+        submit.disabled = false;
+      }
+    };
+
+    input.addEventListener("input", update);
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        commit();
+      }
+    });
+    submit.addEventListener("click", () => commit());
+
+    update();
+    window.setTimeout(() => input.focus(), 0);
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+class EditTransactionModal extends Modal {
+  constructor(app, plugin, entry) {
+    super(app);
+    this.plugin = plugin;
+    this.entry = entry;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("finance-edit");
+    contentEl.createEl("h3", { text: "Edit transaction" });
+    const entry = this.entry;
+
+    const amountRow = contentEl.createDiv({ cls: "finance-edit-row" });
+    amountRow.createEl("label", { text: "Amount" });
+    const amountInput = amountRow.createEl("input", { type: "number", attr: { step: "0.01" } });
+    amountInput.value = String(entry.amount ?? "");
+
+    const catRow = contentEl.createDiv({ cls: "finance-edit-row" });
+    catRow.createEl("label", { text: "Category" });
+    const catInput = catRow.createEl("input", { type: "text" });
+    catInput.value = entry.category || "uncategorized";
+
+    const chips = contentEl.createDiv({ cls: "finance-edit-chips" });
+    for (const option of this.plugin.settings.categoryOptions || []) {
+      const chip = chips.createEl("button", { cls: "finance-edit-chip", text: core.displayCategoryPath(option) });
+      chip.addEventListener("click", () => {
+        catInput.value = option;
+      });
+    }
+
+    const merchantRow = contentEl.createDiv({ cls: "finance-edit-row" });
+    merchantRow.createEl("label", { text: "Merchant" });
+    const merchantInput = merchantRow.createEl("input", { type: "text" });
+    merchantInput.value = entry.merchant || "";
+
+    const rememberLabel = contentEl.createEl("label", { cls: "finance-edit-remember" });
+    const rememberCheckbox = rememberLabel.createEl("input", { type: "checkbox" });
+    rememberLabel.appendText(" Remember this merchant → category");
+
+    const buttons = contentEl.createDiv({ cls: "finance-edit-buttons" });
+    const deleteButton = buttons.createEl("button", { text: "Delete", cls: "mod-warning" });
+    const saveButton = buttons.createEl("button", { text: "Save", cls: "mod-cta" });
+
+    saveButton.addEventListener("click", async () => {
+      saveButton.disabled = true;
+      try {
+        const patch = {
+          amount: core.parseNumber(amountInput.value),
+          category: core.normalizeCategoryPath(catInput.value) || "uncategorized",
+          merchant: merchantInput.value.trim(),
+        };
+        await this.plugin.updateTransactionEntry(entry, patch);
+        if (rememberCheckbox.checked && patch.merchant && patch.category && patch.category !== "uncategorized") {
+          await this.plugin.rememberMerchantCategory(patch.merchant, patch.category);
+        }
+        new Notice("Transaction updated");
+        this.close();
+      } catch (error) {
+        new Notice(`Update failed: ${error.message}`);
+        saveButton.disabled = false;
+      }
+    });
+
+    deleteButton.addEventListener("click", async () => {
+      try {
+        await this.plugin.deleteTransactionEntry(entry);
+        new Notice("Transaction deleted");
+        this.close();
+      } catch (error) {
+        new Notice(`Delete failed: ${error.message}`);
+      }
+    });
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+class BankReconcileModal extends Modal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+    this.dateOrder = "DMY";
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("finance-reconcile");
+    contentEl.createEl("h3", { text: "Reconcile bank / Wise CSV" });
+    contentEl.createEl("p", {
+      cls: "finance-reconcile-hint",
+      text: "Paste an exported statement CSV. Spending rows are matched against what you have already logged; unmatched charges can be sent to your capture inbox.",
+    });
+
+    const orderRow = contentEl.createDiv({ cls: "finance-reconcile-order" });
+    orderRow.createSpan({ text: "Date format " });
+    const orderSelect = orderRow.createEl("select");
+    for (const [value, label] of [["DMY", "DD/MM/YYYY (ANZ, AU)"], ["MDY", "MM/DD/YYYY (US)"], ["YMD", "YYYY-MM-DD"]]) {
+      const option = orderSelect.createEl("option", { text: label });
+      option.value = value;
+    }
+    orderSelect.value = this.dateOrder;
+    orderSelect.addEventListener("change", () => {
+      this.dateOrder = orderSelect.value;
+    });
+
+    const textarea = contentEl.createEl("textarea", {
+      cls: "finance-reconcile-input",
+      attr: { rows: "10", placeholder: "Date,Amount,Description\n08/06/2026,-12.50,NOBU SYDNEY\n..." },
+    });
+
+    const results = contentEl.createDiv({ cls: "finance-reconcile-results" });
+
+    const buttons = contentEl.createDiv({ cls: "finance-reconcile-buttons" });
+    const analyseBtn = buttons.createEl("button", { text: "Analyse", cls: "mod-cta" });
+    analyseBtn.addEventListener("click", async () => {
+      results.empty();
+      try {
+        const summary = await this.plugin.reconcileBankCsv(textarea.value, { dateOrder: this.dateOrder });
+        this.renderSummary(results, summary);
+      } catch (error) {
+        results.setText(`Reconcile failed: ${error.message}`);
+      }
+    });
+  }
+
+  renderSummary(container, summary) {
+    container.empty();
+    container.createEl("div", {
+      cls: "finance-reconcile-counts",
+      text: `${summary.rows.length} spending rows · ${summary.matched.length} already logged · ${summary.missing.length} not logged`,
+    });
+    if (!summary.missing.length) {
+      container.createEl("p", { text: "Everything in this statement is already logged. ✅" });
+      return;
+    }
+    const list = container.createEl("ul", { cls: "finance-reconcile-missing" });
+    for (const row of summary.missing) {
+      const item = list.createEl("li");
+      item.setText(`${row.date}  ${core.formatCurrency(row.amount, row.currency)}  ${row.merchant || ""}`);
+    }
+    const sendBtn = container.createEl("button", {
+      text: `Send ${summary.missing.length} missing charge${summary.missing.length === 1 ? "" : "s"} to capture inbox`,
+      cls: "mod-cta",
+    });
+    sendBtn.addEventListener("click", async () => {
+      sendBtn.disabled = true;
+      try {
+        const count = await this.plugin.sendRowsToInbox(summary.missing);
+        new Notice(`Finance: queued ${count} charge${count === 1 ? "" : "s"} to the capture inbox`);
+        this.close();
+      } catch (error) {
+        new Notice(`Could not queue charges: ${error.message}`);
+        sendBtn.disabled = false;
+      }
+    });
+  }
+
+  onClose() {
+    this.contentEl.empty();
   }
 }
 

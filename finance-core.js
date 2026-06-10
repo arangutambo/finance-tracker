@@ -334,10 +334,59 @@ function extractCategoryFromLogSpendingTag(line) {
   return "";
 }
 
+// Single source of truth for legacy holiday-tag orderings. Rewrites the older
+// `#log/<year>/<key>/spending[/planned]/<cat>` and `#log/<year>/<key>/planned/<cat>`
+// forms to the canonical `#log/spending/<year>/<key>[/planned]/<cat>`. Returns the
+// canonical path (no leading #) when a rewrite applies, else null (already
+// canonical, or not a holiday tag). Used by both the parser and the migrator.
+function canonicalizeFinanceTag(tag) {
+  const normalized = normalizeCategoryPath(String(tag || "").replace(/^#/, ""));
+  const parts = normalized.split("/").filter(Boolean);
+  if (parts.length < 4 || parts[0] !== "log") return null;
+  const isYear = (value) => /^(?:\d{2}|\d{4})$/.test(value);
+  if (!isYear(parts[1]) || !parts[2]) return null;
+
+  if (parts[3] === "spending") {
+    const remainder = parts.slice(4);
+    const planned = String(remainder[0] || "").toLowerCase() === "planned";
+    const category = planned ? remainder.slice(1) : remainder;
+    return ["log", "spending", parts[1], parts[2], ...(planned ? ["planned"] : []), ...category].join("/");
+  }
+  if (parts[3] === "planned") {
+    return ["log", "spending", parts[1], parts[2], "planned", ...parts.slice(4)].join("/");
+  }
+  return null;
+}
+
+function migrateFinanceTagsInLine(line) {
+  let changed = false;
+  const result = String(line).replace(/#([^\s#\]]+)/g, (whole, tagBody) => {
+    const canonical = canonicalizeFinanceTag(tagBody);
+    if (!canonical) return whole;
+    changed = true;
+    return `#${canonical}`;
+  });
+  return { line: result, changed };
+}
+
+// Rewrites every legacy holiday tag in a note to the canonical form. Returns the
+// new content and how many lines changed (0 = nothing to migrate).
+function migrateFinanceTagsInContent(content) {
+  const lines = splitLines(content);
+  let changedLines = 0;
+  const out = lines.map((line) => {
+    const result = migrateFinanceTagsInLine(line);
+    if (result.changed) changedLines += 1;
+    return result.line;
+  });
+  return { content: out.join("\n"), changedLines };
+}
+
 function extractFinanceTagContext(line) {
   const matches = Array.from(String(line || "").matchAll(/#([^\s#\]]+)/gi));
   for (let index = matches.length - 1; index >= 0; index -= 1) {
-    const fullTag = normalizeCategoryPath(matches[index][1]);
+    const canonical = canonicalizeFinanceTag(matches[index][1]);
+    const fullTag = canonical || normalizeCategoryPath(matches[index][1]);
     const parts = fullTag.split("/").filter(Boolean);
     if (!parts.length || parts[0] !== "log") continue;
 
@@ -401,39 +450,6 @@ function extractFinanceTagContext(line) {
       };
     }
 
-    if (parts[1] && /^(?:\d{2}|\d{4})$/.test(parts[1]) && parts[3] === "spending" && parts[2]) {
-      const holidayKey = `${parts[1]}/${parts[2]}`;
-      const remainder = parts.slice(4);
-      const isPlannedExpense = String(remainder[0] || "").toLowerCase() === "planned";
-      const category = normalizeCategoryPath((isPlannedExpense ? remainder.slice(1) : remainder).join("/")) || "uncategorized";
-      return {
-        category,
-        entryType: "holiday-spending",
-        goalKey: normalizeCategoryPath(parts[2]),
-        holidayKey,
-        isGoalContribution: false,
-        isGoalWithdrawal: true,
-        isIncome: false,
-        isPlannedExpense,
-        plannedCategory: isPlannedExpense ? category : "",
-      };
-    }
-
-    if (parts[1] && /^(?:\d{2}|\d{4})$/.test(parts[1]) && parts[2] && parts[3] === "planned") {
-      const holidayKey = `${parts[1]}/${parts[2]}`;
-      const category = normalizeCategoryPath(parts.slice(4).join("/")) || "uncategorized";
-      return {
-        category,
-        entryType: "holiday-spending",
-        goalKey: normalizeCategoryPath(parts[2]),
-        holidayKey,
-        isGoalContribution: false,
-        isGoalWithdrawal: true,
-        isIncome: false,
-        isPlannedExpense: true,
-        plannedCategory: category,
-      };
-    }
   }
 
   return {
@@ -1149,6 +1165,489 @@ function buildCsv(entries) {
   return [headers, ...rows].map((row) => row.map(escapeCell).join(",")).join("\n");
 }
 
+const INBOX_ALIASES = {
+  amt: "amount", amount: "amount", total: "amount", value: "amount",
+  cat: "category", category: "category", tag: "tag",
+  cur: "currency", currency: "currency", ccy: "currency",
+  merchant: "merchant", payee: "merchant", vendor: "merchant", name: "name",
+  memo: "note", note: "note", desc: "note", description: "note",
+  date: "date", when: "date",
+  origamt: "originalamount", originalamount: "originalamount", foreignamount: "originalamount",
+  origcur: "originalcurrency", originalcurrency: "originalcurrency", foreigncurrency: "originalcurrency",
+  src: "source", source: "source",
+  card: "card", pass: "card",
+  id: "externalid", ref: "externalid", reference: "externalid", wiseid: "externalid", txnid: "externalid",
+  transaction: "transaction",
+};
+
+function normalizeInboxParams(params) {
+  const out = {};
+  for (const [rawKey, rawValue] of Object.entries(params || {})) {
+    const key = INBOX_ALIASES[String(rawKey).toLowerCase()] || String(rawKey).toLowerCase();
+    const value = typeof rawValue === "string" ? rawValue.trim() : rawValue;
+    if (value === "" || value === null || value === undefined) continue;
+    out[key] = value;
+  }
+  if (out.merchant && !out.name) out.name = out.merchant;
+  if (out.name && !out.merchant) out.merchant = out.name;
+  return out;
+}
+
+// Parses a single capture-inbox payload (one transaction) into the loose params
+// object that the plugin's capture handler consumes. Accepts three shapes:
+//   1. "amount=12 | cat=food/restaurants | merchant=Nobu | date=2026-06-08"
+//   2. "obsidian://finance-capture?amount=12&category=food/groceries&merchant=Coles"
+//   3. a daily-note bullet "- $12 #log/spending/food/restaurants Nobu"
+//   4. positional "12 food/snacks Coffee"
+function parseInboxLine(raw) {
+  const text = String(raw || "").replace(/^﻿/, "").trim();
+  if (!text || /^(#|\/\/)/.test(text)) return null;
+
+  const urlMatch = text.match(/[?]([^#\s]+)/);
+  if (/^obsidian:\/\//i.test(text) && urlMatch) {
+    const params = {};
+    for (const pair of urlMatch[1].split("&")) {
+      const eq = pair.indexOf("=");
+      if (eq < 0) continue;
+      const key = decodeURIComponent(pair.slice(0, eq)).trim();
+      const value = decodeURIComponent(pair.slice(eq + 1).replace(/\+/g, " "));
+      if (key) params[key] = value;
+    }
+    return Number.isFinite(parseNumber(params.amount || params.total)) ? normalizeInboxParams(params) : null;
+  }
+
+  if (text.includes("=")) {
+    const params = {};
+    for (const segment of text.replace(/\r\n/g, "\n").split(/\n|\|/)) {
+      const eq = segment.indexOf("=");
+      if (eq < 0) continue;
+      const key = segment.slice(0, eq).trim();
+      const value = segment.slice(eq + 1).trim();
+      if (key) params[key] = value;
+    }
+    return Number.isFinite(parseNumber(params.amount || params.amt || params.total)) ? normalizeInboxParams(params) : null;
+  }
+
+  if (/#log\//i.test(text)) {
+    const amount = extractVisibleAmount(text);
+    if (!Number.isFinite(amount)) return null;
+    const category = extractCategoryFromLogSpendingTag(text);
+    const merchant = normalizeWhitespace(
+      text
+        .replace(/^\s*-\s*(?:\[[^\]]\]\s*)?/, "")
+        .replace(/#[^\s#\]]+/g, "")
+        .replace(/-?\$?\d[\d,]*(?:\.\d+)?/g, "")
+        .replace(/:/g, " ")
+    );
+    return normalizeInboxParams({ amount, category, merchant });
+  }
+
+  const tokens = text.split(/\s+/);
+  const amount = parseNumber(tokens[0]);
+  if (!Number.isFinite(amount)) return null;
+  let category = "";
+  const rest = [];
+  for (const token of tokens.slice(1)) {
+    if (!category && (token.includes("/") || /^#/.test(token))) category = token;
+    else rest.push(token);
+  }
+  return normalizeInboxParams({ amount, category, merchant: rest.join(" ") });
+}
+
+// Inverse of parseInboxLine: renders a canonical one-line capture payload.
+function buildInboxLine(expense) {
+  const entry = expense || {};
+  const parts = [`amount=${formatPlainNumber(entry.amount || 0)}`];
+  const category = normalizeCategoryPath(entry.category || "");
+  if (category) parts.push(`cat=${category}`);
+  const merchant = normalizeWhitespace(entry.merchant || entry.name || "");
+  if (merchant) parts.push(`merchant=${merchant}`);
+  parts.push(`date=${parseIsoDate(entry.date) || todayIsoLocal()}`);
+  const currency = normalizeCurrency(entry.currency || "", "");
+  if (currency) parts.push(`cur=${currency}`);
+  if (Number.isFinite(entry.originalAmount) && entry.originalCurrency) {
+    parts.push(`origamt=${formatPlainNumber(entry.originalAmount)}`);
+    parts.push(`origcur=${normalizeCurrency(entry.originalCurrency)}`);
+  }
+  if (entry.source) parts.push(`source=${normalizeWhitespace(entry.source)}`);
+  if (entry.externalId) parts.push(`id=${normalizeWhitespace(entry.externalId)}`);
+  return parts.join(" | ");
+}
+
+// Parses a single free-text quick-add line into structured fields.
+// Grammar: first $?number = amount; a #tag or a/b path or a known category word
+// = category; @token = date; everything else = merchant.
+function parseQuickAddInput(text, knownCategories = []) {
+  let working = ` ${String(text || "").trim()} `;
+
+  let dateToken = "";
+  working = working.replace(/(^|\s)@(\S+)/, (_match, pre, token) => {
+    dateToken = token;
+    return pre;
+  });
+
+  let category = "";
+  const tagMatch = working.match(/(^|\s)#(\S+)/);
+  if (tagMatch) {
+    category = tagMatch[2];
+    working = working.replace(tagMatch[0], " ");
+  }
+  if (!category) {
+    const pathMatch = working.match(/(^|\s)([a-z][a-z0-9_-]*\/[a-z0-9/_-]+)(?=\s|$)/i);
+    if (pathMatch) {
+      category = pathMatch[2];
+      working = working.replace(pathMatch[2], " ");
+    }
+  }
+
+  let amount = null;
+  const amountMatch = working.match(/-?\$?\s?(-?\d[\d,]*(?:\.\d+)?)/);
+  if (amountMatch) {
+    amount = Number(amountMatch[1].replace(/,/g, ""));
+    working = working.replace(amountMatch[0], " ");
+  }
+
+  if (!category && knownCategories.length) {
+    const map = new Map();
+    for (const known of knownCategories) {
+      const full = normalizeCategoryPath(known);
+      if (!full) continue;
+      map.set(full, full);
+      const leaf = full.split("/").pop();
+      if (leaf && !map.has(leaf)) map.set(leaf, full);
+    }
+    const tokens = working.split(/\s+/).filter(Boolean);
+    const index = tokens.findIndex((token) => map.has(normalizeCategoryPath(token)));
+    if (index >= 0) {
+      category = map.get(normalizeCategoryPath(tokens[index]));
+      tokens.splice(index, 1);
+      working = ` ${tokens.join(" ")} `;
+    }
+  }
+
+  const normalizedCategory = /log\/spending/i.test(category)
+    ? extractCategoryFromLogSpendingTag(`#${String(category).replace(/^#/, "")}`)
+    : normalizeCategoryPath(category);
+
+  return {
+    amount: Number.isFinite(amount) ? Number(amount.toFixed(2)) : null,
+    category: normalizedCategory,
+    dateToken,
+    merchant: normalizeWhitespace(working),
+  };
+}
+
+function normalizeMerchant(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+// Stable key for de-duplicating the same purchase arriving from different
+// sources (Apple Pay automation, Wise API, bank CSV): date + amount + merchant.
+function transactionFingerprint(entry) {
+  const data = entry || {};
+  const date = parseIsoDate(data.date) || "";
+  const amount = Number(Number(data.amount || 0).toFixed(2)).toFixed(2);
+  return `${date}|${amount}|${normalizeMerchant(data.merchant || data.name || "")}`;
+}
+
+// Minimal RFC-4180-ish CSV reader: handles quoted fields, escaped quotes,
+// embedded commas and newlines. Returns an array of cell arrays.
+function parseCsvRows(text) {
+  const source = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const rows = [];
+  let row = [];
+  let field = "";
+  let inQuotes = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    if (inQuotes) {
+      if (char === '"') {
+        if (source[index + 1] === '"') {
+          field += '"';
+          index += 1;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        field += char;
+      }
+    } else if (char === '"') {
+      inQuotes = true;
+    } else if (char === ",") {
+      row.push(field);
+      field = "";
+    } else if (char === "\n") {
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = "";
+    } else {
+      field += char;
+    }
+  }
+  if (field.length || row.length) {
+    row.push(field);
+    rows.push(row);
+  }
+  return rows.filter((cells) => cells.some((cell) => String(cell).trim() !== ""));
+}
+
+function parseFlexibleDate(value, order = "DMY") {
+  const iso = parseIsoDate(value);
+  if (iso) return iso;
+  const match = String(value || "").trim().match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})$/);
+  if (!match) return null;
+  let first = Number(match[1]);
+  let second = Number(match[2]);
+  let year = Number(match[3]);
+  if (year < 100) year += 2000;
+  let day;
+  let month;
+  if (String(order).toUpperCase() === "MDY") {
+    month = first;
+    day = second;
+  } else {
+    day = first;
+    month = second;
+  }
+  if (month > 12 && day <= 12) {
+    const swap = month;
+    month = day;
+    day = swap;
+  }
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  return `${year}-${pad(month)}-${pad(day)}`;
+}
+
+// Parses a bank/Wise statement CSV into spending rows. Auto-detects columns by
+// header name, supports either a single signed amount column or separate
+// debit/credit columns, and returns positive spend amounts in ISO dates.
+function parseBankCsv(content, options = {}) {
+  const rows = parseCsvRows(content);
+  if (rows.length < 2) return [];
+  const order = options.dateOrder || "DMY";
+  const onlyDebits = options.onlyDebits !== false;
+  const fallbackCurrency = normalizeCurrency(options.defaultCurrency || "AUD");
+  const header = rows[0].map((cell) => normalizeWhitespace(cell).toLowerCase());
+
+  const findColumn = (candidates) => {
+    for (const candidate of candidates) {
+      const exact = header.findIndex((name) => name === candidate);
+      if (exact >= 0) return exact;
+    }
+    for (const candidate of candidates) {
+      const partial = header.findIndex((name) => name.includes(candidate));
+      if (partial >= 0) return partial;
+    }
+    return -1;
+  };
+
+  const dateCol = findColumn(options.dateColumns || ["transaction date", "completed date", "date", "posted", "created on"]);
+  const amountCol = findColumn(options.amountColumns || ["amount", "value"]);
+  const debitCol = findColumn(options.debitColumns || ["debit", "withdrawal", "money out", "paid out"]);
+  const creditCol = findColumn(options.creditColumns || ["credit", "deposit", "money in", "paid in"]);
+  const merchantCol = findColumn(options.merchantColumns || ["description", "merchant", "details", "narrative", "payee", "reference", "name"]);
+  const currencyCol = findColumn(options.currencyColumns || ["currency", "ccy"]);
+  const idCol = findColumn(options.idColumns || ["transaction id", "reference number", "id"]);
+
+  const result = [];
+  for (let index = 1; index < rows.length; index += 1) {
+    const cells = rows[index];
+    const cell = (position) => (position >= 0 && position < cells.length ? normalizeWhitespace(cells[position]) : "");
+    const date = parseFlexibleDate(cell(dateCol), order);
+    if (!date) continue;
+
+    let amount = null;
+    let isDebit = true;
+    if (debitCol >= 0 || creditCol >= 0) {
+      const debit = parseNumber(cell(debitCol));
+      const credit = parseNumber(cell(creditCol));
+      if (Number.isFinite(debit) && debit !== 0) {
+        amount = Math.abs(debit);
+        isDebit = true;
+      } else if (Number.isFinite(credit) && credit !== 0) {
+        amount = Math.abs(credit);
+        isDebit = false;
+      }
+    } else {
+      const raw = parseNumber(cell(amountCol));
+      if (Number.isFinite(raw)) {
+        amount = Math.abs(raw);
+        isDebit = raw < 0;
+      }
+    }
+    if (!Number.isFinite(amount) || amount === 0) continue;
+    if (onlyDebits && !isDebit) continue;
+
+    result.push({
+      amount: Number(amount.toFixed(2)),
+      currency: currencyCol >= 0 ? normalizeCurrency(cell(currencyCol), fallbackCurrency) : fallbackCurrency,
+      date,
+      externalId: cell(idCol),
+      isDebit,
+      merchant: cell(merchantCol),
+      raw: cells.join(","),
+    });
+  }
+  return result;
+}
+
+// Recomputes the running total on the "#log/spending <total>" root line from the
+// actual entries beneath it, so hand-edits to amounts no longer leave a stale
+// total. Returns the original string unchanged when the total is already correct,
+// preserving the checkbox state and indentation of the root line.
+function recomputeSpendingTotals(content, settings = {}) {
+  const lines = splitLines(content);
+  const noteDate = extractNoteDate(content, "");
+  const spendingHeading = normalizeWhitespace(settings.spendingHeading || "## Spending");
+  const rootTag = normalizeWhitespace(settings.spendingRootTag || "#log/spending");
+  const headingIndex = lines.findIndex(
+    (line) => normalizeWhitespace(line).toLowerCase() === spendingHeading.toLowerCase()
+  );
+  if (headingIndex === -1) return content;
+
+  let sectionEnd = lines.length;
+  for (let index = headingIndex + 1; index < lines.length; index += 1) {
+    const trimmed = lines[index].trim();
+    if (/^#{1,6}\s+/.test(trimmed) || /^---\s*$/.test(trimmed)) {
+      sectionEnd = index;
+      break;
+    }
+  }
+
+  const rootRe = new RegExp(`^- \\[[^\\]]\\] ${rootTag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\\s|$)`, "i");
+  let rootLineIndex = -1;
+  for (let index = headingIndex + 1; index < sectionEnd; index += 1) {
+    if (rootRe.test(lines[index].trim())) {
+      rootLineIndex = index;
+      break;
+    }
+  }
+  if (rootLineIndex === -1) return content;
+
+  const total = calculateSpendingSectionTotal(lines.slice(rootLineIndex + 1, sectionEnd), noteDate, {
+    defaultCurrency: settings.defaultCurrency || "AUD",
+  });
+  const line = lines[rootLineIndex];
+  const tagPos = line.toLowerCase().indexOf(rootTag.toLowerCase());
+  if (tagPos === -1) return content;
+  const prefix = line.slice(0, tagPos + rootTag.length);
+  const desired = `${prefix} ${formatPlainNumber(total)}`;
+  if (line === desired) return content;
+  lines[rootLineIndex] = desired;
+  return lines.join("\n");
+}
+
+// Time-aware budget pace. Given a limit, what is spent, the period bounds and
+// today, returns how far through the period we are, the on-pace spend line, the
+// projected end-of-period spend, and a safe per-day amount for the rest of it.
+function computeBudgetPace(input = {}) {
+  const limit = Number(input.limit || 0);
+  const spent = Number(input.spent || 0);
+  const start = parseIsoDate(input.periodStart || input.start || "");
+  const end = parseIsoDate(input.periodEnd || input.end || "");
+  const reference = parseIsoDate(input.referenceDate || "") || todayIsoLocal();
+  const base = {
+    totalDays: 0,
+    elapsedDays: 0,
+    elapsedFraction: 0,
+    pacedSpend: 0,
+    projected: roundCurrencyAmount(spent),
+    paceRatio: 0,
+    onPace: true,
+    remainingDays: 0,
+    perDayRemaining: 0,
+  };
+  if (!start || !end || limit <= 0) return base;
+
+  const totalDays = daysBetweenInclusive(start, end);
+  let elapsedDays;
+  let remainingDays;
+  if (reference < start) {
+    elapsedDays = 0;
+    remainingDays = totalDays;
+  } else if (reference >= end) {
+    elapsedDays = totalDays;
+    remainingDays = 0;
+  } else {
+    elapsedDays = daysBetweenInclusive(start, reference);
+    remainingDays = daysBetweenInclusive(reference, end);
+  }
+
+  const elapsedFraction = totalDays > 0 ? Math.min(1, elapsedDays / totalDays) : 0;
+  const pacedSpend = roundCurrencyAmount(limit * elapsedFraction);
+  const projected = elapsedFraction > 0 ? roundCurrencyAmount(spent / elapsedFraction) : 0;
+  const rawPaceRatio = pacedSpend > 0 ? spent / pacedSpend : spent > 0 ? 999 : 0;
+  const perDayRemaining = remainingDays > 0
+    ? roundCurrencyAmount(Math.max(0, limit - spent) / remainingDays)
+    : roundCurrencyAmount(Math.max(0, limit - spent));
+
+  return {
+    totalDays,
+    elapsedDays,
+    elapsedFraction: Number(elapsedFraction.toFixed(4)),
+    pacedSpend,
+    projected,
+    paceRatio: Number(rawPaceRatio.toFixed(3)),
+    onPace: spent <= pacedSpend * 1.001,
+    remainingDays,
+    perDayRemaining,
+  };
+}
+
+// Replaces a single logged transaction (its entry line plus any merchant/note
+// child lines) with a freshly built block from `newExpense`, then recomputes the
+// section total. Returns null if the original line is not found.
+function replaceTransactionBlock(content, oldRawLine, newExpense, settings = {}) {
+  const lines = splitLines(content);
+  const target = String(oldRawLine);
+  const index = lines.findIndex((line) => line === target);
+  if (index < 0) return null;
+
+  const indent = (target.match(/^\s*/) || [""])[0].length;
+  let end = index + 1;
+  while (end < lines.length) {
+    const line = lines[end];
+    if (!line.trim()) break;
+    const lineIndent = (line.match(/^\s*/) || [""])[0].length;
+    if (lineIndent > indent && /^\s*-\s/.test(line)) {
+      end += 1;
+      continue;
+    }
+    break;
+  }
+
+  const expense = { ...newExpense, date: newExpense.date || extractNoteDate(content, "") };
+  const block = buildTransactionBlock(expense, settings);
+  lines.splice(index, end - index, ...block);
+  return recomputeSpendingTotals(lines.join("\n"), settings);
+}
+
+// Removes a logged transaction (entry line + child lines) and recomputes the
+// section total. Returns null if the original line is not found.
+function removeTransactionBlock(content, oldRawLine, settings = {}) {
+  const lines = splitLines(content);
+  const target = String(oldRawLine);
+  const index = lines.findIndex((line) => line === target);
+  if (index < 0) return null;
+
+  const indent = (target.match(/^\s*/) || [""])[0].length;
+  let end = index + 1;
+  while (end < lines.length) {
+    const line = lines[end];
+    if (!line.trim()) break;
+    const lineIndent = (line.match(/^\s*/) || [""])[0].length;
+    if (lineIndent > indent && /^\s*-\s/.test(line)) {
+      end += 1;
+      continue;
+    }
+    break;
+  }
+
+  lines.splice(index, end - index);
+  return recomputeSpendingTotals(lines.join("\n"), settings);
+}
+
 module.exports = {
   addDays,
   buildCategoryTag,
@@ -1156,7 +1655,21 @@ module.exports = {
   buildAllocatedExpenseSummary,
   buildPlannedExpenseSummary,
   buildIncomeTag,
+  buildInboxLine,
   buildTransactionBlock,
+  parseInboxLine,
+  parseQuickAddInput,
+  parseBankCsv,
+  parseCsvRows,
+  parseFlexibleDate,
+  normalizeMerchant,
+  transactionFingerprint,
+  recomputeSpendingTotals,
+  computeBudgetPace,
+  replaceTransactionBlock,
+  removeTransactionBlock,
+  canonicalizeFinanceTag,
+  migrateFinanceTagsInContent,
   calculateSpendingSectionTotal,
   canRollBudgetPeriodIntoSection,
   daysBetweenInclusive,
