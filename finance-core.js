@@ -358,30 +358,6 @@ function canonicalizeFinanceTag(tag) {
   return null;
 }
 
-function migrateFinanceTagsInLine(line) {
-  let changed = false;
-  const result = String(line).replace(/#([^\s#\]]+)/g, (whole, tagBody) => {
-    const canonical = canonicalizeFinanceTag(tagBody);
-    if (!canonical) return whole;
-    changed = true;
-    return `#${canonical}`;
-  });
-  return { line: result, changed };
-}
-
-// Rewrites every legacy holiday tag in a note to the canonical form. Returns the
-// new content and how many lines changed (0 = nothing to migrate).
-function migrateFinanceTagsInContent(content) {
-  const lines = splitLines(content);
-  let changedLines = 0;
-  const out = lines.map((line) => {
-    const result = migrateFinanceTagsInLine(line);
-    if (result.changed) changedLines += 1;
-    return result.line;
-  });
-  return { content: out.join("\n"), changedLines };
-}
-
 function extractFinanceTagContext(line) {
   const matches = Array.from(String(line || "").matchAll(/#([^\s#\]]+)/gi));
   for (let index = matches.length - 1; index >= 0; index -= 1) {
@@ -1669,7 +1645,6 @@ module.exports = {
   replaceTransactionBlock,
   removeTransactionBlock,
   canonicalizeFinanceTag,
-  migrateFinanceTagsInContent,
   calculateSpendingSectionTotal,
   canRollBudgetPeriodIntoSection,
   daysBetweenInclusive,

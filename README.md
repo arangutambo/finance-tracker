@@ -4,6 +4,38 @@ An Obsidian plugin that logs spending as tagged bullets inside your daily notes,
 keeps a running total, and turns those notes into spending, budget, holiday and
 savings dashboards. Your markdown notes stay the source of truth — no database.
 
+## First-time setup (empty vault)
+
+From a brand-new vault, in order:
+
+1. **Install & enable.** Copy this plugin to `.obsidian/plugins/finance-tracker/`,
+   then Settings → Community plugins → enable **Finance Tracker**. (On mobile, turn
+   on community plugins first.)
+2. **Set two things** in the plugin's settings tab:
+   - **Default currency** (e.g. `AUD`, `USD`).
+   - **Daily notes folder** — point it at where you keep daily notes. Default is
+     `Journal/Periodics/1. Daily`; the plugin routes captures to `<folder>/YYYY-MM-DD.md`
+     (or `<folder>/YYYY/MM/YYYY-MM-DD.md` if you already use that structure).
+3. **Open the panel.** Click the **coin** ribbon icon (or run *Open daily budget*).
+   This creates, on first run:
+   - `Utility/Budgets/💸 Budgets.md` — a starter budget table you can edit.
+   - `Utility/Finance/Inbox/` — the capture folder Shortcuts write to.
+4. **Log your first transaction.** Run command **Quick add transaction**, type
+   `12 coffee snacks`, press Enter. Today's note is created with a `## Finance`
+   section and the entry; the panel and status bar update.
+5. **Set your budgets.** Open `💸 Budgets.md` and edit the table rows to your own
+   categories, limits and periods. Keep an `all` row for the overall bar + Left/Day.
+6. **Add a dashboard (optional).** Put a ` ```finance-dashboard ` block (see
+   [Dashboards](#dashboards)) in any note for charts and pace bars.
+7. **Phone capture (optional but the point).** Pick the method that matches your sync
+   (see [How logging works](#how-logging-works)): on **Obsidian Sync**, use a Shortcut
+   that opens `obsidian://finance-capture?…` (no special storage needed); on an **iCloud
+   Drive / Mac-local** vault you can instead drop capture files into `Utility/Finance/Inbox/`.
+   Full setup is in `Utility/Finance/Apple Shortcuts - Finance Capture.md`.
+
+Nothing else is required — daily notes, the budget note, and the inbox folder are
+all created for you on demand.
+
 ## How logging works
 
 Every transaction is a bullet under a `## Finance` heading in a daily note
@@ -17,19 +49,29 @@ Every transaction is a bullet under a `## Finance` heading in a daily note
 	- $4.20 #log/spending/food/snacks
 ```
 
-You rarely type this by hand. Four ways to log, fastest first:
+You rarely type this by hand. Four ways to log:
 
 | Method | Use it for |
 | --- | --- |
-| **Apple Shortcuts → capture inbox** | logging from your phone / Apple Pay, no Obsidian launch |
+| **`obsidian://finance-capture` Shortcut** | phone capture with **any** sync (incl. Obsidian Sync); briefly opens Obsidian |
+| **Apple Shortcuts → capture inbox file** | phone capture when the vault is **Files-writable** (iCloud Drive / Mac-local); no Obsidian launch |
 | **Quick add modal** (command or status bar) | logging while you're in Obsidian |
-| **`obsidian://finance-capture?…` URL** | a Shortcut that wants the instant dashboard update |
 | **Type the bullet yourself** | edge cases; the total self-heals on note open |
 
-### Apple Shortcuts (capture inbox)
-A Shortcut drops a one-line file into `Utility/Finance/Inbox/`; the plugin drains it
-into the right daily note on arrival and on launch. Full step-by-step setup
-(manual, Apple Pay automation, Wise sync, ANZ reconcile) lives in
+**Which phone method?** It depends on how the vault syncs:
+- **Obsidian Sync** (the vault lives inside the Obsidian app) → use the **URL Shortcut**.
+  Shortcuts can't write into Obsidian's sandbox, so the inbox-file method won't work on the phone.
+- **iCloud Drive / Mac-local folder** → the **inbox-file** method is best (silent, no app launch),
+  and the same folder lets Mac-side scripts and the in-app bank-CSV reconcile drop captures in.
+
+### URL Shortcut (works with any sync)
+A Shortcut opens `obsidian://finance-capture?amount=12.5&merchant=Coles&category=food/groceries&source=manual`.
+The plugin logs it to today's note. This briefly foregrounds Obsidian but needs no filesystem access.
+
+### Capture inbox (Files-writable vaults)
+A Shortcut (or Mac script, or the bank-CSV reconcile) drops a one-line file into
+`Utility/Finance/Inbox/`; the plugin drains it into the right daily note on arrival and on
+launch. Full setup (manual, Apple Pay automation, Wise sync, ANZ reconcile) is in
 `Utility/Finance/Apple Shortcuts - Finance Capture.md`. Capture line format:
 
 ```

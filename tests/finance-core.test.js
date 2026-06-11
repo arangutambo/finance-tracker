@@ -678,19 +678,3 @@ test("migrated legacy tags parse identically to before the refactor", () => {
   assert.equal(legacy.holidayKey, "25/japan");
   assert.equal(legacy.category, "food/snacks");
 });
-
-test("migrateFinanceTagsInContent rewrites only legacy tags and counts changed lines", () => {
-  const before = [
-    "## Finance",
-    "- [ ] #log/spending 62",
-    "\t- $22 #log/25/japan/spending/food/snacks",
-    "\t- $40 #log/spending/food/groceries",
-    "\t- $90 #log/26/japanmidyear/planned/flights",
-  ].join("\n");
-  const { content, changedLines } = core.migrateFinanceTagsInContent(before);
-  assert.equal(changedLines, 2);
-  assert.ok(content.includes("#log/spending/25/japan/food/snacks"));
-  assert.ok(content.includes("#log/spending/26/japanmidyear/planned/flights"));
-  assert.ok(content.includes("#log/spending/food/groceries")); // untouched
-  assert.equal(core.migrateFinanceTagsInContent(content).changedLines, 0); // idempotent
-});

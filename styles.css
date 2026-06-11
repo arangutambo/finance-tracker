@@ -704,7 +704,3 @@
 .finance-edit-chip { font-size: 0.8em; padding: 0.2em 0.55em; }
 .finance-edit-remember { display: block; color: var(--text-muted); font-size: 0.9em; margin: 0.4em 0; }
 .finance-edit-buttons { display: flex; justify-content: space-between; margin-top: 0.75em; }
-
-/* ---- Tag migration modal ---- */
-.finance-migrate-status { font-weight: 600; margin: 0.4em 0; }
-.finance-migrate-samples { font-family: var(--font-monospace); font-size: 0.82em; max-height: 180px; overflow-y: auto; }
