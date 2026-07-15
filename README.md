@@ -30,8 +30,8 @@ From a brand-new vault, in order:
 7. **Phone capture (optional but the point).** Pick the method that matches your sync
    (see [How logging works](#how-logging-works)): on **Obsidian Sync**, use a Shortcut
    that opens `obsidian://finance-capture?…` (no special storage needed); on an **iCloud
-   Drive / Mac-local** vault you can instead drop capture files into `Utility/Finance/Inbox/`.
-   Full setup is in `Utility/Finance/Apple Shortcuts - Finance Capture.md`.
+   Drive / Mac-local** vault you can instead drop capture files into your configured
+   inbox folder. Step-by-step Shortcut recipes are in [How logging works](#how-logging-works) below.
 
 Nothing else is required — daily notes, the budget note, and the inbox folder are
 all created for you on demand.
@@ -69,10 +69,9 @@ A Shortcut opens `obsidian://finance-capture?amount=12.5&merchant=Coles&category
 The plugin logs it to today's note. This briefly foregrounds Obsidian but needs no filesystem access.
 
 ### Capture inbox (Files-writable vaults)
-A Shortcut (or Mac script, or the bank-CSV reconcile) drops a one-line file into
-`Utility/Finance/Inbox/`; the plugin drains it into the right daily note on arrival and on
-launch. Full setup (manual, Apple Pay automation, Wise sync, ANZ reconcile) is in
-`Utility/Finance/Apple Shortcuts - Finance Capture.md`. Capture line format:
+A Shortcut (or Mac script, or the bank-CSV reconcile) drops a one-line file into the
+inbox folder (default `Utility/Finance/Inbox/`); the plugin drains it into the right daily
+note on arrival and on launch. Capture line format:
 
 ```
 amount=12 | cat=food/restaurants | merchant=Nobu | date=2026-06-10 | source=apple-pay

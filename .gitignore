@@ -3,3 +3,6 @@ dist/
 .DS_Store
 *.log
 coverage/
+
+# Per-vault user settings — must not ship with the plugin
+data.json

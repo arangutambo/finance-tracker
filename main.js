@@ -1591,6 +1591,26 @@ const core = (() => {
   };
 })();
 
+// [self-write guard] Tracks paths the plugin is currently writing so its own
+// vault.on("modify"/"create") handlers don't re-fire on them — prevents the
+// write -> modify-event -> write feedback loops (100% CPU freezes).
+const _ftSelfWrites = new Set();
+function _ftModify(app, file, data) {
+  if (file && file.path) {
+    _ftSelfWrites.add(file.path);
+    setTimeout(() => _ftSelfWrites.delete(file.path), 1500);
+  }
+  return app.vault.modify(file, data);
+}
+function _ftCreate(app, path, data) {
+  const p = typeof path === "string" ? path : path && path.path;
+  if (p) {
+    _ftSelfWrites.add(p);
+    setTimeout(() => _ftSelfWrites.delete(p), 1500);
+  }
+  return app.vault.create(path, data);
+}
+
 const DEFAULT_SETTINGS = {
   dailyNotesFolder: "Journal/Periodics/1. Daily",
   spendingHeading: "## Finance",
@@ -2008,7 +2028,7 @@ class FinanceTrackerPlugin extends Plugin {
 
     this.registerView(DAILY_BUDGET_VIEW, (leaf) => new DailyBudgetView(leaf, this));
 
-    this.addRibbonIcon("coins", "Daily Budget", () => this.activateDailyBudgetView());
+    this.addRibbonIcon("coins", "Daily budget", () => this.activateDailyBudgetView());
     this.addRibbonIcon("circle-plus", "Quick add transaction", () => new QuickAddTransactionModal(this.app, this).open());
 
     this._statusBarItem = this.addStatusBarItem();
@@ -2047,7 +2067,10 @@ class FinanceTrackerPlugin extends Plugin {
       this.updateStatusBar().catch(() => {});
     });
 
-    this.setupJournalCalendarIntegration();
+    // [hotfix 2026-06-12] DISABLED: journal-calendar spend-badge decoration caused an
+    // infinite MutationObserver <-> journals(Vue) re-render loop = 100% CPU freeze.
+    // Re-enable only after a source fix (disconnect observer during decoration + diff-before-mutate).
+    // this.setupJournalCalendarIntegration();
   }
 
   async setupCaptureInbox() {
@@ -2060,6 +2083,7 @@ class FinanceTrackerPlugin extends Plugin {
     }
     const prefix = normalizePath(`${this.settings.captureInboxFolder}/`);
     const onInboxEvent = (file) => {
+      if (file && file.path && _ftSelfWrites.has(file.path)) return;
       if (file && file.path && file.path.startsWith(prefix) && !file.path.includes("/_failed/")) {
         this._scheduleInboxDrain();
       }
@@ -2122,12 +2146,17 @@ class FinanceTrackerPlugin extends Plugin {
   }
 
   async decorateJournalCalendar() {
-    const leaves = this.app.workspace.getLeavesOfType("journal-calendar");
-    for (const leaf of leaves) {
-      const containerEl = leaf.view?.containerEl;
-      if (!containerEl) continue;
-      await this.decorateJournalCalendarLeaf(containerEl);
-      this._watchJournalCalendarGrid(containerEl);
+    this._decorating = true;
+    try {
+      const leaves = this.app.workspace.getLeavesOfType("journal-calendar");
+      for (const leaf of leaves) {
+        const containerEl = leaf.view?.containerEl;
+        if (!containerEl) continue;
+        await this.decorateJournalCalendarLeaf(containerEl);
+        this._watchJournalCalendarGrid(containerEl);
+      }
+    } finally {
+      setTimeout(() => { this._decorating = false; }, 50);
     }
   }
 
@@ -2140,7 +2169,7 @@ class FinanceTrackerPlugin extends Plugin {
         Array.from(m.addedNodes).some((n) => n.nodeType === 1 && !n.classList?.contains("finance-tracker-spend-badge")) ||
         Array.from(m.removedNodes).some((n) => n.nodeType === 1 && !n.classList?.contains("finance-tracker-spend-badge"))
       );
-      if (hasExternalChange) this._scheduleCalendarDecoration();
+      if (hasExternalChange && !this._decorating) this._scheduleCalendarDecoration();
     });
     observer.observe(grid, { childList: true, subtree: false });
     this._journalCalendarObservers.set(containerEl, observer);
@@ -2294,11 +2323,11 @@ class FinanceTrackerPlugin extends Plugin {
     const normalizedPath = normalizePath(path);
     const existing = this.app.vault.getAbstractFileByPath(normalizedPath);
     if (existing instanceof TFile) {
-      await this.app.vault.modify(existing, content);
+      await _ftModify(this.app,existing, content);
       return existing;
     }
     await this.ensureFolder(normalizedPath.split("/").slice(0, -1).join("/"));
-    return this.app.vault.create(normalizedPath, content);
+    return _ftCreate(this.app,normalizedPath, content);
   }
 
   async ensureTextFile(path, contentBuilder) {
@@ -2382,7 +2411,7 @@ class FinanceTrackerPlugin extends Plugin {
 
     const currentContent = await this.app.vault.cachedRead(file);
     const nextContent = core.insertTransactionIntoDailyNote(currentContent, expense, this.settings);
-    await this.app.vault.modify(file, nextContent);
+    await _ftModify(this.app,file, nextContent);
 
     if (expense.externalId) {
       await this.markExternalIdProcessed(expense.externalId);
@@ -2511,7 +2540,7 @@ class FinanceTrackerPlugin extends Plugin {
         externalId: row.externalId ? `csv:${row.externalId}` : "",
       });
       const stamp = `${String(row.date || core.todayIsoLocal()).replace(/-/g, "")}-${Math.random().toString(36).slice(2, 6)}`;
-      await this.app.vault.create(normalizePath(`${folder}/reconcile-${stamp}.txt`), `${line}\n`);
+      await _ftCreate(this.app,normalizePath(`${folder}/reconcile-${stamp}.txt`), `${line}\n`);
       count += 1;
     }
     return count;
@@ -2535,7 +2564,7 @@ class FinanceTrackerPlugin extends Plugin {
     };
     const next = core.replaceTransactionBlock(content, entry.rawLine, newExpense, this.settings);
     if (next == null) throw new Error("Could not locate that entry (the note may have changed).");
-    await this.app.vault.modify(file, next);
+    await _ftModify(this.app,file, next);
     this.invalidateIndexEntry(file.path);
     this._scheduleStatusBarUpdate();
     this.refreshDailyBudgetView();
@@ -2547,7 +2576,7 @@ class FinanceTrackerPlugin extends Plugin {
     const content = await this.app.vault.cachedRead(file);
     const next = core.removeTransactionBlock(content, entry.rawLine, this.settings);
     if (next == null) throw new Error("Could not locate that entry in the note.");
-    await this.app.vault.modify(file, next);
+    await _ftModify(this.app,file, next);
     this.invalidateIndexEntry(file.path);
     this._scheduleStatusBarUpdate();
     this.refreshDailyBudgetView();
@@ -2575,7 +2604,7 @@ class FinanceTrackerPlugin extends Plugin {
     } else {
       lines.push("", "| Merchant | Category |", "| --- | --- |", row);
     }
-    await this.app.vault.modify(file, lines.join("\n"));
+    await _ftModify(this.app,file, lines.join("\n"));
   }
 
   countPendingCaptures() {
@@ -2790,6 +2819,7 @@ class FinanceTrackerPlugin extends Plugin {
   setupIndexAndTotals() {
     this.registerEvent(
       this.app.vault.on("modify", (file) => {
+        if (_ftSelfWrites.has(file.path)) return;
         const prefix = normalizePath(`${this.settings.dailyNotesFolder}/`);
         if (file.path.startsWith(prefix)) {
           this.invalidateIndexEntry(file.path);
@@ -2815,7 +2845,7 @@ class FinanceTrackerPlugin extends Plugin {
     const content = await this.app.vault.cachedRead(file);
     const next = core.recomputeSpendingTotals(content, this.settings);
     if (next !== content) {
-      await this.app.vault.modify(file, next);
+      await _ftModify(this.app,file, next);
     }
   }
 
@@ -2997,7 +3027,7 @@ class FinanceTrackerPlugin extends Plugin {
       dueDate: core.parseIsoDate(frontmatter.due_date || frontmatter.savings_due_date || ""),
       filePath,
       goalKey: core.normalizeCategoryPath(frontmatter.goal_key || frontmatter.savings_goal_key || buildGoalKeyFromName(frontmatter.goal_name || filePath)),
-      goalName: String(frontmatter.goal_name || frontmatter.name || String(filePath || "").split("/").pop()?.replace(/\.md$/i, "") || "Savings Goal").trim(),
+      goalName: String(frontmatter.goal_name || frontmatter.name || String(filePath || "").split("/").pop()?.replace(/\.md$/i, "") || "Savings goal").trim(),
       goalType: String(frontmatter.goal_type || "general").trim().toLowerCase(),
       savingsDisplayMode: String(frontmatter.savings_display_mode || "standard").trim().toLowerCase(),
       savingsProgressMode: String(frontmatter.savings_progress_mode || "account-only").trim().toLowerCase(),
@@ -3192,7 +3222,7 @@ class FinanceTrackerPlugin extends Plugin {
       "```savings-dashboard",
       "```",
       "",
-      "## Planned Expenses",
+      "## Planned expenses",
       "",
       "`Booked` means reserved or committed. If Booked is above 0 it overrides Planned for your remaining holiday budget.",
       "",
@@ -3200,7 +3230,7 @@ class FinanceTrackerPlugin extends Plugin {
       "| --- | --- | ---: | ---: | --- | --- | --- |",
       ...DEFAULT_HOLIDAY_PLANNED_EXPENSES.map((item) => `| ${item.item} | ${item.category} | 0 | 0 | ${startDate} | ${startDate} |  |`),
       "",
-      "## Allocated Expenses",
+      "## Allocated expenses",
       "",
       "Use this table for predicted in-trip spending like transport, shopping, and food. If Start and End are blank the row spans the whole trip.",
       "",
@@ -3208,7 +3238,7 @@ class FinanceTrackerPlugin extends Plugin {
       "| --- | --- | ---: | --- | --- | --- |",
       ...DEFAULT_HOLIDAY_ALLOCATED_EXPENSES.map((item) => `| ${item.item} | ${item.category} | 0 |  |  |  |`),
       "",
-      "## Planned Expenses Log",
+      "## Planned expenses Log",
       "",
       "- Log planned payments in daily notes with tags like `#log/spending/${normalizedHolidayKey}/planned/flights`.",
       "- When the total logged against a category matches its `Booked` amount, the dashboard marks it fully paid.",
@@ -3217,7 +3247,7 @@ class FinanceTrackerPlugin extends Plugin {
   }
 
   buildSavingsGoalNoteContent(title, options = {}) {
-    const goalName = String(title || "Savings Goal").trim() || "Savings Goal";
+    const goalName = String(title || "Savings goal").trim() || "Savings goal";
     const goalKey = core.normalizeCategoryPath(options.goalKey || buildGoalKeyFromName(goalName));
     const dueDate = core.parseIsoDate(options.dueDate || "") || core.todayIsoLocal();
     const currency = core.normalizeCurrency(options.currency || this.settings.defaultCurrency);
@@ -3312,7 +3342,7 @@ class FinanceTrackerPlugin extends Plugin {
       goalName
         .replace(/[\\/:*?"<>|]/g, " ")
         .replace(/\s+/g, " ")
-        .trim() || "Savings Goal";
+        .trim() || "Savings goal";
     const fileName = safeName;
     const budgetPath = normalizePath(`${this.settings.budgetsFolderPath}/${fileName}.md`);
     return this.ensureTextFile(budgetPath, () =>
@@ -3410,7 +3440,7 @@ class FinanceTrackerPlugin extends Plugin {
     let nextContent = updateFrontmatterValue(content, "currency", core.normalizeCurrency(payload.targetCurrency || holidayMeta.currency || this.settings.defaultCurrency));
     nextContent = updateFrontmatterValue(nextContent, "exchange_rates", serializeFlatExchangeRates(nextFlat));
     nextContent = updateFrontmatterValue(nextContent, "exchange_rate_periods", serializeExchangeRatePeriods(nextPeriods));
-    await this.app.vault.modify(file, nextContent);
+    await _ftModify(this.app,file, nextContent);
     new Notice(`Updated exchange rates in ${file.basename}`);
   }
 
@@ -3647,7 +3677,7 @@ class FinanceTrackerPlugin extends Plugin {
 
     const cardData = [
       { label: "Total", value: core.formatCurrency(total, currency) },
-      { label: "Avg / Day", value: core.formatCurrency(core.roundCurrencyAmount(avgPerDay), currency) },
+      { label: "Avg / day", value: core.formatCurrency(core.roundCurrencyAmount(avgPerDay), currency) },
     ];
 
     if (Number.isFinite(options.previousTotal)) {
@@ -3656,12 +3686,12 @@ class FinanceTrackerPlugin extends Plugin {
       const arrow = delta > 0 ? "▲" : delta < 0 ? "▼" : "—";
       const pctText = pct === null ? "" : ` (${delta >= 0 ? "+" : ""}${pct}%)`;
       cardData.push({
-        label: `vs Prev ${core.titleCaseSegment(range.period || "period")}`,
+        label: `vs prev ${range.period || "period"}`,
         value: `${arrow} ${core.formatCurrency(Math.abs(delta), currency)}${pctText}`,
         cls: delta > 0 ? "is-up" : delta < 0 ? "is-down" : "",
       });
     }
-    cardData.push({ label: "Top Category", value: topCategory });
+    cardData.push({ label: "Top category", value: topCategory });
 
     for (const card of cardData) {
       const element = cards.createDiv({ cls: `finance-tracker-summary-card${card.cls ? ` ${card.cls}` : ""}` });
@@ -3689,23 +3719,35 @@ class FinanceTrackerPlugin extends Plugin {
     const gap = totals.length > 30 ? 1 : 2;
     const barWidth = (W - pad * 2 - gap * (totals.length - 1)) / totals.length;
     const today = core.todayIsoLocal();
-    let bars = "";
+    const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
+    section.createEl("h4", { text: "Daily spend" });
+    const holder = section.createDiv({ cls: "finance-tracker-spark" });
+    const svg = holder.createSvg("svg", {
+      cls: "ft-spark-svg",
+      attr: { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "none", role: "img" },
+    });
+    if (perDayBudget > 0) {
+      const lineY = H - pad - (perDayBudget / maxValue) * (H - pad * 2);
+      svg.createSvg("line", {
+        cls: "ft-spark-budget",
+        attr: { x1: pad, y1: lineY.toFixed(1), x2: W - pad, y2: lineY.toFixed(1) },
+      });
+    }
     totals.forEach((entry, index) => {
       const height = (entry.sum / maxValue) * (H - pad * 2);
       const x = pad + index * (barWidth + gap);
       const y = H - pad - height;
-      const cls = entry.date === today ? "ft-spark-today" : "ft-spark-bar";
-      bars += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${Math.max(0.5, barWidth).toFixed(1)}" height="${Math.max(0, height).toFixed(1)}" rx="1" class="${cls}"></rect>`;
+      svg.createSvg("rect", {
+        cls: entry.date === today ? "ft-spark-today" : "ft-spark-bar",
+        attr: {
+          x: x.toFixed(1),
+          y: y.toFixed(1),
+          width: Math.max(0.5, barWidth).toFixed(1),
+          height: Math.max(0, height).toFixed(1),
+          rx: 1,
+        },
+      });
     });
-    let budgetLine = "";
-    if (perDayBudget > 0) {
-      const lineY = H - pad - (perDayBudget / maxValue) * (H - pad * 2);
-      budgetLine = `<line x1="${pad}" y1="${lineY.toFixed(1)}" x2="${W - pad}" y2="${lineY.toFixed(1)}" class="ft-spark-budget"></line>`;
-    }
-    const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
-    section.createEl("h4", { text: "Daily Spend" });
-    const holder = section.createDiv({ cls: "finance-tracker-spark" });
-    holder.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" class="ft-spark-svg" role="img">${budgetLine}${bars}</svg>`;
     if (perDayBudget > 0) {
       section.createDiv({ cls: "finance-tracker-budget-meta", text: `Line = ${core.formatCurrency(perDayBudget, currency)}/day budget` });
     }
@@ -3713,7 +3755,7 @@ class FinanceTrackerPlugin extends Plugin {
 
   renderPieChart(wrapper, groups, currency, threshold = 0.08) {
     const pieSection = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
-    pieSection.createEl("h4", { text: "Category Proportions" });
+    pieSection.createEl("h4", { text: "Category proportions" });
 
     const total = groups.reduce((sum, group) => sum + group.total, 0);
     if (!total) {
@@ -3741,39 +3783,40 @@ class FinanceTrackerPlugin extends Plugin {
       };
     });
 
-    const svgParts = [
-      `<svg viewBox="0 0 ${size} ${size}" class="finance-tracker-pie-svg" role="img" aria-label="Spending by category pie chart">`,
-    ];
+    const chartLayout = pieSection.createDiv({ cls: "finance-tracker-pie-layout" });
+    const chartHost = chartLayout.createDiv({ cls: "finance-tracker-pie-host" });
+    const svg = chartHost.createSvg("svg", {
+      cls: "finance-tracker-pie-svg",
+      attr: { viewBox: `0 0 ${size} ${size}`, role: "img", "aria-label": "Spending by category pie chart" },
+    });
 
     for (const slice of slices) {
       if (slice.ratio >= 0.999) {
-        svgParts.push(
-          `<circle cx="${center}" cy="${center}" r="${radius}" fill="${slice.color}" class="finance-tracker-pie-slice"></circle>`
-        );
+        svg.createSvg("circle", {
+          cls: "finance-tracker-pie-slice",
+          attr: { cx: center, cy: center, r: radius, fill: slice.color },
+        });
       } else {
-        svgParts.push(
-          `<path d="${describePieSlice(center, center, radius, slice.startAngle, slice.endAngle)}" fill="${slice.color}" class="finance-tracker-pie-slice"></path>`
-        );
+        svg.createSvg("path", {
+          cls: "finance-tracker-pie-slice",
+          attr: { d: describePieSlice(center, center, radius, slice.startAngle, slice.endAngle), fill: slice.color },
+        });
       }
 
       if (slice.ratio >= threshold) {
         const labelPoint = centroidForSlice(center, center, radius, slice.startAngle, slice.endAngle);
-        const amount = escapeHtml(core.formatCurrency(slice.total, currency));
-        const label = escapeHtml(slice.label);
-        svgParts.push(
-          `<text x="${labelPoint.x}" y="${labelPoint.y - 8}" class="finance-tracker-pie-label" text-anchor="middle">${label}</text>`
-        );
-        svgParts.push(
-          `<text x="${labelPoint.x}" y="${labelPoint.y + 12}" class="finance-tracker-pie-value" text-anchor="middle">${amount}</text>`
-        );
+        svg.createSvg("text", {
+          cls: "finance-tracker-pie-label",
+          text: slice.label,
+          attr: { x: labelPoint.x, y: labelPoint.y - 8, "text-anchor": "middle" },
+        });
+        svg.createSvg("text", {
+          cls: "finance-tracker-pie-value",
+          text: core.formatCurrency(slice.total, currency),
+          attr: { x: labelPoint.x, y: labelPoint.y + 12, "text-anchor": "middle" },
+        });
       }
     }
-
-    svgParts.push("</svg>");
-
-    const chartLayout = pieSection.createDiv({ cls: "finance-tracker-pie-layout" });
-    const chartHost = chartLayout.createDiv({ cls: "finance-tracker-pie-host" });
-    chartHost.innerHTML = svgParts.join("");
 
     const legend = chartLayout.createDiv({ cls: "finance-tracker-legend" });
     for (const slice of slices) {
@@ -3792,7 +3835,7 @@ class FinanceTrackerPlugin extends Plugin {
     if (!total) return;
 
     const pieSection = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
-    pieSection.createEl("h4", { text: "By Category" });
+    pieSection.createEl("h4", { text: "By category" });
 
     const size = 200;
     const center = size / 2;
@@ -3807,20 +3850,24 @@ class FinanceTrackerPlugin extends Plugin {
       return { ...group, color: PIE_COLORS[index % PIE_COLORS.length], ratio, startAngle, endAngle: angle };
     });
 
-    const svgParts = [
-      `<svg viewBox="0 0 ${size} ${size}" class="finance-tracker-pie-svg finance-tracker-pie-svg--mini" role="img" aria-label="Spending by category">`,
-    ];
+    const chartHost = pieSection.createDiv({ cls: "finance-tracker-pie-host" });
+    const svg = chartHost.createSvg("svg", {
+      cls: "finance-tracker-pie-svg finance-tracker-pie-svg--mini",
+      attr: { viewBox: `0 0 ${size} ${size}`, role: "img", "aria-label": "Spending by category" },
+    });
     for (const slice of slices) {
       if (slice.ratio >= 0.999) {
-        svgParts.push(`<circle cx="${center}" cy="${center}" r="${radius}" fill="${slice.color}" class="finance-tracker-pie-slice"></circle>`);
+        svg.createSvg("circle", {
+          cls: "finance-tracker-pie-slice",
+          attr: { cx: center, cy: center, r: radius, fill: slice.color },
+        });
       } else {
-        svgParts.push(`<path d="${describePieSlice(center, center, radius, slice.startAngle, slice.endAngle)}" fill="${slice.color}" class="finance-tracker-pie-slice"></path>`);
+        svg.createSvg("path", {
+          cls: "finance-tracker-pie-slice",
+          attr: { d: describePieSlice(center, center, radius, slice.startAngle, slice.endAngle), fill: slice.color },
+        });
       }
     }
-    svgParts.push("</svg>");
-
-    const chartHost = pieSection.createDiv({ cls: "finance-tracker-pie-host" });
-    chartHost.innerHTML = svgParts.join("");
 
     const legend = pieSection.createDiv({ cls: "finance-tracker-legend finance-tracker-legend--mini" });
     for (const slice of slices) {
@@ -3836,7 +3883,7 @@ class FinanceTrackerPlugin extends Plugin {
 
   renderBudgets(wrapper, budgets, currency, options = {}) {
     const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
-    section.createEl("h4", { text: options.title || "Budget Progress" });
+    section.createEl("h4", { text: options.title || "Budget progress" });
 
     if (!budgets.length) {
       if (!options.hideEmptyState) {
@@ -3924,7 +3971,7 @@ class FinanceTrackerPlugin extends Plugin {
     if (!rows.length) return;
 
     const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
-    section.createEl("h4", { text: "Savings Activity" });
+    section.createEl("h4", { text: "Savings activity" });
     section.createDiv({
       cls: "finance-tracker-budget-meta",
       text: `${core.formatCurrency(
@@ -3963,9 +4010,9 @@ class FinanceTrackerPlugin extends Plugin {
   renderHolidaySummary(wrapper, metrics, currency) {
     const cards = wrapper.createDiv({ cls: "finance-tracker-summary" });
     const cardData = [
-      { label: "Holiday Budget", value: metrics.totalBudget > 0 ? core.formatCurrency(metrics.totalBudget, currency) : "Not set" },
-      { label: "Total Spent", value: core.formatCurrency(metrics.totalSpent, currency) },
-      { label: "Total Spent %", value: metrics.totalBudget > 0 ? `${metrics.totalSpentPercent}%` : "Not set" },
+      { label: "Holiday budget", value: metrics.totalBudget > 0 ? core.formatCurrency(metrics.totalBudget, currency) : "Not set" },
+      { label: "Total spent", value: core.formatCurrency(metrics.totalSpent, currency) },
+      { label: "Total spent %", value: metrics.totalBudget > 0 ? `${metrics.totalSpentPercent}%` : "Not set" },
       {
         label: "Remaining",
         value:
@@ -3973,12 +4020,12 @@ class FinanceTrackerPlugin extends Plugin {
             ? core.formatCurrency(metrics.remaining, currency)
             : "Not set",
       },
-      { label: "Can Spend / Day", value: core.formatCurrency(metrics.canSpendPerDay, currency) },
-      { label: "Trip Days So Far", value: String(metrics.tripDays) },
-      { label: "Avg / Day", value: core.formatCurrency(metrics.averageExcludingAccommodation, currency) },
-      { label: "Avg Accommodation / Day", value: core.formatCurrency(metrics.averageAccommodationPerDay, currency) },
-      { label: "Avg Transport / Day", value: core.formatCurrency(metrics.averageTransportPerDay, currency) },
-      { label: "Avg Food / Day", value: core.formatCurrency(metrics.averageFoodPerDay, currency) },
+      { label: "Can spend / day", value: core.formatCurrency(metrics.canSpendPerDay, currency) },
+      { label: "Trip days so far", value: String(metrics.tripDays) },
+      { label: "Avg / day", value: core.formatCurrency(metrics.averageExcludingAccommodation, currency) },
+      { label: "Avg accommodation / day", value: core.formatCurrency(metrics.averageAccommodationPerDay, currency) },
+      { label: "Avg transport / day", value: core.formatCurrency(metrics.averageTransportPerDay, currency) },
+      { label: "Avg food / day", value: core.formatCurrency(metrics.averageFoodPerDay, currency) },
     ];
 
     for (const card of cardData) {
@@ -3990,12 +4037,12 @@ class FinanceTrackerPlugin extends Plugin {
 
   renderPlannedExpenses(wrapper, plannedExpenses, currency) {
     const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
-    section.createEl("h4", { text: "Planned Expenses" });
+    section.createEl("h4", { text: "Planned expenses" });
 
     if (!plannedExpenses?.rows?.length) {
       section.createDiv({
         cls: "finance-tracker-empty",
-        text: "No planned trip costs found yet. Add rows to the Planned Expenses table in the holiday budget note.",
+        text: "No planned trip costs found yet. Add rows to the Planned expenses table in the holiday budget note.",
       });
       return;
     }
@@ -4041,12 +4088,12 @@ class FinanceTrackerPlugin extends Plugin {
 
   renderAllocatedExpenses(wrapper, allocatedExpenses, currency) {
     const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
-    section.createEl("h4", { text: "Allocated Expenses" });
+    section.createEl("h4", { text: "Allocated expenses" });
 
     if (!allocatedExpenses?.rows?.length) {
       section.createDiv({
         cls: "finance-tracker-empty",
-        text: "No allocated in-trip costs found yet. Add rows to the Allocated Expenses table in the holiday budget note.",
+        text: "No allocated in-trip costs found yet. Add rows to the Allocated expenses table in the holiday budget note.",
       });
       return;
     }
@@ -4100,7 +4147,7 @@ class FinanceTrackerPlugin extends Plugin {
 
   renderPlannedExpenseCalendar(wrapper, plannedExpenses, plannedEntries, holidayMeta) {
     const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
-    section.createEl("h4", { text: "Planned Expenses Calendar" });
+    section.createEl("h4", { text: "Planned expenses calendar" });
     try {
       const startDate = core.parseIsoDate(holidayMeta?.startDate || "");
       const endDate = core.parseIsoDate(holidayMeta?.endDate || "");
@@ -4585,7 +4632,7 @@ class FinanceTrackerPlugin extends Plugin {
 
   renderExchangeRates(wrapper, holidayMeta) {
     const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
-    section.createEl("h4", { text: "Exchange Rates" });
+    section.createEl("h4", { text: "Exchange rates" });
 
     const flatEntries = Object.entries(holidayMeta?.exchangeRates?.flat || {});
     const periodEntries = holidayMeta?.exchangeRates?.periods || [];
@@ -4628,19 +4675,19 @@ class FinanceTrackerPlugin extends Plugin {
 
   renderSavingsSummary(wrapper, goal, summary, currency, extras = {}) {
     const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
-    section.createEl("h4", { text: goal.goalName || "Savings Goal" });
+    section.createEl("h4", { text: goal.goalName || "Savings goal" });
     const cards = section.createDiv({ cls: "finance-tracker-summary" });
     const cardData = goal.goalType === "holiday"
       ? [
         { label: "Target", value: core.formatCurrency(summary.targetAmount, currency) },
         { label: "Current Account Balance", value: core.formatCurrency(summary.currentAccountBalance, currency) },
-        { label: "Paid Planned Expenses", value: core.formatCurrency(summary.paidPlannedExpenses, currency) },
+        { label: "Paid Planned expenses", value: core.formatCurrency(summary.paidPlannedExpenses, currency) },
         { label: "Saved Progress", value: core.formatCurrency(summary.savedProgress, currency) },
         { label: summary.amountRemainingLabel, value: core.formatCurrency(summary.amountRemaining, currency) },
         { label: "Saved %", value: summary.targetAmount > 0 ? `${summary.proportionSaved}%` : "0%" },
         { label: "Required This Period", value: core.formatCurrency(summary.requiredPerPeriod, currency) },
         { label: "This Period", value: core.formatCurrency(summary.currentPeriodContribution, currency) },
-        { label: "Avg Accommodation / Day", value: core.formatCurrency(extras.averageAccommodationPerDay || 0, currency) },
+        { label: "Avg accommodation / day", value: core.formatCurrency(extras.averageAccommodationPerDay || 0, currency) },
         { label: "Maximum Spent / Night", value: extras.maximumAccommodationPerNight ? core.formatCurrency(extras.maximumAccommodationPerNight, currency) : "Not set" },
         { label: "Minimum Spent / Night", value: extras.minimumAccommodationPerNight ? core.formatCurrency(extras.minimumAccommodationPerNight, currency) : "Not set" },
       ]
@@ -4660,11 +4707,7 @@ class FinanceTrackerPlugin extends Plugin {
   }
 
   async renderSavingsDashboard(source, el, ctx) {
-    if (typeof el.empty === "function") {
-      el.empty();
-    } else {
-      el.innerHTML = "";
-    }
+    el.empty();
 
     const config = parseConfigBlock(source);
     const referenceDate = this.getReferenceDateForSource(ctx.sourcePath);
@@ -4707,7 +4750,7 @@ class FinanceTrackerPlugin extends Plugin {
     const summary = await this.buildSavingsGoalSummary(goalDefinition, referenceDate);
     const wrapper = el.createDiv({ cls: "finance-tracker-dashboard" });
     const header = wrapper.createDiv({ cls: "finance-tracker-header" });
-    header.createEl("h3", { text: config.title || `${goalDefinition.goalName} ${goalDefinition.goalType === "holiday" ? "Trip Preparation Dashboard" : "Savings Dashboard"}` });
+    header.createEl("h3", { text: config.title || `${goalDefinition.goalName} ${goalDefinition.goalType === "holiday" ? "Trip preparation dashboard" : "Savings dashboard"}` });
     if (goalDefinition.goalType === "holiday") {
       const holidayMeta = this.parseHolidayBudgetContent(await this.app.vault.cachedRead(sourceFile), sourceFile.path);
       const plannedEntries = await this.collectTransactionsForHoliday(holidayMeta.holidayKey, {
@@ -4740,11 +4783,7 @@ class FinanceTrackerPlugin extends Plugin {
   }
 
   async renderHolidayDashboard(source, el, ctx) {
-    if (typeof el.empty === "function") {
-      el.empty();
-    } else {
-      el.innerHTML = "";
-    }
+    el.empty();
 
     try {
       const config = parseConfigBlock(source);
@@ -4786,12 +4825,12 @@ class FinanceTrackerPlugin extends Plugin {
       });
 
       const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
-      const exportButton = headerActions.createEl("button", { text: "Export Holiday CSV" });
+      const exportButton = headerActions.createEl("button", { text: "Export holiday CSV" });
       exportButton.addEventListener("click", async () => {
         await this.exportEntriesToCsv(actualEntries, `holiday-${holidayKey.replace(/\//g, "-")}-${effectiveEnd || referenceDate}`);
       });
       if (budgetFile instanceof TFile) {
-        const budgetButton = headerActions.createEl("button", { text: "Open Holiday Budget" });
+        const budgetButton = headerActions.createEl("button", { text: "Open holiday budget" });
         budgetButton.addEventListener("click", async () => {
           await this.app.workspace.getLeaf(true).openFile(budgetFile);
         });
@@ -4815,11 +4854,7 @@ class FinanceTrackerPlugin extends Plugin {
   }
 
   async renderDailyBudgetCheckInto(el, referenceDate, groupBy = "full") {
-    if (typeof el.empty === "function") {
-      el.empty();
-    } else {
-      el.innerHTML = "";
-    }
+    el.empty();
 
     const basePeriod = this.settings.budgetCheckPeriod || "week";
     const currency = core.normalizeCurrency(this.settings.defaultCurrency);
@@ -4850,7 +4885,7 @@ class FinanceTrackerPlugin extends Plugin {
 
     // Header
     const header = wrapper.createDiv({ cls: "finance-tracker-header" });
-    header.createEl("h3", { text: "Daily Budget" });
+    header.createEl("h3", { text: "Daily budget" });
     const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
     const budgetsButton = headerActions.createEl("button", { text: "Budgets" });
     budgetsButton.addEventListener("click", async () => {
@@ -4877,7 +4912,7 @@ class FinanceTrackerPlugin extends Plugin {
       const pace = core.computeBudgetPace({ limit: scaledLimit, spent: periodTotal, periodStart: periodRange.start, periodEnd: periodRange.end, referenceDate });
       const leftCard = summaryGrid.createDiv({ cls: "finance-tracker-summary-card" });
       if (pace.projected > scaledLimit) leftCard.addClass("is-over");
-      leftCard.createDiv({ cls: "finance-tracker-summary-label", text: "Left / Day" });
+      leftCard.createDiv({ cls: "finance-tracker-summary-label", text: "Left / day" });
       leftCard.createDiv({ cls: "finance-tracker-summary-value", text: core.formatCurrency(pace.perDayRemaining, currency) });
     }
 
@@ -4900,7 +4935,7 @@ class FinanceTrackerPlugin extends Plugin {
         ? core.roundCurrencyAmount(metrics.spendableRemaining / metrics.remainingTripDays)
         : 0;
       const holidayCard = summaryGrid.createDiv({ cls: "finance-tracker-summary-card" });
-      holidayCard.createDiv({ cls: "finance-tracker-summary-label", text: `${holidayContext.name || "Trip"} / Day` });
+      holidayCard.createDiv({ cls: "finance-tracker-summary-label", text: `${holidayContext.name || "Trip"} / day` });
       holidayCard.createDiv({ cls: "finance-tracker-summary-value", text: core.formatCurrency(dailyCanSpend, holidayContext.currency || currency) });
     }
 
@@ -4941,7 +4976,7 @@ class FinanceTrackerPlugin extends Plugin {
     const savingsGoals = (await this.collectSavingsGoalDefinitions()).filter((goal) => goal.activeSavingsGoal);
     if (savingsGoals.length) {
       const goalsSection = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
-      goalsSection.createEl("h4", { text: "Savings Goals" });
+      goalsSection.createEl("h4", { text: "Savings goals" });
       for (const goal of savingsGoals) {
         const summary = await this.buildSavingsGoalSummary(goal, referenceDate);
         const goalTotal = summary.currentSaved + summary.amountRemaining;
@@ -4962,7 +4997,7 @@ class FinanceTrackerPlugin extends Plugin {
     const needsCategory = spendEntries.filter((entry) => !entry.category || entry.category === "uncategorized");
     if (needsCategory.length) {
       const triage = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-tracker-triage" });
-      triage.createEl("h4", { text: `Needs a Category (${needsCategory.length})` });
+      triage.createEl("h4", { text: `Needs a category (${needsCategory.length})` });
       for (const entry of needsCategory.slice(0, 12)) {
         const row = triage.createDiv({ cls: "finance-tracker-budget-card is-clickable is-uncategorized" });
         const title = row.createDiv({ cls: "finance-tracker-budget-title" });
@@ -4975,7 +5010,7 @@ class FinanceTrackerPlugin extends Plugin {
     // Today's individual entries (tap to edit / recategorise / delete).
     if (todayEntries.length) {
       const todaySection = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
-      todaySection.createEl("h4", { text: "Today's Entries" });
+      todaySection.createEl("h4", { text: "Today's entries" });
       for (const entry of todayEntries) {
         const row = todaySection.createDiv({ cls: "finance-tracker-budget-card is-clickable" });
         if (!entry.category || entry.category === "uncategorized") row.addClass("is-uncategorized");
@@ -4992,11 +5027,7 @@ class FinanceTrackerPlugin extends Plugin {
   }
 
   async renderDashboard(source, el, ctx) {
-    if (typeof el.empty === "function") {
-      el.empty();
-    } else {
-      el.innerHTML = "";
-    }
+    el.empty();
 
     const config = parseConfigBlock(source);
     const referenceDate = this.getReferenceDateForSource(ctx.sourcePath);
@@ -5013,7 +5044,7 @@ class FinanceTrackerPlugin extends Plugin {
     const wrapper = el.createDiv({ cls: "finance-tracker-dashboard" });
     const header = wrapper.createDiv({ cls: "finance-tracker-header" });
     header.createEl("h3", {
-      text: config.title || `Finance Dashboard: ${range.start === range.end ? range.start : `${range.start} to ${range.end}`}`,
+      text: config.title || `Finance dashboard: ${range.start === range.end ? range.start : `${range.start} to ${range.end}`}`,
     });
 
     const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
@@ -5071,12 +5102,13 @@ class DailyBudgetView extends ItemView {
   }
 
   getViewType() { return DAILY_BUDGET_VIEW; }
-  getDisplayText() { return "Daily Budget"; }
+  getDisplayText() { return "Daily budget"; }
   getIcon() { return "coins"; }
 
   async onOpen() {
     this.registerEvent(
       this.app.vault.on("modify", (file) => {
+        if (_ftSelfWrites.has(file.path)) return;
         const prefix = normalizePath(this.plugin.settings.dailyNotesFolder + "/");
         if (file.path.startsWith(prefix)) {
           clearTimeout(this._refreshTimer);
@@ -5491,7 +5523,7 @@ class HolidayBudgetModal extends Modal {
     if (!this.query.trim()) return;
 
     this.updateCreateDefaults();
-    this.createPanelEl.createEl("h3", { text: "New Holiday Details" });
+    this.createPanelEl.createEl("h3", { text: "New holiday details" });
     this.createPanelEl.createEl("p", {
       cls: "finance-tracker-settings-section-copy",
       text: "Set the tracking tag and trip dates now so the holiday budget note is ready to use immediately.",
@@ -5530,7 +5562,7 @@ class HolidayBudgetModal extends Modal {
     });
 
     const actions = this.createPanelEl.createDiv({ cls: "finance-tracker-settings-actions" });
-    const createButton = actions.createEl("button", { text: "Create Holiday Budget" });
+    const createButton = actions.createEl("button", { text: "Create holiday budget" });
     createButton.addEventListener("click", async () => {
       await this.createFromForm();
     });
@@ -5539,7 +5571,7 @@ class HolidayBudgetModal extends Modal {
   onOpen() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl("h2", { text: "Select Or Create Holiday Budget" });
+    contentEl.createEl("h2", { text: "Select or create holiday budget" });
     const intro = contentEl.createEl("p", {
       text: "Search an existing holiday budget. If nothing matches, choose the create option to start a new one inside your budgets folder.",
     });
@@ -5617,7 +5649,7 @@ class ExchangeRateModal extends Modal {
   onOpen() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl("h2", { text: `Add Exchange Rate: ${this.budgetFile.basename}` });
+    contentEl.createEl("h2", { text: `Add exchange rate: ${this.budgetFile.basename}` });
 
     new Setting(contentEl)
       .setName("Rate scope")
@@ -5690,7 +5722,7 @@ class ExchangeRateModal extends Modal {
       this.close();
       await this.onSubmit(null);
     });
-    const saveButton = actions.createEl("button", { text: "Save Rate" });
+    const saveButton = actions.createEl("button", { text: "Save rate" });
     saveButton.addEventListener("click", async () => {
       await this.submit();
     });
@@ -5729,7 +5761,7 @@ class SavingsGoalModal extends Modal {
   onOpen() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl("h2", { text: "Create Savings Goal" });
+    contentEl.createEl("h2", { text: "Create savings goal" });
 
     new Setting(contentEl)
       .setName("Goal name")
@@ -5761,7 +5793,7 @@ class SavingsGoalModal extends Modal {
       });
 
     const actions = contentEl.createDiv({ cls: "finance-tracker-settings-actions" });
-    const createButton = actions.createEl("button", { text: "Create Goal Note" });
+    const createButton = actions.createEl("button", { text: "Create goal note" });
     createButton.addEventListener("click", async () => {
       await this.submit();
     });
@@ -5779,7 +5811,7 @@ class ExportFolderModal extends Modal {
   onOpen() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl("h2", { text: "Choose Export Folder" });
+    contentEl.createEl("h2", { text: "Choose export folder" });
     contentEl.createEl("p", {
       cls: "finance-tracker-settings-section-copy",
       text: "Pick the folder where this CSV should be saved for this export.",
@@ -6000,13 +6032,13 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
       );
 
     const actions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
-    const openBudgetsButton = actions.createEl("button", { text: "Open Budgets Note" });
+    const openBudgetsButton = actions.createEl("button", { text: "Open budgets note" });
     openBudgetsButton.addEventListener("click", async () => {
       await this.plugin.openBudgetNote();
     });
 
     addSection(
-      "Holiday Budgets",
+      "Holiday budgets",
       "Create, select, and archive holiday budgets here. Spending is treated as holiday spending automatically when the note date falls inside a holiday budget's start and end dates."
     );
 
@@ -6018,21 +6050,21 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
     });
 
     const holidayActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
-    const selectHolidayButton = holidayActions.createEl("button", { text: "Select Or Create Holiday" });
+    const selectHolidayButton = holidayActions.createEl("button", { text: "Select or create holiday" });
     selectHolidayButton.addEventListener("click", () => {
       new HolidayBudgetModal(this.app, this.plugin, async () => {
         this.display();
       }).open();
     });
-    const archiveHolidayButton = holidayActions.createEl("button", { text: "Archive Selected Holiday" });
+    const archiveHolidayButton = holidayActions.createEl("button", { text: "Archive selected holiday" });
     archiveHolidayButton.addEventListener("click", async () => {
       await this.plugin.archiveActiveHolidayBudget();
       this.display();
     });
 
-    addSection("Savings Goals", "Create standalone savings goal notes for things like a house deposit or rainy day fund.");
+    addSection("Savings goals", "Create standalone savings goal notes for things like a house deposit or rainy day fund.");
     const savingsActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
-    const createSavingsGoalButton = savingsActions.createEl("button", { text: "Create Savings Goal" });
+    const createSavingsGoalButton = savingsActions.createEl("button", { text: "Create savings goal" });
     createSavingsGoalButton.addEventListener("click", () => {
       new SavingsGoalModal(this.app, this.plugin, async () => {
         this.display();

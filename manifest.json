@@ -3,7 +3,7 @@
   "name": "Finance Tracker",
   "version": "0.1.0",
   "minAppVersion": "1.0.0",
-  "description": "Capture Apple Shortcut spending entries into daily notes, visualize weekly category spending with pie charts, track budgets, and export CSV data.",
+  "description": "Log spending as tags in your daily notes, then turn them into pace-aware budget, holiday, and savings dashboards. Capture via Apple Shortcuts or a quick-add modal.",
   "author": "Antoine Jhaddad",
   "authorUrl": "https://github.com/antoinejhaddad",
   "isDesktopOnly": false
