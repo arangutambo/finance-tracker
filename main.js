@@ -2688,6 +2688,15 @@ function extractPlannedLineDates(line = "") {
   };
 }
 
+// Reduces a possibly-templated folder path ("Journal/Daily/{{date:YYYY}}") to
+// its static prefix ("Journal/Daily"). Returns "" when nothing static remains.
+function stripFolderTemplate(value) {
+  return String(value || "")
+    .split("{{")[0]
+    .replace(/\/+$/, "")
+    .trim();
+}
+
 function normalizeCategoryOptions(value) {
   const items = Array.isArray(value) ? value : String(value || "").split(/\r?\n|,/);
   return Array.from(
@@ -3098,13 +3107,19 @@ class FinanceTrackerPlugin extends Plugin {
     // community plugin or the core Daily notes plugin, falling back to the
     // manual setting when neither is configured.
     this._dailyNoteFormat = "YYYY-MM-DD";
+    // Heal a templated folder that 0.2.0 could persist verbatim from the
+    // Journals config (e.g. "Journal/Daily/{{date:YYYY}}/{{date:MM}}").
+    if (String(this.settings.dailyNotesFolder || "").includes("{{")) {
+      this.settings.dailyNotesFolder = stripFolderTemplate(this.settings.dailyNotesFolder) || DEFAULT_SETTINGS.dailyNotesFolder;
+    }
     const journalsConfig = await this.readJournalsDailyConfig();
     const coreDailyNotesConfig = await this.readCoreDailyNotesConfig();
     const detected = journalsConfig || coreDailyNotesConfig;
-    if (detected?.folder) {
+    const detectedFolder = stripFolderTemplate(detected?.folder);
+    if (detectedFolder) {
       const currentFolder = (this.settings.dailyNotesFolder || "").trim();
       if (!currentFolder || currentFolder === DEFAULT_SETTINGS.dailyNotesFolder) {
-        this.settings.dailyNotesFolder = detected.folder;
+        this.settings.dailyNotesFolder = detectedFolder;
       }
     }
     if (detected?.format && core.formatDailyNoteName("2026-01-02", detected.format)) {
@@ -3135,13 +3150,16 @@ class FinanceTrackerPlugin extends Plugin {
 
   // Reads the Journals community plugin config and returns the first daily
   // journal's folder and date format, or null when Journals is not set up.
+  // Journals folders can be per-date templates like
+  // `Journal/Periodics/1. Daily/{{date:YYYY}}/{{date:MM}}` — only the static
+  // prefix is a real folder, so template segments are stripped.
   async readJournalsDailyConfig() {
     try {
       const raw = await this.app.vault.adapter.read(normalizePath(".obsidian/plugins/journals/data.json"));
       const parsed = JSON.parse(raw);
       for (const journal of Object.values(parsed?.journals || {})) {
         if (journal?.write?.type !== "day") continue;
-        const folder = String(journal.folder || "").trim();
+        const folder = stripFolderTemplate(journal.folder);
         if (!folder) continue;
         return { folder, format: String(journal.dateFormat || "YYYY-MM-DD").trim() };
       }
