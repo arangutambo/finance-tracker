@@ -4,6 +4,8 @@ An Obsidian plugin that logs spending as tagged bullets inside your daily notes,
 keeps a running total, and turns those notes into spending, budget, holiday and
 savings dashboards. Your markdown notes stay the source of truth — no database.
 
+Support the project: [Buy Me a Coffee](https://buymeacoffee.com/tonyhad)
+
 ## First-time setup (empty vault)
 
 From a brand-new vault, in order:
@@ -101,6 +103,9 @@ the rest = merchant.
 | Savings contribution | `#log/income/<goalKey>` | `- $500 #log/income/japanmidyear` |
 | Savings withdrawal | `#log/spending/goal/<goalKey>/<category>` | `- $90 #log/spending/goal/rainy-day/medical` |
 | Holiday spend | `#log/spending/<year>/<key>/<category>` | `- $40 #log/spending/26/japanmidyear/food` |
+| Recurring bill | `#log/spending/subscriptions/<cadence>/<name>` | `- $12.99 #log/spending/subscriptions/monthly/spotify` |
+| Owed share (child line) | `#log/owed/<person>` | `	- owes: Sam $8.00 #log/owed/sam` |
+| Balance snapshot | `#log/balance/<account>` | `- $5,230.00 #log/balance/anz-plus` |
 
 The amount is a `$`-prefixed number on the bullet; a child line is the merchant, a
 second child is a note. Categories are slash paths (`food/restaurants`).
@@ -147,11 +152,219 @@ pie, a daily-spend sparkline with your budget line, pace-aware budget bars, and
 savings activity. Export CSV from the header.
 
 `holiday-dashboard` — planned vs actual trip spend, per-day budget remaining, and a
-trip calendar. Reads a holiday budget note (frontmatter `holiday_tag`,
-`total_budget`, `start_date`, `end_date`, plus Planned/Allocated tables).
+trip calendar. Reads a goal note that has a `trip_tag` (see [Goals](#goals-savings--trips)),
+plus its Planned/Allocated tables.
 
-`savings-dashboard` — per-goal progress, contributions, projected completion. Reads
-a savings goal note (frontmatter `goal_key`, `target_amount`, `due_date`, …).
+`savings-dashboard` — per-goal progress, contributions, sinking-fund set-aside and
+pace. Reads a goal note (frontmatter `goal_key`, `target_amount`, `due_date`, …).
+
+Every chart shares one **hue-family colour system**: each major category gets a
+base hue, its subcategories render as lighter/darker shades of that hue, and
+pies and legends rank by major-group total with subgroups nested beneath.
+
+## Goals (savings + trips)
+
+Savings goals and holiday budgets share **one frontmatter schema**. Any goal with
+`target_amount` and `due_date` automatically shows sinking-fund math — the
+set-aside needed per week and whether you're ahead of or behind the linear pace.
+A holiday is simply a goal that also has a `trip_tag`, dates, and a currency.
+Command: **Create savings goal** (or the buttons in settings).
+
+```md
+---
+goal_name: Roadbike
+goal_key: roadbike
+target_amount: 3000
+starting_balance: 0
+due_date: 2026-12-10
+active: true
+currency: AUD
+---
+
+```savings-dashboard
+```
+```
+
+A trip goal adds the trip keys (and optionally `trip_currency` for trip-mode capture):
+
+```md
+---
+goal_name: Japan Mid-Year
+goal_key: japanmidyear
+target_amount: 6000
+due_date: 2026-06-18
+trip_tag: 26/japanmidyear
+trip_currency: JPY
+start_date: 2026-06-21
+end_date: 2026-07-08
+total_budget: 6000
+currency: AUD
+exchange_rates: JPY=0.00877
+---
+```
+
+Contributions are `- $500 #log/income/roadbike` bullets; withdrawals are
+`- $90 #log/spending/goal/roadbike/<category>`. The legacy `goal_key` /
+`holiday_tag` frontmatter still parses, so un-migrated notes keep rendering.
+
+### Multiple holidays & archiving
+
+Command: **Archive finished holidays** (or the per-note toggles and Archive
+buttons in Settings → Holiday budgets)
+
+You can save for **several holidays at once** — every goal note with
+`active: true` shows in the sidebar and counts toward forecast set-asides, and
+capture routes to whichever trip's dates match.
+
+When a trip is over, archive it. Archiving writes a frozen **Archive summary**
+into the note — the savings steps (every contribution, dated) and how the money
+was spent, during the trip and after its end date — then marks it
+`archived: <date>` and moves it to the archive folder. The note keeps its full
+history and its dashboards still render when you open it, but it leaves the
+active set: no more capture routing, sidebar cards, or forecast set-asides.
+
+```md
+## Archive summary (2026-07-25)
+
+- Target: $3,500.00
+- Saved: $3,500.00 (100% of target) — $500.00 starting balance + 2 contributions
+
+### Savings steps
+
+| Date       |    Amount | Note             |
+| ---------- | --------: | ---------------- |
+| 2026-05-01 | $1,500.00 | Savings transfer |
+| 2026-06-01 | $1,500.00 | Savings transfer |
+
+### How it was spent
+
+- Trip budget: $3,500.00
+- Spent during the trip: $2,914.00 across 41 entries
+- Spent after 2026-07-24: $40.00 across 1 entry
+```
+
+## Recurring payments
+
+Command: **Log due recurring payments** · **Insert recurring payments block**
+
+Tag a bill once with a cadence subtag under the recurring prefix (default
+`subscriptions`; configurable in settings) and it becomes a tracked recurring
+payment. The amount is inferred from the last logged entry, and next-due from
+the last logged date plus the cadence (`weekly`, `fortnightly`, `monthly`,
+`quarterly`, `yearly`):
+
+```md
+## Finance
+- [ ] #log/spending 31.49
+	- $12.99 #log/spending/subscriptions/monthly/spotify
+		- Spotify
+	- $18.50 #log/spending/subscriptions/weekly/gym
+		- Anytime Fitness
+```
+
+Then drop this block into any note:
+
+````md
+```finance-recurring
+```
+````
+
+It shows upcoming bills, overdue items with a one-tap **Log now**, and the total
+subscription cost per month and per year. An optional setting (**Auto-log
+recurring payments**) logs each item automatically on its due day.
+
+## Split expenses
+
+Command: **Settle up split expenses** · **Insert split expenses block**
+
+Quick-add and `obsidian://finance-capture` accept `split=N` (even split — your
+share is amount ÷ N) and `owed=Name:$X` tokens:
+
+```
+24 nobu restaurants split=2          → you owe $12, someone owes you $12
+30 dinner restaurants owed=Sam:$10   → Sam owes $10 of the $30
+```
+
+The full amount stays on the bullet, with a hand-editable child line per person.
+Only **your share** counts toward budgets:
+
+```md
+	- $24.00 #log/spending/food/restaurants
+		- Nobu
+		- owes: Sam $12.00 #log/owed/sam
+```
+
+The ` ```finance-splits``` ` block and a sidebar card sum outstanding balances
+per person. **Settle up** logs the repayment as income
+(`- $12.00 #log/income/settleup/sam`) and appends `· settled <date>` to the owed
+lines.
+
+## Trip mode
+
+Commands: **Start trip** · **End trip**
+
+Start trip picks a trip goal note and, until you end the trip, quick-add and URL
+captures default to the trip tag — and to the trip currency when `trip_currency`
+is set, converting to your home currency through the note's stored exchange
+rates. The sidebar shows spent-today, trip budget remaining, and a safe $/day
+for the days left.
+
+## Forecast
+
+Command: **Insert forecast block**
+
+````md
+```finance-forecast
+months: 6
+```
+````
+
+Projects recurring income, minus recurring bills, minus your trailing-90-day
+average discretionary spend, forward N months — including committed goal
+set-asides — as a line chart with a `~$X by <date>` headline. Override any
+input with `income:`, `bills:`, `discretionary:`, `setaside:`, or `start:`.
+
+## Net worth
+
+Command: **Snapshot balances** · **Insert net worth block**
+
+Snapshot balances logs one bullet per account into today's daily note (accounts
+you've snapshotted before are pre-filled):
+
+```md
+- $5,230.00 #log/balance/anz-plus
+- $812.40 #log/balance/wise
+```
+
+The dashboard renders the balance trend from those bullets — no extra files:
+
+````md
+```networth-dashboard
+```
+````
+
+## Query block
+
+Command: **Insert finance query block**
+
+A read-only report over your entries — filter by category, tag, merchant, or
+date range; group by category, merchant, or month; sum or count:
+
+````md
+```finance-query
+period: month        # or start: / end: dates
+category: food       # optional prefix filter
+merchant: nobu       # optional substring filter
+type: spending       # spending | income | all
+group: category      # category | category-full | merchant | month | none
+op: sum              # sum | count
+view: table          # table | categories | bars | income-expense | cumulative
+```
+````
+
+Views: `table` (grouped sums), `categories` (ranked category table with
+percentages), `bars` (ranked bars), `income-expense` (monthly income-vs-expense
+bars), `cumulative` (cumulative balance line).
 
 ## Daily Budget sidebar & status bar
 
@@ -178,6 +391,11 @@ duplicates); unmatched charges can be sent to the capture inbox to log and triag
 - Reconcile bank/Wise CSV against logged spending
 - Open daily budget · Open finance budgets note
 - Add holiday exchange rate · Create savings goal
+- Log due recurring payments · Insert recurring payments block
+- Settle up split expenses · Insert split expenses block
+- Start trip · End trip · Archive finished holidays
+- Snapshot balances · Insert net worth block
+- Insert forecast block · Insert finance query block
 - Export finance transactions to CSV
 
 ## Key settings
@@ -185,7 +403,12 @@ duplicates); unmatched charges can be sent to the capture inbox to log and triag
 `dailyNotesFolder`, `spendingHeading` (`## Finance`), `defaultCurrency`,
 `budgetsFolderPath` / `defaultBudgetNoteName`, `captureInboxFolder`,
 `merchantMapPath`, `autoDrainInbox`, `budgetCheckPeriod`, `weekStartsOn`,
-`activeHolidayBudgetPath`.
+`activeHolidayBudgetPath`, `recurringTagPrefix` (`subscriptions`),
+`autoLogRecurring`, `tripModeActive` / `activeTripGoalPath`.
+
+The daily-note folder and date format are auto-detected from the **Journals**
+community plugin or the core **Daily notes** plugin when present; the manual
+setting is the fallback.
 
 ## Development
 

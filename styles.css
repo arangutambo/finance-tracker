@@ -61,6 +61,10 @@
 
 .finance-tracker-chart-card h4 {
   margin: 0 0 12px 0;
+  font-size: 0.95em;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--text-normal);
 }
 
 .finance-tracker-pie-layout {
@@ -704,3 +708,176 @@
 .finance-edit-chip { font-size: 0.8em; padding: 0.2em 0.55em; }
 .finance-edit-remember { display: block; color: var(--text-muted); font-size: 0.9em; margin: 0.4em 0; }
 .finance-edit-buttons { display: flex; justify-content: space-between; margin-top: 0.75em; }
+
+/* ============================================================
+   0.2.0 — shared dashboard polish
+   Cards align on a 16px rhythm; headings, meta text, and radii
+   are consistent across every block.
+   ============================================================ */
+
+.finance-tracker-dashboard > .finance-tracker-chart-card:last-child {
+  margin-bottom: 0;
+}
+
+.finance-tracker-summary-card {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 64px;
+}
+
+.finance-tracker-summary-value {
+  font-variant-numeric: tabular-nums;
+}
+
+.finance-tracker-summary-card.is-trip {
+  border-left: 3px solid var(--interactive-accent);
+}
+
+/* ---- Nested hue-family legend ---- */
+.finance-tracker-legend-item.is-group .finance-tracker-legend-label {
+  font-weight: 600;
+}
+
+.finance-tracker-legend-item.is-child {
+  padding-left: 22px;
+}
+
+.finance-tracker-legend-item.is-child .finance-tracker-legend-label {
+  font-size: 0.86em;
+  color: var(--text-muted);
+}
+
+.finance-tracker-legend--row {
+  flex-direction: row;
+  gap: 16px;
+  margin-top: 8px;
+}
+
+/* ---- Recurring payments block ---- */
+.finance-tracker-recurring-row .finance-tracker-header-actions {
+  margin-top: 8px;
+}
+
+.finance-tracker-recurring-row.is-overdue {
+  border-left: 3px solid var(--color-red, #c0392b);
+  padding-left: 11px;
+}
+
+/* ---- Forecast headline ---- */
+.finance-tracker-forecast-headline {
+  font-size: 1.35em;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  margin: 0 0 14px;
+}
+
+/* ---- Line charts (forecast, net worth, cumulative) ---- */
+.finance-tracker-line-chart {
+  width: 100%;
+}
+
+.ft-line-svg {
+  width: 100%;
+  height: 160px;
+  display: block;
+}
+
+.ft-line-path {
+  fill: none;
+  stroke: var(--interactive-accent);
+  stroke-width: 2;
+}
+
+.ft-line-area {
+  fill: var(--interactive-accent);
+  opacity: 0.12;
+}
+
+.ft-line-dot {
+  fill: var(--interactive-accent);
+}
+
+.ft-line-zero {
+  stroke: var(--text-muted);
+  stroke-width: 1;
+  stroke-dasharray: 4 3;
+}
+
+.ft-chart-axis-label {
+  fill: var(--text-muted);
+  font-size: 10px;
+}
+
+.finance-tracker-line-axis {
+  display: flex;
+  justify-content: space-between;
+  color: var(--text-muted);
+  font-size: 0.82em;
+  margin-top: 6px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- Query table ---- */
+.finance-tracker-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.finance-tracker-table th,
+.finance-tracker-table td {
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  text-align: left;
+}
+
+.finance-tracker-table th {
+  color: var(--text-muted);
+  font-size: 0.82em;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.finance-tracker-table td.is-numeric,
+.finance-tracker-table th:not(:first-child) {
+  text-align: right;
+}
+
+.finance-tracker-table tfoot td {
+  border-bottom: none;
+  font-weight: 600;
+}
+
+.finance-tracker-table-swatch {
+  display: inline-block;
+  margin-right: 8px;
+  vertical-align: baseline;
+}
+
+/* ---- Ranked bars (query view: bars) ---- */
+.finance-tracker-ranked-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.finance-tracker-ranked-bar-label {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 4px;
+  font-size: 0.92em;
+}
+
+/* ---- Quick add trip banner ---- */
+.finance-quick-add-trip {
+  color: var(--text-muted);
+  font-size: 0.88em;
+  border-left: 3px solid var(--interactive-accent);
+  padding: 4px 8px;
+  margin-bottom: 0.6em;
+  background: var(--background-secondary);
+  border-radius: 0 6px 6px 0;
+}

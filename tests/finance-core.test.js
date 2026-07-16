@@ -678,3 +678,464 @@ test("migrated legacy tags parse identically to before the refactor", () => {
   assert.equal(legacy.holidayKey, "25/japan");
   assert.equal(legacy.category, "food/snacks");
 });
+
+// ---------------------------------------------------------------------------
+// v0.2.0: recurring payments
+// ---------------------------------------------------------------------------
+
+test("addMonths clamps to the end of shorter months", () => {
+  assert.equal(core.addMonths("2026-01-31", 1), "2026-02-28");
+  assert.equal(core.addMonths("2026-03-15", 3), "2026-06-15");
+  assert.equal(core.addMonths("2026-12-05", 1), "2027-01-05");
+});
+
+test("detectRecurringPayments infers amount, cadence, and next due from tags", () => {
+  const content = `
+## Finance
+- [ ] #log/spending 0
+\t- $12.99 #log/spending/subscriptions/monthly/spotify
+\t\t- Spotify
+\t- $18.50 #log/spending/subscriptions/weekly/gym
+\t\t- Anytime Fitness
+\t- $9.20 #log/spending/food/snacks
+`.trim();
+  const entries = core.parseTransactionsFromNoteContent(content, "Daily/2026-06-20.md", {
+    defaultCurrency: "AUD",
+    financeHeading: "## Finance",
+  });
+  const recurring = core.detectRecurringPayments(entries, { prefix: "subscriptions", referenceDate: "2026-07-16" });
+
+  assert.equal(recurring.items.length, 2);
+  const spotify = recurring.items.find((item) => item.name === "spotify");
+  assert.equal(spotify.cadence, "monthly");
+  assert.equal(spotify.lastAmount, 12.99);
+  assert.equal(spotify.nextDue, "2026-07-20");
+  assert.equal(spotify.status, "upcoming");
+  assert.equal(spotify.monthlyCost, 12.99);
+  const gym = recurring.items.find((item) => item.name === "gym");
+  assert.equal(gym.nextDue, "2026-06-27");
+  assert.equal(gym.status, "overdue");
+  assert.equal(gym.monthlyCost, 80.17); // 18.50 * 52/12
+  assert.equal(recurring.totals.monthly, 93.16);
+  assert.equal(recurring.totals.yearly, 1117.88); // per-item rounding: 155.88 + 962
+});
+
+test("detectRecurringPayments uses the latest entry per item and a custom prefix", () => {
+  const mk = (date, amount) => ({ amount, category: "bills/monthly/rent", date, merchant: "Landlord" });
+  const recurring = core.detectRecurringPayments(
+    [mk("2026-05-01", 640), mk("2026-06-01", 660)],
+    { prefix: "bills", referenceDate: "2026-06-15" }
+  );
+  assert.equal(recurring.items.length, 1);
+  assert.equal(recurring.items[0].lastAmount, 660);
+  assert.equal(recurring.items[0].nextDue, "2026-07-01");
+  assert.equal(recurring.items[0].tag, "#log/spending/bills/monthly/rent");
+});
+
+// ---------------------------------------------------------------------------
+// v0.2.0: unified goal schema + sinking funds
+// ---------------------------------------------------------------------------
+
+test("parseGoalDefinition reads the unified schema for a plain goal", () => {
+  const goal = core.parseGoalDefinition({
+    goal_name: "Roadbike",
+    goal_key: "roadbike",
+    target_amount: "3000",
+    starting_balance: "0",
+    due_date: "2026-12-10",
+    active: "true",
+    currency: "AUD",
+  });
+  assert.equal(goal.goalKey, "roadbike");
+  assert.equal(goal.goalType, "general");
+  assert.equal(goal.targetAmount, 3000);
+  assert.equal(goal.dueDate, "2026-12-10");
+  assert.equal(goal.active, true);
+  assert.equal(goal.tripTag, "");
+});
+
+test("parseGoalDefinition treats a goal with trip_tag as a holiday", () => {
+  const goal = core.parseGoalDefinition({
+    goal_name: "Japan Mid-Year",
+    goal_key: "japanmidyear",
+    target_amount: "6000",
+    due_date: "2026-06-18",
+    trip_tag: "26/japanmidyear",
+    start_date: "2026-06-21",
+    end_date: "2026-07-08",
+    total_budget: "6000",
+    currency: "AUD",
+    trip_currency: "JPY",
+  });
+  assert.equal(goal.goalType, "holiday");
+  assert.equal(goal.tripTag, "26/japanmidyear");
+  assert.equal(goal.startDate, "2026-06-21");
+  assert.equal(goal.totalBudget, 6000);
+  assert.equal(goal.tripCurrency, "JPY");
+  assert.equal(goal.savingsDisplayMode, "dual-phase");
+});
+
+test("parseGoalDefinition keeps parsing legacy goal_key/holiday_tag frontmatter", () => {
+  const legacyHoliday = core.parseGoalDefinition({
+    holiday_name: "Japan Mid-Year",
+    holiday_tag: "26/japanmidyear",
+    savings_goal_key: "japanmidyear",
+    savings_goal_amount: "6000",
+    savings_due_date: "2026-06-18",
+    active_savings_goal: "true",
+    start_date: "2026-06-21",
+    total_budget: "6000",
+  });
+  assert.equal(legacyHoliday.goalType, "holiday");
+  assert.equal(legacyHoliday.tripTag, "26/japanmidyear");
+  assert.equal(legacyHoliday.targetAmount, 6000);
+  assert.equal(legacyHoliday.dueDate, "2026-06-18");
+  assert.equal(legacyHoliday.active, true);
+
+  const legacyGoal = core.parseGoalDefinition({
+    goal_name: "New iPhone",
+    goal_key: "iphone",
+    goal_type: "general",
+    target_amount: "2500",
+    due_date: "2026-09-18",
+    active_savings_goal: "false",
+  });
+  assert.equal(legacyGoal.goalKey, "iphone");
+  assert.equal(legacyGoal.targetAmount, 2500);
+  assert.equal(legacyGoal.active, false);
+  assert.equal(core.parseGoalDefinition({ title: "Random note" }), null);
+});
+
+test("computeSinkingFund reports weekly set-aside and pace status", () => {
+  const fund = core.computeSinkingFund({
+    targetAmount: 3000,
+    currentSaved: 1200,
+    dueDate: "2026-12-10",
+    referenceDate: "2026-07-16",
+    anchorDate: "2026-01-01",
+  });
+  assert.equal(fund.remaining, 1800);
+  assert.equal(fund.weeksLeft, 21); // 147 days / 7
+  assert.equal(fund.requiredPerWeek, 85.71);
+  // linear pace by mid-July expects ~57% of 3000 saved; 1200 is behind
+  assert.equal(fund.status, "behind");
+  assert.ok(fund.expectedByNow > 1200);
+
+  const done = core.computeSinkingFund({ targetAmount: 500, currentSaved: 600, dueDate: "2026-12-10", referenceDate: "2026-07-16" });
+  assert.equal(done.status, "complete");
+  assert.equal(done.requiredPerWeek, 0);
+});
+
+// ---------------------------------------------------------------------------
+// v0.2.0: split expenses
+// ---------------------------------------------------------------------------
+
+test("parseOwedChildLine reads hand-editable owed lines and settled markers", () => {
+  const open = core.parseOwedChildLine("owes: Sam $8.00 #log/owed/sam");
+  assert.equal(open.person, "sam");
+  assert.equal(open.displayName, "Sam");
+  assert.equal(open.amount, 8);
+  assert.equal(open.settled, false);
+
+  const settled = core.parseOwedChildLine("owes: Alex $12.50 #log/owed/alex · settled 2026-07-10");
+  assert.equal(settled.settled, true);
+  assert.equal(core.parseOwedChildLine("just a note line"), null);
+});
+
+test("split entries store the full amount but count only my share", () => {
+  const content = `
+## Finance
+- [ ] #log/spending 24
+\t- $24.00 #log/spending/food/restaurants
+\t\t- Nobu
+\t\t- owes: Sam $8.00 #log/owed/sam
+\t\t- owes: Alex $8.00 #log/owed/alex
+`.trim();
+  const entries = core.parseTransactionsFromNoteContent(content, "Daily/2026-07-16.md", {
+    defaultCurrency: "AUD",
+    financeHeading: "## Finance",
+  });
+  assert.equal(entries.length, 1); // owed child lines are not standalone transactions
+  assert.equal(entries[0].amount, 24);
+  assert.equal(entries[0].owedTotal, 16);
+  assert.equal(entries[0].myShare, 8);
+  assert.equal(entries[0].merchant, "Nobu");
+  assert.equal(entries[0].owed.length, 2);
+  assert.equal(core.entrySpendAmount(entries[0]), 8);
+  const grouped = core.groupTransactionsByCategory(entries, "primary");
+  assert.equal(grouped[0].total, 8);
+});
+
+test("parseQuickAddInput extracts split and owed tokens", () => {
+  const even = core.parseQuickAddInput("24 nobu restaurants split=3", ["food/restaurants"]);
+  assert.equal(even.amount, 24);
+  assert.equal(even.splitCount, 3);
+  assert.equal(even.merchant, "nobu");
+
+  const named = core.parseQuickAddInput("30 dinner restaurants owed=Sam:$10 owed=Alex:5", ["food/restaurants"]);
+  assert.equal(named.amount, 30);
+  assert.deepEqual(named.owedTokens, ["Sam:$10", "Alex:5"]);
+});
+
+test("buildOwedSharesFromTokens splits evenly or by explicit shares", () => {
+  const even = core.buildOwedSharesFromTokens(24, 3, []);
+  assert.equal(even.length, 1);
+  assert.equal(even[0].amount, 16); // others owe 2/3 of $24
+  assert.equal(even[0].person, "others");
+
+  const named = core.buildOwedSharesFromTokens(30, null, ["Sam:$10", "Alex:5"]);
+  assert.equal(named.length, 2);
+  assert.equal(named[0].person, "sam");
+  assert.equal(named[0].amount, 10);
+  assert.equal(named[1].amount, 5);
+});
+
+test("buildTransactionBlock writes owed child lines beneath the bullet", () => {
+  const block = core.buildTransactionBlock(
+    { amount: 24, category: "food/restaurants", currency: "AUD", merchant: "Nobu", owed: [{ person: "sam", displayName: "Sam", amount: 8 }] },
+    { defaultCurrency: "AUD" }
+  );
+  assert.equal(block[0], "\t- $24.00 #log/spending/food/restaurants");
+  assert.equal(block[1], "\t\t- Nobu");
+  assert.equal(block[2], "\t\t- owes: Sam $8.00 #log/owed/sam");
+});
+
+test("summarizeSplitBalances sums outstanding balances per person", () => {
+  const entries = [
+    { date: "2026-07-01", merchant: "Nobu", owed: [{ person: "sam", displayName: "Sam", amount: 8, settled: false }] },
+    { date: "2026-07-04", merchant: "Uber", owed: [{ person: "sam", displayName: "Sam", amount: 6, settled: false }, { person: "alex", displayName: "Alex", amount: 6, settled: true }] },
+  ];
+  const summary = core.summarizeSplitBalances(entries);
+  assert.equal(summary.people[0].person, "sam");
+  assert.equal(summary.people[0].outstanding, 14);
+  assert.equal(summary.people.find((p) => p.person === "alex").outstanding, 0);
+  assert.equal(summary.people.find((p) => p.person === "alex").settledTotal, 6);
+  assert.equal(summary.totalOutstanding, 14);
+});
+
+// ---------------------------------------------------------------------------
+// v0.2.0: balance snapshots / net worth
+// ---------------------------------------------------------------------------
+
+test("balance snapshot bullets parse as balance entries and stay out of spend totals", () => {
+  const content = `
+## Finance
+- [ ] #log/spending 5.5
+\t- $5.50 #log/spending/food/snacks
+- $5230.00 #log/balance/anz-plus
+- $812.40 #log/balance/wise
+`.trim();
+  const entries = core.parseTransactionsFromNoteContent(content, "Daily/2026-07-16.md", {
+    defaultCurrency: "AUD",
+    financeHeading: "## Finance",
+  });
+  const balances = entries.filter((entry) => entry.entryType === "balance");
+  assert.equal(balances.length, 2);
+  assert.equal(balances[0].accountKey, "anz-plus");
+  assert.equal(core.isSpendingEntry(balances[0]), false);
+  const total = core.calculateSpendingSectionTotal(content.split("\n").slice(1), "2026-07-16", { defaultCurrency: "AUD" });
+  assert.equal(total, 5.5);
+});
+
+test("summarizeBalanceSnapshots carries balances forward per account", () => {
+  const mk = (date, accountKey, amount) => ({ entryType: "balance", accountKey, amount, date });
+  const summary = core.summarizeBalanceSnapshots([
+    mk("2026-06-01", "anz-plus", 5000),
+    mk("2026-06-01", "wise", 700),
+    mk("2026-07-01", "anz-plus", 5230),
+  ]);
+  assert.equal(summary.series.length, 2);
+  assert.equal(summary.series[0].total, 5700);
+  assert.equal(summary.series[1].total, 5930); // wise carried forward
+  assert.equal(summary.latestTotal, 5930);
+  assert.equal(summary.previousTotal, 5700);
+  assert.equal(summary.accounts[0].key, "anz-plus");
+  assert.equal(core.buildBalanceSnapshotLine("ANZ Plus", 5230), "- $5,230.00 #log/balance/anz-plus");
+});
+
+// ---------------------------------------------------------------------------
+// v0.2.0: forecast
+// ---------------------------------------------------------------------------
+
+test("buildForecastProjection projects the monthly net forward", () => {
+  const projection = core.buildForecastProjection({
+    referenceDate: "2026-07-16",
+    months: 6,
+    startBalance: 1000,
+    monthlyIncome: 4800,
+    monthlyBills: 300,
+    monthlyDiscretionary: 2500,
+    monthlyGoalSetAside: 500,
+  });
+  assert.equal(projection.monthlyNet, 1500);
+  assert.equal(projection.points.length, 7);
+  assert.equal(projection.endDate, "2027-01-16");
+  assert.equal(projection.endBalance, 10000);
+});
+
+test("computeForecastInputs averages the trailing window and skips goal transfers", () => {
+  const entries = [
+    { entryType: "income", isIncome: true, isGoalContribution: true, goalKey: "salary", amount: 3044, date: "2026-07-01", category: "salary" },
+    { entryType: "income", isIncome: true, isGoalContribution: true, goalKey: "roadbike", amount: 500, date: "2026-07-02", category: "roadbike" },
+    { entryType: "spending", amount: 913.2, date: "2026-07-03", category: "food/groceries" },
+    { entryType: "spending", amount: 12.99, date: "2026-07-05", category: "subscriptions/monthly/spotify" },
+  ];
+  const inputs = core.computeForecastInputs(entries, { totals: { monthly: 12.99 } }, {
+    referenceDate: "2026-07-16",
+    windowDays: 30.44,
+    goalKeys: ["roadbike"],
+    recurringPrefix: "subscriptions",
+  });
+  assert.equal(inputs.monthlyIncome, 3044);
+  assert.equal(inputs.monthlyDiscretionary, 913.2);
+  assert.equal(inputs.monthlyBills, 12.99);
+});
+
+// ---------------------------------------------------------------------------
+// v0.2.0: query engine
+// ---------------------------------------------------------------------------
+
+const QUERY_ENTRIES = [
+  { entryType: "spending", amount: 40, myShare: 40, date: "2026-06-03", category: "food/restaurants", merchant: "Nobu", rawLine: "- $40 #log/spending/food/restaurants" },
+  { entryType: "spending", amount: 60, myShare: 60, date: "2026-06-10", category: "food/groceries", merchant: "Woolworths", rawLine: "- $60 #log/spending/food/groceries" },
+  { entryType: "spending", amount: 25, myShare: 25, date: "2026-07-02", category: "transport", merchant: "Uber", rawLine: "- $25 #log/spending/transport" },
+  { entryType: "income", isIncome: true, isGoalContribution: true, goalKey: "salary", amount: 2400, date: "2026-06-30", category: "salary", merchant: "", rawLine: "- $2400 #log/income/salary" },
+];
+
+test("runFinanceQuery filters by category and date range and groups with percentages", () => {
+  const result = core.runFinanceQuery(QUERY_ENTRIES, { category: "food", start: "2026-06-01", end: "2026-06-30", group: "category-full" });
+  assert.equal(result.count, 2);
+  assert.equal(result.total, 100);
+  assert.equal(result.rows[0].key, "food/groceries");
+  assert.equal(result.rows[0].pct, 60);
+
+  const byMerchant = core.runFinanceQuery(QUERY_ENTRIES, { group: "merchant", op: "count" });
+  assert.equal(byMerchant.rows.length, 3);
+
+  const income = core.runFinanceQuery(QUERY_ENTRIES, { type: "income", group: "none" });
+  assert.equal(income.total, 2400);
+});
+
+test("buildMonthlyIncomeExpense and buildCumulativeBalanceSeries", () => {
+  const months = core.buildMonthlyIncomeExpense(QUERY_ENTRIES);
+  assert.equal(months.length, 2);
+  assert.equal(months[0].month, "2026-06");
+  assert.equal(months[0].income, 2400);
+  assert.equal(months[0].expense, 100);
+  assert.equal(months[0].net, 2300);
+
+  const series = core.buildCumulativeBalanceSeries(QUERY_ENTRIES);
+  assert.equal(series[series.length - 1].balance, 2275); // 2400 - 125
+});
+
+// ---------------------------------------------------------------------------
+// v0.2.0: hierarchical colour system
+// ---------------------------------------------------------------------------
+
+test("buildHierarchicalCategoryGroups ranks majors and shades subgroups from one hue", () => {
+  const entries = [
+    { amount: 90, myShare: 90, category: "food/groceries" },
+    { amount: 40, myShare: 40, category: "food/restaurants" },
+    { amount: 30, myShare: 30, category: "transport" },
+  ];
+  const hierarchy = core.buildHierarchicalCategoryGroups(entries, "full");
+  assert.equal(hierarchy.groups[0].key, "food");
+  assert.equal(hierarchy.groups[0].total, 130);
+  assert.equal(hierarchy.groups[0].children[0].key, "food/groceries");
+  assert.equal(hierarchy.groups[1].key, "transport");
+  // both food shades share the food hue, distinct from the transport hue
+  const hue = (color) => color.match(/hsl\((\d+)/)[1];
+  assert.equal(hue(hierarchy.groups[0].children[0].color), hue(hierarchy.groups[0].children[1].color));
+  assert.notEqual(hue(hierarchy.groups[0].color), hue(hierarchy.groups[1].color));
+  assert.notEqual(hierarchy.groups[0].children[0].color, hierarchy.groups[0].children[1].color);
+  assert.equal(hierarchy.slices.length, 3);
+});
+
+// ---------------------------------------------------------------------------
+// v0.2.0: daily-note name helpers
+// ---------------------------------------------------------------------------
+
+test("formatDailyNoteName and parseDailyNoteName round-trip supported formats", () => {
+  assert.equal(core.formatDailyNoteName("2026-07-16", "YYYY-MM-DD"), "2026-07-16");
+  assert.equal(core.formatDailyNoteName("2026-07-16", "DD-MM-YYYY"), "16-07-2026");
+  assert.equal(core.formatDailyNoteName("2026-07-16", "MMM D, YYYY"), null); // unsupported token
+  assert.equal(core.parseDailyNoteName("16-07-2026.md", "DD-MM-YYYY"), "2026-07-16");
+  assert.equal(core.parseDailyNoteName("2026-07-16.md", "YYYY-MM-DD"), "2026-07-16");
+  assert.equal(core.parseDailyNoteName("2026-07-16.md", "DD-MM-YYYY"), "2026-07-16"); // ISO fallback
+});
+
+test("owed child lines attach only to their own parent entry", () => {
+  const content = `
+## Finance
+- [ ] #log/spending 79
+\t- $12.00 #log/spending/26/japan/recreation
+\t\t- Senso-ji
+\t- $4.10 #log/spending/uncategorized
+\t\t- TFL TRAVEL CH
+\t- $44.00 #log/spending/26/japan/food
+\t\t- Izakaya dinner with Sam
+\t\t- owes: Sam $22.00 #log/owed/sam
+`.trim();
+  const entries = core.parseTransactionsFromNoteContent(content, "Daily/2026-07-16.md", {
+    defaultCurrency: "AUD",
+    financeHeading: "## Finance",
+  });
+  assert.equal(entries.length, 3);
+  assert.equal(entries[0].owed.length, 0);
+  assert.equal(entries[0].myShare, 12);
+  assert.equal(entries[0].merchant, "Senso-ji");
+  assert.equal(entries[1].owed.length, 0);
+  assert.equal(entries[1].merchant, "TFL TRAVEL CH");
+  assert.equal(entries[2].owed.length, 1);
+  assert.equal(entries[2].myShare, 22);
+  const summary = core.summarizeSplitBalances(entries);
+  assert.equal(summary.totalOutstanding, 22);
+});
+
+// ---------------------------------------------------------------------------
+// v0.2.0: goal archiving
+// ---------------------------------------------------------------------------
+
+test("parseGoalDefinition treats archived goals as inactive", () => {
+  const goal = core.parseGoalDefinition({
+    goal_name: "Japan Trip",
+    goal_key: "japan",
+    target_amount: "3500",
+    due_date: "2026-07-10",
+    trip_tag: "26/japan",
+    active: "true",
+    archived: "2026-07-25",
+  });
+  assert.equal(goal.archivedDate, "2026-07-25");
+  assert.equal(goal.active, false); // archived overrides active: true
+  const live = core.parseGoalDefinition({ goal_key: "japan", target_amount: "3500", active: "true" });
+  assert.equal(live.archivedDate, "");
+  assert.equal(live.active, true);
+});
+
+test("buildGoalArchiveSummaryLines freezes savings steps and trip spending", () => {
+  const goal = {
+    currency: "AUD",
+    endDate: "2026-07-24",
+    goalKey: "japan",
+    startingBalance: 500,
+    targetAmount: 3500,
+    totalBudget: 3500,
+    tripTag: "26/japan",
+  };
+  const entries = [
+    { entryType: "income", isIncome: true, isGoalContribution: true, goalKey: "japan", amount: 1500, date: "2026-05-01", merchant: "Savings transfer" },
+    { entryType: "income", isIncome: true, isGoalContribution: true, goalKey: "japan", amount: 1500, date: "2026-06-01", merchant: "Savings transfer" },
+    { entryType: "holiday-spending", holidayKey: "26/japan", amount: 88, myShare: 88, date: "2026-07-14", category: "accommodation", isGoalWithdrawal: true },
+    { entryType: "holiday-spending", holidayKey: "26/japan", amount: 40, myShare: 40, date: "2026-07-26", category: "food", isGoalWithdrawal: true },
+  ];
+  const lines = core.buildGoalArchiveSummaryLines(goal, entries, "2026-07-25");
+  const text = lines.join("\n");
+  assert.match(text, /^## Archive summary \(2026-07-25\)/);
+  assert.match(text, /Saved: \$3,500\.00 \(100% of target\)/);
+  assert.match(text, /### Savings steps/);
+  assert.match(text, /\| 2026-05-01 \| \$1,500\.00 \| Savings transfer \|/);
+  assert.match(text, /Spent during the trip: \$88\.00 across 1 entry/);
+  assert.match(text, /Spent after 2026-07-24: \$40\.00 across 1 entry/);
+  assert.match(text, /\| Accommodation \| \$88\.00 \| 1 \|/);
+});

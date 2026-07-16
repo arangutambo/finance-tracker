@@ -380,6 +380,36 @@ function extractFinanceTagContext(line) {
       };
     }
 
+    if (parts[1] === "owed" && parts[2]) {
+      return {
+        category: "uncategorized",
+        entryType: "owed",
+        goalKey: "",
+        holidayKey: "",
+        isGoalContribution: false,
+        isGoalWithdrawal: false,
+        isIncome: false,
+        isPlannedExpense: false,
+        person: normalizeCategoryPath(parts.slice(2).join("/")),
+        plannedCategory: "",
+      };
+    }
+
+    if (parts[1] === "balance" && parts[2]) {
+      return {
+        accountKey: normalizeCategoryPath(parts.slice(2).join("/")),
+        category: "balance",
+        entryType: "balance",
+        goalKey: "",
+        holidayKey: "",
+        isGoalContribution: false,
+        isGoalWithdrawal: false,
+        isIncome: false,
+        isPlannedExpense: false,
+        plannedCategory: "",
+      };
+    }
+
     if (parts[1] === "spending") {
       if (parts[2] === "goal" && parts[3]) {
         return {
@@ -527,6 +557,7 @@ function parseTransactionLine(line, noteDate, filePath, options = {}, childLines
   if (!Number.isFinite(amount)) return null;
 
   const financeContext = extractFinanceTagContext(text);
+  if (financeContext.entryType === "owed") return null;
   const holidayContext = financeContext.holidayKey
     ? parseHolidayTagContext(`${financeContext.holidayKey}/${financeContext.isPlannedExpense ? `planned/${financeContext.category}` : financeContext.category}`)
     : parseHolidayTagContext(financeContext.category);
@@ -537,14 +568,27 @@ function parseTransactionLine(line, noteDate, filePath, options = {}, childLines
   const originalSide = visibleSection.includes(":") ? visibleSection.split(":")[0].trim() : "";
   const originalAmount = extractVisibleAmount(`- ${originalSide}`);
   const originalDescriptor = parseCurrencyDescriptor(originalSide, currency);
-  const merchant = normalizeWhitespace(childLines[0] || "");
-  const note = normalizeWhitespace(childLines.slice(1).join(" | "));
-  const plannedLogMeta = extractPlannedLogMetadata(childLines);
+  const owed = [];
+  const plainChildLines = [];
+  for (const child of childLines) {
+    const owedItem = parseOwedChildLine(child);
+    if (owedItem) {
+      owed.push(owedItem);
+    } else {
+      plainChildLines.push(child);
+    }
+  }
+  const owedTotal = roundCurrencyAmount(owed.reduce((sum, item) => sum + Number(item.amount || 0), 0));
+  const merchant = normalizeWhitespace(plainChildLines[0] || "");
+  const note = normalizeWhitespace(plainChildLines.slice(1).join(" | "));
+  const plannedLogMeta = extractPlannedLogMetadata(plainChildLines);
   const plannedLineDates = holidayContext.isPlannedExpense ? extractPlannedLineDates(text) : { startDate: "", endDate: "" };
   const transactionDate = noteDate || extractNoteDate("", filePath);
 
+  const roundedAmount = Number(Number(amount).toFixed(2));
   return {
-    amount: Number(Number(amount).toFixed(2)),
+    accountKey: financeContext.accountKey || "",
+    amount: roundedAmount,
     card: "",
     category,
     categoryDisplay: displayCategoryPath(category),
@@ -568,9 +612,12 @@ function parseTransactionLine(line, noteDate, filePath, options = {}, childLines
     holidayYear: holidayContext.holidayYear,
     merchant,
     name: merchant,
+    myShare: roundCurrencyAmount(Math.max(roundedAmount - owedTotal, 0)),
     originalAmount: Number.isFinite(originalAmount) ? Number(Number(originalAmount).toFixed(2)) : null,
     originalCurrency: originalSide ? originalDescriptor.currency : "",
     originalRateKey: originalSide ? originalDescriptor.rateKey : "",
+    owed,
+    owedTotal,
     note,
     rawLine: text,
     source: "",
@@ -611,7 +658,7 @@ function getRemainingTripDaysInclusive(start, end, reference) {
 
 function parseTransactionsFromNoteContent(content, filePath, options = {}) {
   const lines = splitLines(content);
-  const noteDate = extractNoteDate(content, filePath);
+  const noteDate = extractNoteDate(content, filePath) || parseIsoDate(options.noteDate || "") || null;
   const transactions = [];
   let inFinanceSection = false;
   const candidateHeadings = new Set(
@@ -634,14 +681,16 @@ function parseTransactionsFromNoteContent(content, filePath, options = {}) {
     if (!inFinanceSection) continue;
     if ((/^\t- /.test(line) || /^\s{2,}- /.test(line)) && !/#log\//i.test(line)) continue;
 
+    const parentIndent = (line.match(/^\s*/) || [""])[0].length;
     const childLines = [];
     for (let childIndex = index + 1; childIndex < lines.length; childIndex += 1) {
       const childLine = lines[childIndex];
-      if (/^\t- /.test(childLine) || /^\s{2,}- /.test(childLine)) {
+      if (!childLine.trim()) continue;
+      const childIndent = (childLine.match(/^\s*/) || [""])[0].length;
+      if (/^\s*-\s/.test(childLine) && childIndent > parentIndent) {
         childLines.push(childLine.replace(/^\s*-\s*/, "").trim());
         continue;
       }
-      if (!childLine.trim()) continue;
       break;
     }
 
@@ -658,7 +707,7 @@ function calculateSpendingSectionTotal(sectionLines, noteDate, options = {}) {
   return Number(
     sectionLines
       .map((line) => parseTransactionLine(line, noteDate, "", options))
-      .filter((entry) => entry && !entry.isIncome && !entry.isGoalContribution)
+      .filter((entry) => entry && !entry.isIncome && !entry.isGoalContribution && entry.entryType !== "balance")
       .reduce((sum, entry) => sum + entry.amount, 0)
       .toFixed(2)
   );
@@ -693,6 +742,10 @@ function buildTransactionBlock(expense, settings = {}) {
 
   if (note) {
     lines.push(`\t\t- ${note}`);
+  }
+
+  for (const owedItem of expense.owed || []) {
+    lines.push(`\t\t- ${buildOwedChildLine(owedItem.person, owedItem.amount, owedItem.displayName)}`);
   }
 
   return lines;
@@ -862,7 +915,7 @@ function groupTransactionsByCategory(entries, groupBy = "primary") {
       total: 0,
       count: 0,
     };
-    current.total += Number(entry.amount || 0);
+    current.total += entrySpendAmount(entry);
     current.count += 1;
     grouped.set(key, current);
   }
@@ -1154,6 +1207,7 @@ const INBOX_ALIASES = {
   card: "card", pass: "card",
   id: "externalid", ref: "externalid", reference: "externalid", wiseid: "externalid", txnid: "externalid",
   transaction: "transaction",
+  split: "split", owed: "owed",
 };
 
 function normalizeInboxParams(params) {
@@ -1262,6 +1316,18 @@ function parseQuickAddInput(text, knownCategories = []) {
     return pre;
   });
 
+  let splitCount = null;
+  working = working.replace(/(^|\s)split=(\d+)(?=\s|$)/i, (_match, pre, count) => {
+    splitCount = Number(count);
+    return pre;
+  });
+
+  const owedTokens = [];
+  working = working.replace(/(^|\s)owed=(\S+)/gi, (_match, pre, token) => {
+    owedTokens.push(token);
+    return pre;
+  });
+
   let category = "";
   const tagMatch = working.match(/(^|\s)#(\S+)/);
   if (tagMatch) {
@@ -1310,6 +1376,8 @@ function parseQuickAddInput(text, knownCategories = []) {
     category: normalizedCategory,
     dateToken,
     merchant: normalizeWhitespace(working),
+    owedTokens,
+    splitCount,
   };
 }
 
@@ -1624,7 +1692,716 @@ function removeTransactionBlock(content, oldRawLine, settings = {}) {
   return recomputeSpendingTotals(lines.join("\n"), settings);
 }
 
+// ---------------------------------------------------------------------------
+// v0.2.0 core additions: recurring payments, unified goals, split expenses,
+// balance snapshots / net worth, forecasting, the finance-query engine, the
+// hierarchical hue-family colour system, and daily-note format helpers.
+// ---------------------------------------------------------------------------
+
+const RECURRING_CADENCES = {
+  weekly: { days: 7, perMonth: 52 / 12, label: "Weekly" },
+  fortnightly: { days: 14, perMonth: 26 / 12, label: "Fortnightly" },
+  monthly: { months: 1, perMonth: 1, label: "Monthly" },
+  quarterly: { months: 3, perMonth: 1 / 3, label: "Quarterly" },
+  yearly: { months: 12, perMonth: 1 / 12, label: "Yearly" },
+};
+
+function normalizeCadence(value) {
+  const token = String(value || "").toLowerCase().trim();
+  const aliases = {
+    week: "weekly", weekly: "weekly",
+    fortnight: "fortnightly", fortnightly: "fortnightly", biweekly: "fortnightly",
+    month: "monthly", monthly: "monthly",
+    quarter: "quarterly", quarterly: "quarterly",
+    year: "yearly", yearly: "yearly", annual: "yearly", annually: "yearly",
+  };
+  return aliases[token] || "";
+}
+
+// Adds calendar months, clamping to the end of shorter months (Jan 31 + 1mo = Feb 28).
+function addMonths(iso, count) {
+  const date = isoToDate(iso);
+  if (!date) return null;
+  const day = date.getDate();
+  const target = new Date(date.getFullYear(), date.getMonth() + count, 1);
+  const lastDay = new Date(target.getFullYear(), target.getMonth() + 1, 0).getDate();
+  target.setDate(Math.min(day, lastDay));
+  return todayIsoLocal(target);
+}
+
+function nextRecurringDate(lastDate, cadence) {
+  const iso = parseIsoDate(lastDate);
+  const spec = RECURRING_CADENCES[normalizeCadence(cadence)];
+  if (!iso || !spec) return null;
+  return spec.days ? addDays(iso, spec.days) : addMonths(iso, spec.months);
+}
+
+// Detects recurring payments from tags like #log/spending/subscriptions/monthly/spotify.
+// The segment after the prefix is the cadence; the rest names the item. Each
+// item's amount is inferred from its last logged entry and next-due from
+// last-logged-date + cadence.
+function detectRecurringPayments(entries, options = {}) {
+  const prefix = normalizeCategoryPath(options.prefix || "subscriptions") || "subscriptions";
+  const referenceDate = parseIsoDate(options.referenceDate) || todayIsoLocal();
+  const items = new Map();
+
+  for (const entry of entries || []) {
+    if (!entry || entry.isIncome || entry.isGoalContribution || isPlannedExpenseEntry(entry)) continue;
+    const category = normalizeCategoryPath(entry.category || "");
+    if (category !== prefix && !category.startsWith(`${prefix}/`)) continue;
+    const rest = category.slice(prefix.length).split("/").filter(Boolean);
+    const cadence = normalizeCadence(rest[0]);
+    if (!cadence) continue;
+    const rawCadence = rest[0];
+    const name = rest.slice(1).join("/") || normalizeCategoryPath(entry.merchant || "") || "recurring";
+    const key = `${cadence}/${name}`;
+    const date = parseIsoDate(entry.date) || "";
+    const current = items.get(key);
+    if (!current || date >= current.lastDate) {
+      items.set(key, {
+        cadence,
+        rawCadence,
+        name,
+        label: titleCaseSegment(name.split("/").pop()),
+        merchant: normalizeWhitespace(entry.merchant || "") || titleCaseSegment(name.split("/").pop()),
+        category,
+        currency: entry.currency || "",
+        lastAmount: roundCurrencyAmount(entry.amount || 0),
+        lastDate: date,
+        count: (current ? current.count : 0) + 1,
+      });
+    } else {
+      current.count += 1;
+    }
+  }
+
+  const rows = Array.from(items.values()).map((item) => {
+    const spec = RECURRING_CADENCES[item.cadence];
+    const nextDue = item.lastDate ? nextRecurringDate(item.lastDate, item.cadence) : null;
+    const status = !nextDue
+      ? "unknown"
+      : nextDue < referenceDate
+        ? "overdue"
+        : nextDue === referenceDate
+          ? "due"
+          : "upcoming";
+    return {
+      ...item,
+      monthlyCost: roundCurrencyAmount(item.lastAmount * spec.perMonth),
+      yearlyCost: roundCurrencyAmount(item.lastAmount * spec.perMonth * 12),
+      nextDue,
+      status,
+      daysUntilDue: nextDue ? (nextDue >= referenceDate ? daysBetweenInclusive(referenceDate, nextDue) - 1 : -(daysBetweenInclusive(nextDue, referenceDate) - 1)) : null,
+      tag: `#log/spending/${item.category}`,
+    };
+  });
+
+  const statusRank = { overdue: 0, due: 1, upcoming: 2, unknown: 3 };
+  rows.sort((left, right) => {
+    if (statusRank[left.status] !== statusRank[right.status]) return statusRank[left.status] - statusRank[right.status];
+    return String(left.nextDue || "").localeCompare(String(right.nextDue || ""));
+  });
+
+  return {
+    items: rows,
+    totals: {
+      monthly: roundCurrencyAmount(rows.reduce((sum, row) => sum + row.monthlyCost, 0)),
+      yearly: roundCurrencyAmount(rows.reduce((sum, row) => sum + row.yearlyCost, 0)),
+    },
+  };
+}
+
+// --- Unified goal schema -----------------------------------------------------
+// One frontmatter format for savings goals and trips: any goal with
+// target_amount + due_date gets sinking-fund math; a holiday is simply a goal
+// that also carries trip_tag, start/end dates, and a currency. The legacy
+// goal_key / holiday_tag keys keep parsing so un-migrated notes still render.
+function parseGoalDefinition(frontmatter, options = {}) {
+  const fm = frontmatter || {};
+  const fallbackCurrency = options.defaultCurrency || "AUD";
+  const tripTag = normalizeHolidayKey(fm.trip_tag || fm.holiday_tag || fm.holiday || "");
+  const goalName = normalizeWhitespace(fm.goal_name || fm.holiday_name || fm.name || options.fallbackName || "");
+  const goalKey = normalizeCategoryPath(
+    fm.goal_key || fm.savings_goal_key || (tripTag ? tripTag.split("/")[1] : "") || goalName
+  );
+  const targetAmount = parseNumber(fm.target_amount ?? fm.savings_goal_amount ?? fm.total_budget);
+  const dueDate = parseIsoDate(fm.due_date || fm.savings_due_date || fm.goal_due_date || (tripTag ? fm.start_date : "") || "");
+  const hasGoalKeys =
+    "goal_key" in fm || "savings_goal_key" in fm || "target_amount" in fm ||
+    "savings_goal_amount" in fm || tripTag;
+  if (!hasGoalKeys || !goalKey) return null;
+
+  const isTrip = Boolean(tripTag);
+  const archivedDate = parseIsoDate(fm.archived || "");
+  return {
+    active: !archivedDate && /^(?:true|yes|1)$/i.test(String(fm.active ?? fm.active_savings_goal ?? "false")),
+    archivedDate: archivedDate || "",
+    carryMissedSavings: /^(?:true|yes|1)$/i.test(String(fm.carry_missed_savings || "false")),
+    currency: normalizeCurrency(fm.currency || fallbackCurrency, fallbackCurrency),
+    dueDate: dueDate || "",
+    endDate: parseIsoDate(fm.end_date || fm.end || fm.return_date || ""),
+    goalKey,
+    goalName: goalName || titleCaseSegment(goalKey),
+    goalType: isTrip ? "holiday" : String(fm.goal_type || "general").trim().toLowerCase(),
+    savingsDisplayMode: String(fm.savings_display_mode || (isTrip ? "dual-phase" : "standard")).trim().toLowerCase(),
+    savingsProgressMode: String(fm.savings_progress_mode || (isTrip ? "account-plus-paid-planned" : "account-only")).trim().toLowerCase(),
+    startDate: parseIsoDate(fm.start_date || fm.start || fm.departure_date || ""),
+    startingBalance: parseNumber(fm.starting_balance ?? fm.savings_starting_balance ?? "0") || 0,
+    targetAmount: Number.isFinite(targetAmount) ? roundCurrencyAmount(targetAmount) : 0,
+    totalBudget: roundCurrencyAmount(parseNumber(fm.total_budget || fm.budget || "") || targetAmount || 0),
+    tripCurrency: normalizeCurrency(fm.trip_currency || "", ""),
+    tripTag,
+  };
+}
+
+// Sinking-fund math: what has to be set aside each week between now and the
+// due date, and whether saving is ahead of or behind the linear pace line.
+function computeSinkingFund(input = {}) {
+  const targetAmount = roundCurrencyAmount(input.targetAmount || 0);
+  const currentSaved = roundCurrencyAmount(input.currentSaved || 0);
+  const dueDate = parseIsoDate(input.dueDate || "");
+  const referenceDate = parseIsoDate(input.referenceDate || "") || todayIsoLocal();
+  const anchorDate = parseIsoDate(input.anchorDate || "");
+  const remaining = Math.max(roundCurrencyAmount(targetAmount - currentSaved), 0);
+
+  const daysLeft = dueDate && dueDate >= referenceDate ? daysBetweenInclusive(referenceDate, dueDate) - 1 : 0;
+  const weeksLeft = daysLeft > 0 ? Math.max(1, Math.ceil(daysLeft / 7)) : 0;
+  const requiredPerWeek = remaining <= 0 ? 0 : weeksLeft > 0 ? roundCurrencyAmount(remaining / weeksLeft) : remaining;
+
+  let expectedByNow = null;
+  let status = remaining <= 0 ? "complete" : dueDate && dueDate < referenceDate ? "overdue" : "on-track";
+  if (remaining > 0 && anchorDate && dueDate && dueDate > anchorDate && referenceDate >= anchorDate) {
+    const totalSpan = daysBetweenInclusive(anchorDate, dueDate) - 1;
+    const elapsed = Math.min(daysBetweenInclusive(anchorDate, referenceDate) - 1, totalSpan);
+    expectedByNow = roundCurrencyAmount((targetAmount * elapsed) / Math.max(totalSpan, 1));
+    status = currentSaved >= expectedByNow ? "ahead" : "behind";
+  }
+
+  return { currentSaved, daysLeft, expectedByNow, remaining, requiredPerWeek, status, targetAmount, weeksLeft };
+}
+
+// --- Split expenses ----------------------------------------------------------
+
+// Parses a hand-editable owed child line like "owes: Sam $8 #log/owed/sam".
+// A line is settled once it carries the word "settled" anywhere after the tag.
+function parseOwedChildLine(text) {
+  const line = String(text || "");
+  const tagMatch = line.match(/#log\/owed\/([^\s#\]]+)/i);
+  if (!tagMatch) return null;
+  const person = normalizeCategoryPath(tagMatch[1]);
+  if (!person) return null;
+  const amount = extractVisibleAmount(`- ${stripFirstTag(line)}`);
+  const nameMatch = line.match(/owes?:?\s+([^$#\d]+)/i);
+  return {
+    amount: Number.isFinite(amount) ? roundCurrencyAmount(amount) : 0,
+    displayName: normalizeWhitespace(nameMatch ? nameMatch[1] : "") || titleCaseSegment(person),
+    person,
+    rawLine: line,
+    settled: /\bsettled\b/i.test(line.slice(line.indexOf(tagMatch[0]))),
+  };
+}
+
+function buildOwedChildLine(person, amount, displayName = "") {
+  const slug = normalizeCategoryPath(person) || "someone";
+  const label = normalizeWhitespace(displayName) || titleCaseSegment(slug);
+  return `owes: ${label} ${formatCurrency(amount)} #log/owed/${slug}`;
+}
+
+// Expands quick-add / capture split tokens into owed shares. split=N is an even
+// split where my share is amount / N; owed=Name:$X assigns an explicit share.
+function buildOwedSharesFromTokens(amount, splitCount, owedTokens = []) {
+  const owed = [];
+  for (const token of owedTokens || []) {
+    const match = String(token || "").match(/^([^:=]+)[:=]\s*\$?([\d,]+(?:\.\d+)?)$/);
+    if (!match) continue;
+    const share = parseNumber(match[2]);
+    if (!Number.isFinite(share) || share <= 0) continue;
+    owed.push({ person: normalizeCategoryPath(match[1]) || "someone", displayName: normalizeWhitespace(match[1]), amount: roundCurrencyAmount(share) });
+  }
+  const count = Number(splitCount);
+  if (Number.isFinite(count) && count >= 2 && Number.isFinite(amount) && !owed.length) {
+    owed.push({
+      person: "others",
+      displayName: "Others",
+      amount: roundCurrencyAmount((Number(amount) * (count - 1)) / count),
+    });
+  }
+  return owed;
+}
+
+// Outstanding split balances per person, from entries carrying owed child lines.
+function summarizeSplitBalances(entries) {
+  const people = new Map();
+  for (const entry of entries || []) {
+    for (const owed of entry?.owed || []) {
+      const key = owed.person;
+      if (!key) continue;
+      const current = people.get(key) || {
+        person: key,
+        displayName: owed.displayName || titleCaseSegment(key),
+        outstanding: 0,
+        settledTotal: 0,
+        entries: [],
+      };
+      if (owed.settled) {
+        current.settledTotal = roundCurrencyAmount(current.settledTotal + owed.amount);
+      } else {
+        current.outstanding = roundCurrencyAmount(current.outstanding + owed.amount);
+      }
+      current.entries.push({
+        amount: owed.amount,
+        date: entry.date || "",
+        filePath: entry.filePath || "",
+        merchant: entry.merchant || "",
+        settled: Boolean(owed.settled),
+      });
+      people.set(key, current);
+    }
+  }
+  const rows = Array.from(people.values()).sort((left, right) => right.outstanding - left.outstanding);
+  return {
+    people: rows,
+    totalOutstanding: roundCurrencyAmount(rows.reduce((sum, row) => sum + row.outstanding, 0)),
+  };
+}
+
+// The amount that counts toward budgets: the full bullet amount minus what
+// others owe on it (my share of a split).
+function entrySpendAmount(entry) {
+  if (!entry) return 0;
+  if (Number.isFinite(entry.myShare)) return Number(entry.myShare);
+  return Number(entry.amount || 0);
+}
+
+// One place to decide "does this entry count as my spending".
+function isSpendingEntry(entry) {
+  if (!entry) return false;
+  return (
+    !entry.isIncome &&
+    !entry.isGoalContribution &&
+    !isPlannedExpenseEntry(entry) &&
+    entry.entryType !== "goal-withdrawal" &&
+    entry.entryType !== "balance"
+  );
+}
+
+// --- Balance snapshots / net worth --------------------------------------------
+
+function buildBalanceSnapshotLine(account, amount) {
+  const slug = normalizeCategoryPath(account) || "account";
+  return `- ${formatCurrency(amount)} #log/balance/${slug}`;
+}
+
+// Aggregates #log/balance/<account> bullets into per-account histories and a
+// net-worth series (each account carries its last-known balance forward).
+function summarizeBalanceSnapshots(entries) {
+  const snapshots = (entries || [])
+    .filter((entry) => entry?.entryType === "balance" && entry.accountKey && parseIsoDate(entry.date))
+    .sort((left, right) => String(left.date).localeCompare(String(right.date)));
+
+  const accounts = new Map();
+  for (const entry of snapshots) {
+    const key = entry.accountKey;
+    const current = accounts.get(key) || { key, label: titleCaseSegment(key.split("/").pop()), history: [] };
+    const amount = roundCurrencyAmount(entry.amount || 0);
+    const existing = current.history.find((point) => point.date === entry.date);
+    if (existing) {
+      existing.amount = amount;
+    } else {
+      current.history.push({ date: entry.date, amount });
+    }
+    accounts.set(key, current);
+  }
+
+  const dates = Array.from(new Set(snapshots.map((entry) => entry.date))).sort();
+  const lastKnown = new Map();
+  const series = dates.map((date) => {
+    for (const account of accounts.values()) {
+      const point = account.history.find((item) => item.date === date);
+      if (point) lastKnown.set(account.key, point.amount);
+    }
+    let total = 0;
+    for (const amount of lastKnown.values()) total += amount;
+    return { date, total: roundCurrencyAmount(total) };
+  });
+
+  const rows = Array.from(accounts.values()).map((account) => ({
+    ...account,
+    latest: account.history[account.history.length - 1] || null,
+  })).sort((left, right) => (right.latest?.amount || 0) - (left.latest?.amount || 0));
+
+  return {
+    accounts: rows,
+    series,
+    latestTotal: series.length ? series[series.length - 1].total : 0,
+    previousTotal: series.length > 1 ? series[series.length - 2].total : null,
+  };
+}
+
+// --- Forecast ------------------------------------------------------------------
+
+// Derives forecast inputs from history: recurring bills come straight from the
+// recurring detector; income and non-recurring (discretionary) spend are the
+// trailing-window averages scaled to a 30.44-day month.
+function computeForecastInputs(entries, recurring, options = {}) {
+  const referenceDate = parseIsoDate(options.referenceDate) || todayIsoLocal();
+  const windowDays = Number(options.windowDays) > 0 ? Number(options.windowDays) : 90;
+  const windowStart = addDays(referenceDate, -(windowDays - 1));
+  const goalKeys = new Set((options.goalKeys || []).map((key) => normalizeCategoryPath(key)).filter(Boolean));
+  const recurringPrefix = normalizeCategoryPath(options.recurringPrefix || "subscriptions") || "subscriptions";
+  const inWindow = (entry) => {
+    const date = parseIsoDate(entry.date);
+    return date && date >= windowStart && date <= referenceDate;
+  };
+
+  let incomeTotal = 0;
+  let discretionaryTotal = 0;
+  for (const entry of entries || []) {
+    if (!inWindow(entry)) continue;
+    if (entry.entryType === "income") {
+      if (goalKeys.has(entry.goalKey)) continue; // goal transfers are not new income
+      incomeTotal += Number(entry.amount || 0);
+      continue;
+    }
+    if (!isSpendingEntry(entry)) continue;
+    const category = normalizeCategoryPath(entry.category || "");
+    if (category === recurringPrefix || category.startsWith(`${recurringPrefix}/`)) continue;
+    discretionaryTotal += entrySpendAmount(entry);
+  }
+
+  const scale = 30.44 / windowDays;
+  return {
+    monthlyBills: roundCurrencyAmount(recurring?.totals?.monthly || 0),
+    monthlyDiscretionary: roundCurrencyAmount(discretionaryTotal * scale),
+    monthlyIncome: roundCurrencyAmount(incomeTotal * scale),
+    referenceDate,
+    windowDays,
+    windowStart,
+  };
+}
+
+// Projects the monthly net (income - bills - discretionary - goal set-asides)
+// forward, returning the points for a line chart and a "~$X by <date>" headline.
+function buildForecastProjection(input = {}) {
+  const referenceDate = parseIsoDate(input.referenceDate) || todayIsoLocal();
+  const months = Math.max(1, Math.min(Number(input.months) || 6, 60));
+  const startBalance = roundCurrencyAmount(input.startBalance || 0);
+  const monthlyNet = roundCurrencyAmount(
+    Number(input.monthlyIncome || 0) -
+    Number(input.monthlyBills || 0) -
+    Number(input.monthlyDiscretionary || 0) -
+    Number(input.monthlyGoalSetAside || 0)
+  );
+
+  const points = [{ date: referenceDate, balance: startBalance }];
+  for (let index = 1; index <= months; index += 1) {
+    points.push({
+      date: addMonths(referenceDate, index),
+      balance: roundCurrencyAmount(startBalance + monthlyNet * index),
+    });
+  }
+
+  return {
+    endBalance: points[points.length - 1].balance,
+    endDate: points[points.length - 1].date,
+    monthlyNet,
+    months,
+    points,
+  };
+}
+
+// --- Query engine ---------------------------------------------------------------
+
+// Read-only query over parsed entries: filter by category / tag / merchant /
+// date range, group by category, merchant, or month, sum or count.
+function runFinanceQuery(entries, config = {}) {
+  const start = parseIsoDate(config.start || "") || "1900-01-01";
+  const end = parseIsoDate(config.end || "") || "2999-12-31";
+  const categoryFilter = normalizeCategoryPath(config.category || "");
+  const tagFilter = String(config.tag || "").replace(/^#/, "").toLowerCase();
+  const merchantFilter = normalizeMerchant(config.merchant || "");
+  const type = String(config.type || "spending").toLowerCase();
+  const groupBy = String(config.group || config.groupby || "category").toLowerCase();
+  const op = String(config.op || "sum").toLowerCase();
+
+  const filtered = (entries || []).filter((entry) => {
+    const date = parseIsoDate(entry.date);
+    if (!date || date < start || date > end) return false;
+    if (type === "income" && entry.entryType !== "income") return false;
+    if (type === "spending" && !isSpendingEntry(entry)) return false;
+    if (type === "all" && entry.entryType === "balance") return false;
+    if (categoryFilter) {
+      const category = normalizeCategoryPath(entry.category || "");
+      if (category !== categoryFilter && !category.startsWith(`${categoryFilter}/`)) return false;
+    }
+    if (tagFilter && !String(entry.rawLine || "").toLowerCase().includes(tagFilter)) return false;
+    if (merchantFilter && !normalizeMerchant(entry.merchant || "").includes(merchantFilter)) return false;
+    return true;
+  });
+
+  const keyFor = (entry) => {
+    if (groupBy === "merchant") return normalizeWhitespace(entry.merchant || "") || "(no merchant)";
+    if (groupBy === "month") return String(entry.date || "").slice(0, 7) || "(no date)";
+    if (groupBy === "category-full" || groupBy === "full") return normalizeCategoryPath(entry.category || "") || "uncategorized";
+    if (groupBy === "none") return "All";
+    return primaryCategory(entry.category || "uncategorized");
+  };
+  const labelFor = (key) => {
+    if (groupBy === "merchant" || groupBy === "month" || groupBy === "none") return key;
+    return displayCategoryPath(key);
+  };
+
+  const groups = new Map();
+  for (const entry of filtered) {
+    const key = keyFor(entry);
+    const current = groups.get(key) || { key, label: labelFor(key), value: 0, count: 0 };
+    current.value = roundCurrencyAmount(current.value + (entry.entryType === "income" ? Number(entry.amount || 0) : entrySpendAmount(entry)));
+    current.count += 1;
+    groups.set(key, current);
+  }
+
+  const rows = Array.from(groups.values());
+  if (groupBy === "month") {
+    rows.sort((left, right) => left.key.localeCompare(right.key));
+  } else {
+    rows.sort((left, right) => (op === "count" ? right.count - left.count : right.value - left.value));
+  }
+  const total = roundCurrencyAmount(rows.reduce((sum, row) => sum + row.value, 0));
+  for (const row of rows) {
+    row.pct = total > 0 ? Number(((row.value / total) * 100).toFixed(1)) : 0;
+  }
+
+  return { entries: filtered, op, rows, total, count: filtered.length };
+}
+
+// Monthly income vs expense buckets for the income-expense bar view.
+function buildMonthlyIncomeExpense(entries, options = {}) {
+  const goalKeys = new Set((options.goalKeys || []).map((key) => normalizeCategoryPath(key)).filter(Boolean));
+  const months = new Map();
+  for (const entry of entries || []) {
+    const month = String(parseIsoDate(entry.date) || "").slice(0, 7);
+    if (!month) continue;
+    const bucket = months.get(month) || { month, income: 0, expense: 0 };
+    if (entry.entryType === "income" && !goalKeys.has(entry.goalKey)) {
+      bucket.income = roundCurrencyAmount(bucket.income + Number(entry.amount || 0));
+    } else if (isSpendingEntry(entry)) {
+      bucket.expense = roundCurrencyAmount(bucket.expense + entrySpendAmount(entry));
+    }
+    months.set(month, bucket);
+  }
+  return Array.from(months.values())
+    .map((bucket) => ({ ...bucket, net: roundCurrencyAmount(bucket.income - bucket.expense) }))
+    .sort((left, right) => left.month.localeCompare(right.month));
+}
+
+// Cumulative income-minus-spend line over time.
+function buildCumulativeBalanceSeries(entries, options = {}) {
+  const goalKeys = new Set((options.goalKeys || []).map((key) => normalizeCategoryPath(key)).filter(Boolean));
+  const byDate = new Map();
+  for (const entry of entries || []) {
+    const date = parseIsoDate(entry.date);
+    if (!date) continue;
+    let delta = 0;
+    if (entry.entryType === "income" && !goalKeys.has(entry.goalKey)) delta = Number(entry.amount || 0);
+    else if (isSpendingEntry(entry)) delta = -entrySpendAmount(entry);
+    else continue;
+    byDate.set(date, roundCurrencyAmount((byDate.get(date) || 0) + delta));
+  }
+  const dates = Array.from(byDate.keys()).sort();
+  let running = 0;
+  return dates.map((date) => {
+    running = roundCurrencyAmount(running + byDate.get(date));
+    return { date, balance: running };
+  });
+}
+
+// --- Hierarchical colour system ----------------------------------------------
+// Every chart shares this: each major category gets one base hue, and its
+// subcategories render as progressively lighter/darker shades of that hue.
+
+const CATEGORY_BASE_HUES = [211, 145, 26, 45, 356, 262, 176, 328, 96, 197, 16, 230];
+
+function categoryBaseColor(rank) {
+  const hue = CATEGORY_BASE_HUES[((rank % CATEGORY_BASE_HUES.length) + CATEGORY_BASE_HUES.length) % CATEGORY_BASE_HUES.length];
+  return { hue, saturation: 58, lightness: 44 };
+}
+
+function categoryShadeColor(base, childIndex) {
+  const offsets = [0, 10, -9, 18, -15, 25, -20, 31];
+  const offset = offsets[childIndex % offsets.length] + Math.floor(childIndex / offsets.length) * 3;
+  const lightness = Math.max(22, Math.min(74, base.lightness + offset));
+  return `hsl(${base.hue}, ${base.saturation}%, ${lightness}%)`;
+}
+
+// Groups entries into ranked major groups with nested subgroups, assigning the
+// hue-family colours. Majors are ranked by group total; subgroups sit beneath
+// their parent, largest first. `slices` is the flattened leaf list for pies.
+function buildHierarchicalCategoryGroups(entries, groupBy = "primary") {
+  const useFull = String(groupBy || "primary").toLowerCase() === "full";
+  const majors = new Map();
+
+  for (const entry of entries || []) {
+    const full = normalizeCategoryPath(entry.category || "uncategorized") || "uncategorized";
+    const major = full.split("/")[0];
+    const amount = entrySpendAmount(entry);
+    const majorGroup = majors.get(major) || { key: major, label: titleCaseSegment(major), total: 0, count: 0, children: new Map() };
+    majorGroup.total = roundCurrencyAmount(majorGroup.total + amount);
+    majorGroup.count += 1;
+    const childKey = useFull ? full : major;
+    const child = majorGroup.children.get(childKey) || { key: childKey, label: displayCategoryPath(childKey), total: 0, count: 0 };
+    child.total = roundCurrencyAmount(child.total + amount);
+    child.count += 1;
+    majorGroup.children.set(childKey, child);
+    majors.set(major, majorGroup);
+  }
+
+  const ranked = Array.from(majors.values()).sort((left, right) => right.total - left.total);
+  const slices = [];
+  const groups = ranked.map((major, majorIndex) => {
+    const base = categoryBaseColor(majorIndex);
+    const color = categoryShadeColor(base, 0);
+    const children = Array.from(major.children.values())
+      .sort((left, right) => right.total - left.total)
+      .map((child, childIndex) => ({
+        ...child,
+        color: categoryShadeColor(base, childIndex),
+        parent: major.key,
+      }));
+    for (const child of children) slices.push(child);
+    return { ...major, children, color };
+  });
+
+  return { groups, slices };
+}
+
+// --- Daily-note file name helpers ----------------------------------------------
+// Supports the folder/format auto-detected from the Journals or core Daily
+// notes plugin. Only pure date tokens are supported; anything fancier falls
+// back to YYYY-MM-DD.
+
+function formatDailyNoteName(iso, format) {
+  const date = parseIsoDate(iso);
+  if (!date) return null;
+  const [year, month, day] = date.split("-");
+  const pattern = String(format || "YYYY-MM-DD");
+  if (/[A-Za-z]/.test(pattern.replace(/Y|M|D/g, ""))) return null;
+  if (!/YYYY/.test(pattern) || !/MM/.test(pattern) || !/DD/.test(pattern)) return null;
+  return pattern.replace(/YYYY/g, year).replace(/MM/g, month).replace(/DD/g, day);
+}
+
+function parseDailyNoteName(name, format) {
+  const base = String(name || "").replace(/\.md$/i, "");
+  const pattern = String(format || "YYYY-MM-DD");
+  const order = [];
+  const regexSource = pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/YYYY|MM|DD/g, (token) => {
+    order.push(token);
+    return token === "YYYY" ? "(\\d{4})" : "(\\d{2})";
+  });
+  if (order.length !== 3) return parseIsoDate(base);
+  const match = base.match(new RegExp(`^${regexSource}$`));
+  if (!match) return parseIsoDate(base);
+  const parts = {};
+  order.forEach((token, index) => { parts[token] = match[index + 1]; });
+  return parseIsoDate(`${parts.YYYY}-${parts.MM}-${parts.DD}`);
+}
+
+// --- Goal archiving ------------------------------------------------------------
+// Frozen plain-markdown record written into a goal note when it is archived:
+// the savings steps (every contribution), and — for trips — how the money was
+// spent during the trip and after its end date. The note stops being part of
+// the active set but keeps its full history readable forever.
+function buildGoalArchiveSummaryLines(goal, entries, referenceDate) {
+  const today = parseIsoDate(referenceDate) || todayIsoLocal();
+  const currency = goal?.currency || "AUD";
+  const goalKey = normalizeCategoryPath(goal?.goalKey || "");
+  const tripTag = normalizeHolidayKey(goal?.tripTag || "");
+  const endDate = parseIsoDate(goal?.endDate || "");
+  const targetAmount = roundCurrencyAmount(goal?.targetAmount || 0);
+  const startingBalance = roundCurrencyAmount(goal?.startingBalance || 0);
+
+  const contributions = (entries || [])
+    .filter((entry) => entry.goalKey === goalKey && entry.isGoalContribution && entry.entryType === "income")
+    .sort((left, right) => String(left.date || "").localeCompare(String(right.date || "")));
+  const totalContributed = roundCurrencyAmount(contributions.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
+  const totalSaved = roundCurrencyAmount(startingBalance + totalContributed);
+
+  const lines = [];
+  lines.push(`## Archive summary (${today})`);
+  lines.push("");
+  const savedPct = targetAmount > 0 ? ` (${Math.round((totalSaved / targetAmount) * 100)}% of target)` : "";
+  lines.push(`- Target: ${formatCurrency(targetAmount, currency)}`);
+  lines.push(`- Saved: ${formatCurrency(totalSaved, currency)}${savedPct} — ${formatCurrency(startingBalance, currency)} starting balance + ${contributions.length} contribution${contributions.length === 1 ? "" : "s"}`);
+
+  if (contributions.length) {
+    lines.push("");
+    lines.push("### Savings steps");
+    lines.push("");
+    lines.push("| Date | Amount | Note |");
+    lines.push("| --- | ---: | --- |");
+    for (const entry of contributions) {
+      lines.push(`| ${entry.date || ""} | ${formatCurrency(entry.amount, currency)} | ${normalizeWhitespace(entry.merchant || "")} |`);
+    }
+  }
+
+  if (tripTag) {
+    const tripEntries = (entries || []).filter(
+      (entry) => entry.holidayKey === tripTag && !isPlannedExpenseEntry(entry) && !entry.isIncome && !entry.isGoalContribution
+    );
+    const during = tripEntries.filter((entry) => !endDate || String(entry.date || "") <= endDate);
+    const after = tripEntries.filter((entry) => endDate && String(entry.date || "") > endDate);
+    const sumEntries = (list) => roundCurrencyAmount(list.reduce((sum, entry) => sum + entrySpendAmount(entry), 0));
+    lines.push("");
+    lines.push("### How it was spent");
+    lines.push("");
+    const totalBudget = roundCurrencyAmount(goal?.totalBudget || 0);
+    if (totalBudget > 0) {
+      lines.push(`- Trip budget: ${formatCurrency(totalBudget, currency)}`);
+    }
+    lines.push(`- Spent during the trip: ${formatCurrency(sumEntries(during), currency)} across ${during.length} entr${during.length === 1 ? "y" : "ies"}`);
+    if (after.length) {
+      lines.push(`- Spent after ${endDate}: ${formatCurrency(sumEntries(after), currency)} across ${after.length} entr${after.length === 1 ? "y" : "ies"}`);
+    }
+    const grouped = groupTransactionsByCategory(tripEntries, "primary");
+    if (grouped.length) {
+      lines.push("");
+      lines.push("| Category | Total | Entries |");
+      lines.push("| --- | ---: | ---: |");
+      for (const group of grouped) {
+        lines.push(`| ${group.label} | ${formatCurrency(group.total, currency)} | ${group.count} |`);
+      }
+    }
+  }
+
+  return lines;
+}
+
 module.exports = {
+  buildGoalArchiveSummaryLines,
+  addMonths,
+  normalizeCadence,
+  nextRecurringDate,
+  detectRecurringPayments,
+  parseGoalDefinition,
+  computeSinkingFund,
+  parseOwedChildLine,
+  buildOwedChildLine,
+  buildOwedSharesFromTokens,
+  summarizeSplitBalances,
+  entrySpendAmount,
+  isSpendingEntry,
+  buildBalanceSnapshotLine,
+  summarizeBalanceSnapshots,
+  computeForecastInputs,
+  buildForecastProjection,
+  runFinanceQuery,
+  buildMonthlyIncomeExpense,
+  buildCumulativeBalanceSeries,
+  buildHierarchicalCategoryGroups,
+  categoryBaseColor,
+  categoryShadeColor,
+  formatDailyNoteName,
+  parseDailyNoteName,
+
   addDays,
   buildCategoryTag,
   buildCsv,
