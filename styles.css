@@ -443,42 +443,10 @@
   margin-bottom: 4px;
 }
 
-.finance-tracker-budget-card.is-compact {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  justify-content: space-between;
-  min-height: 108px;
-  padding: 12px;
-}
-
-.finance-tracker-budget-card.is-compact.is-good {
-  background: #2f855a;
-  border-color: #2f855a;
-}
-
-.finance-tracker-budget-card.is-compact.is-near {
-  background: #d69e2e;
-  border-color: #d69e2e;
-}
-
-.finance-tracker-budget-card.is-compact.is-over {
-  background: #c53030;
-  border-color: #c53030;
-}
-
 .finance-tracker-budget-meta {
   color: var(--text-muted);
   font-size: 0.92em;
   margin-bottom: 10px;
-}
-
-.finance-tracker-budget-card.is-compact .finance-tracker-budget-title,
-.finance-tracker-budget-card.is-compact .finance-tracker-budget-meta {
-  color: white;
-  margin-bottom: 0;
-  position: relative;
-  z-index: 1;
 }
 
 .finance-tracker-budget-bar {
@@ -679,7 +647,6 @@
   opacity: 0.65;
   pointer-events: none;
 }
-.finance-tracker-budget-list.is-compact .finance-tracker-budget-bar { height: 6px; }
 .finance-tracker-budget-meta.is-pace { opacity: 0.8; font-style: italic; }
 
 /* ---- Summary delta cards ---- */
@@ -880,4 +847,160 @@
   margin-bottom: 0.6em;
   background: var(--background-secondary);
   border-radius: 0 6px 6px 0;
+}
+
+/* ============================================================
+   Sidebar compaction — slim budget rows + tighter cards.
+   Detail (left, safe $/day, projection) lives in a hover
+   tooltip and expands on tap.
+   ============================================================ */
+
+.ft-budget-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ft-budget-row {
+  padding: 5px 8px;
+  margin: 0 -8px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.ft-budget-row:hover {
+  background: var(--background-modifier-hover);
+}
+
+.ft-budget-row-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 3px;
+  font-size: 0.88em;
+  line-height: 1.25;
+}
+
+.ft-budget-row-name {
+  font-weight: 500;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ft-budget-row-value {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.ft-budget-row.is-near .ft-budget-row-value {
+  color: var(--color-orange, #d69e2e);
+}
+
+.ft-budget-row.is-over .ft-budget-row-value {
+  color: var(--color-red, #c0392b);
+  font-weight: 600;
+}
+
+.ft-budget-row .finance-tracker-budget-bar {
+  height: 4px;
+}
+
+.ft-budget-row .finance-tracker-budget-pace-marker {
+  top: -2px;
+  bottom: -2px;
+}
+
+.ft-budget-row-details {
+  display: none;
+  color: var(--text-muted);
+  font-size: 0.8em;
+  margin-top: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ft-budget-row.is-expanded .ft-budget-row-details {
+  display: block;
+}
+
+/* Budget section cards in the sidebar shrink to match the rows */
+.finance-tracker-chart-card.is-compact-card {
+  padding: 10px 14px;
+  margin-bottom: 10px;
+}
+
+.finance-tracker-chart-card.is-compact-card h4 {
+  margin-bottom: 8px;
+  font-size: 0.82em;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+
+/* Sidebar-wide tightening (in-note dashboards keep the roomy layout) */
+.finance-tracker-dashboard.is-sidebar {
+  padding: 12px;
+}
+
+.finance-tracker-dashboard.is-sidebar .finance-tracker-summary {
+  grid-template-columns: repeat(auto-fit, minmax(108px, 1fr));
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.finance-tracker-dashboard.is-sidebar .finance-tracker-summary-card {
+  padding: 8px 10px;
+  min-height: 50px;
+}
+
+.finance-tracker-dashboard.is-sidebar .finance-tracker-summary-label {
+  font-size: 0.76em;
+  margin-bottom: 2px;
+}
+
+.finance-tracker-dashboard.is-sidebar .finance-tracker-summary-value {
+  font-size: 0.98em;
+}
+
+.finance-tracker-dashboard.is-sidebar .finance-tracker-chart-card {
+  padding: 10px 14px;
+  margin-bottom: 10px;
+}
+
+.finance-tracker-dashboard.is-sidebar .finance-tracker-chart-card h4 {
+  margin-bottom: 8px;
+  font-size: 0.82em;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+
+.finance-tracker-dashboard.is-sidebar .finance-tracker-budget-list {
+  gap: 6px;
+}
+
+.finance-tracker-dashboard.is-sidebar .finance-tracker-budget-card {
+  padding: 8px 10px;
+}
+
+.finance-tracker-dashboard.is-sidebar .finance-tracker-budget-title {
+  font-size: 0.88em;
+  margin-bottom: 2px;
+}
+
+.finance-tracker-dashboard.is-sidebar .finance-tracker-budget-meta {
+  font-size: 0.8em;
+  margin-bottom: 4px;
+}
+
+.finance-tracker-dashboard.is-sidebar .finance-tracker-header {
+  margin-bottom: 10px;
+}
+
+.finance-tracker-dashboard.is-sidebar .finance-tracker-header h3 {
+  font-size: 1em;
 }

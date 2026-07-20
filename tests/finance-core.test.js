@@ -1139,3 +1139,115 @@ test("buildGoalArchiveSummaryLines freezes savings steps and trip spending", () 
   assert.match(text, /Spent after 2026-07-24: \$40\.00 across 1 entry/);
   assert.match(text, /\| Accommodation \| \$88\.00 \| 1 \|/);
 });
+
+test("trip-tagged spending never counts toward home budgets or spend totals", () => {
+  const content = `
+## Finance
+- [ ] #log/spending 100
+\t- $60.00 #log/spending/shopping
+\t\t- Uniqlo at home
+\t- $40.00 #log/spending/26/japanmidyear/shopping
+\t\t- Loft Tokyo
+`.trim();
+  const entries = core.parseTransactionsFromNoteContent(content, "Daily/2026-07-05.md", {
+    defaultCurrency: "AUD",
+    financeHeading: "## Finance",
+  });
+  assert.equal(entries.length, 2);
+  const home = entries.filter((entry) => core.isSpendingEntry(entry));
+  assert.equal(home.length, 1);
+  assert.equal(home[0].merchant, "Uniqlo at home");
+  // the trip entry still reduces its savings goal and feeds the holiday dashboard
+  const trip = entries.find((entry) => entry.holidayKey === "26/japanmidyear");
+  assert.equal(trip.isGoalWithdrawal, true);
+  assert.equal(core.isSpendingEntry(trip), false);
+  // and the note's checkbox total still includes it (all money out that day)
+  const total = core.calculateSpendingSectionTotal(content.split("\n").slice(1), "2026-07-05", { defaultCurrency: "AUD" });
+  assert.equal(total, 100);
+});
+
+// ---------------------------------------------------------------------------
+// v0.2.x: recurring management + goal contribution/archiving improvements
+// ---------------------------------------------------------------------------
+
+test("a zero-amount skip entry advances the recurring anchor without changing the amount", () => {
+  const mk = (date, amount) => ({ amount, category: "subscriptions/monthly/spotify", date, merchant: "Spotify" });
+  const recurring = core.detectRecurringPayments(
+    [mk("2026-05-20", 12.99), mk("2026-06-20", 0)],
+    { prefix: "subscriptions", referenceDate: "2026-07-01" }
+  );
+  assert.equal(recurring.items.length, 1);
+  assert.equal(recurring.items[0].lastAmount, 12.99); // amount survives the skip
+  assert.equal(recurring.items[0].lastDate, "2026-06-20"); // anchor moved
+  assert.equal(recurring.items[0].nextDue, "2026-07-20");
+});
+
+test("computeRecurringReserve accrues per bill and totals the next 30 days", () => {
+  const recurring = core.detectRecurringPayments(
+    [
+      { amount: 14, category: "subscriptions/weekly/gym", date: "2026-07-13", merchant: "Gym" },
+      { amount: 120, category: "subscriptions/yearly/domain", date: "2026-01-16", merchant: "Registrar" },
+    ],
+    { prefix: "subscriptions", referenceDate: "2026-07-16" }
+  );
+  const reserve = core.computeRecurringReserve(recurring, "2026-07-16");
+  const gym = reserve.rows.find((row) => row.name === "gym");
+  assert.equal(gym.accrued, 6); // 3 of 7 days through the cycle: 14 * 3/7
+  assert.equal(gym.perWeek, 14);
+  assert.equal(gym.dueSoon, 56); // 4 occurrences inside 30 days: 07-20, 07-27, 08-03, 08-10
+  const domain = reserve.rows.find((row) => row.name === "domain");
+  assert.ok(domain.accrued > 55 && domain.accrued < 65); // ~half the year elapsed
+  assert.equal(domain.dueSoon, 0); // not due until 2027
+  assert.equal(reserve.totals.perWeek, core.roundCurrencyAmount(14 + 120 / 52));
+  assert.equal(reserve.totals.dueNext30Days, gym.dueSoon);
+});
+
+test("archive summary includes a withdrawals table for plain savings goals", () => {
+  const goal = { currency: "AUD", goalKey: "roadbike", startingBalance: 0, targetAmount: 3000 };
+  const entries = [
+    { entryType: "income", isIncome: true, isGoalContribution: true, goalKey: "roadbike", amount: 1000, date: "2026-05-01", merchant: "Transfer" },
+    { entryType: "goal-withdrawal", isGoalWithdrawal: true, goalKey: "roadbike", amount: 250, date: "2026-06-10", category: "repairs", merchant: "Bike shop" },
+  ];
+  const text = core.buildGoalArchiveSummaryLines(goal, entries, "2026-07-16").join("\n");
+  assert.match(text, /### Withdrawals/);
+  assert.match(text, /\| 2026-06-10 \| \$250\.00 \| Repairs \| Bike shop \|/);
+});
+
+test("buildTripReflection summarises a finished trip by category and day", () => {
+  const goal = { tripTag: "26/japan", startDate: "2026-07-01", endDate: "2026-07-04", currency: "AUD", totalBudget: 500 };
+  const mk = (date, amount, category, merchant) => ({
+    holidayKey: "26/japan", entryType: "holiday-spending", isGoalWithdrawal: true,
+    date, amount, myShare: amount, category, merchant,
+  });
+  const entries = [
+    mk("2026-07-01", 40, "food", "Ichiran"),
+    mk("2026-07-02", 90, "food", "Sushi Dai"),
+    mk("2026-07-02", 60, "transport", "JR"),
+    mk("2026-07-03", 10, "food", "FamilyMart"),
+    mk("2026-07-06", 25, "shopping", "Airport duty free"), // after the trip
+    { holidayKey: "26/japan", entryType: "income", isIncome: true, isGoalContribution: true, date: "2026-07-01", amount: 500, category: "japan" },
+  ];
+  const reflection = core.buildTripReflection(goal, entries, "2026-07-10");
+
+  assert.equal(reflection.isFinished, true);
+  assert.equal(reflection.tripDays, 4);
+  assert.equal(reflection.totalSpent, 200);
+  assert.equal(reflection.afterTotal, 25);
+  assert.equal(reflection.allInTotal, 225);
+  assert.equal(reflection.budgetDelta, 275); // 500 - 225, under budget
+  assert.equal(reflection.averagePerDay, 50);
+
+  const food = reflection.categories[0];
+  assert.equal(food.key, "food");
+  assert.equal(food.total, 140);
+  assert.equal(food.averagePerDay, 35);
+  assert.equal(food.maxEntry.amount, 90);
+  assert.equal(food.maxEntry.merchant, "Sushi Dai");
+  assert.equal(food.pct, 70);
+
+  assert.equal(reflection.maxDay.date, "2026-07-02");
+  assert.equal(reflection.maxDay.total, 150);
+  assert.equal(reflection.quietDay.date, "2026-07-03");
+  assert.equal(reflection.dailySeries.length, 4);
+  assert.equal(reflection.dailySeries[3].total, 0); // 07-04 quiet travel day
+});

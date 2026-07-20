@@ -1756,8 +1756,9 @@ function detectRecurringPayments(entries, options = {}) {
     const name = rest.slice(1).join("/") || normalizeCategoryPath(entry.merchant || "") || "recurring";
     const key = `${cadence}/${name}`;
     const date = parseIsoDate(entry.date) || "";
+    const amount = roundCurrencyAmount(entry.amount || 0);
     const current = items.get(key);
-    if (!current || date >= current.lastDate) {
+    if (!current) {
       items.set(key, {
         cadence,
         rawCadence,
@@ -1766,12 +1767,22 @@ function detectRecurringPayments(entries, options = {}) {
         merchant: normalizeWhitespace(entry.merchant || "") || titleCaseSegment(name.split("/").pop()),
         category,
         currency: entry.currency || "",
-        lastAmount: roundCurrencyAmount(entry.amount || 0),
+        lastAmount: amount,
         lastDate: date,
-        count: (current ? current.count : 0) + 1,
+        count: 1,
       });
-    } else {
-      current.count += 1;
+      continue;
+    }
+    current.count += 1;
+    if (date >= current.lastDate) {
+      current.lastDate = date;
+      current.category = category;
+      current.rawCadence = rawCadence;
+      if (entry.merchant) current.merchant = normalizeWhitespace(entry.merchant);
+      // a $0 entry (a skipped cycle) moves the anchor without changing the amount
+      if (amount > 0) current.lastAmount = amount;
+    } else if (!(current.lastAmount > 0) && amount > 0) {
+      current.lastAmount = amount;
     }
   }
 
@@ -1807,6 +1818,59 @@ function detectRecurringPayments(entries, options = {}) {
     totals: {
       monthly: roundCurrencyAmount(rows.reduce((sum, row) => sum + row.monthlyCost, 0)),
       yearly: roundCurrencyAmount(rows.reduce((sum, row) => sum + row.yearlyCost, 0)),
+    },
+  };
+}
+
+// Sinking-fund maths for recurring bills: how much of each bill has "accrued"
+// since it was last paid (money that should already be set aside), what is due
+// within the next 30 days, and the steady per-week/per-month set-aside that
+// keeps every cadence covered.
+function computeRecurringReserve(recurring, referenceDate) {
+  const today = parseIsoDate(referenceDate) || todayIsoLocal();
+  const horizon = addDays(today, 30);
+  const rows = [];
+  let accruedTotal = 0;
+  let perYearTotal = 0;
+  let dueSoonTotal = 0;
+
+  for (const item of recurring?.items || []) {
+    const spec = RECURRING_CADENCES[item.cadence];
+    if (!spec || !item.lastDate || !(item.lastAmount > 0)) continue;
+    const cycleDays = spec.days || Math.round(30.44 * spec.months);
+    const perYear = item.lastAmount * spec.perMonth * 12;
+    const daysSinceLast = Math.max(0, daysBetweenInclusive(item.lastDate, today) - 1);
+    const accrued = roundCurrencyAmount(Math.min(daysSinceLast / cycleDays, 1) * item.lastAmount);
+
+    let dueSoon = 0;
+    let due = item.nextDue;
+    for (let guard = 0; due && due <= horizon && guard < 32; guard += 1) {
+      dueSoon += item.lastAmount;
+      due = nextRecurringDate(due, item.cadence);
+    }
+    dueSoon = roundCurrencyAmount(dueSoon);
+
+    accruedTotal += accrued;
+    perYearTotal += perYear;
+    dueSoonTotal += dueSoon;
+    rows.push({
+      accrued,
+      cadence: item.cadence,
+      dueSoon,
+      label: item.label,
+      name: item.name,
+      perWeek: roundCurrencyAmount(perYear / 52),
+    });
+  }
+
+  rows.sort((left, right) => right.accrued - left.accrued);
+  return {
+    rows,
+    totals: {
+      accrued: roundCurrencyAmount(accruedTotal),
+      dueNext30Days: roundCurrencyAmount(dueSoonTotal),
+      perMonth: roundCurrencyAmount(perYearTotal / 12),
+      perWeek: roundCurrencyAmount(perYearTotal / 52),
     },
   };
 }
@@ -1973,13 +2037,16 @@ function entrySpendAmount(entry) {
   return Number(entry.amount || 0);
 }
 
-// One place to decide "does this entry count as my spending".
+// One place to decide "does this entry count as my home spending". Trip-tagged
+// entries are withdrawals from their trip's savings goal — they belong to the
+// holiday dashboards and never count toward regular budgets or spend totals.
 function isSpendingEntry(entry) {
   if (!entry) return false;
   return (
     !entry.isIncome &&
     !entry.isGoalContribution &&
     !isPlannedExpenseEntry(entry) &&
+    !entry.holidayKey &&
     entry.entryType !== "goal-withdrawal" &&
     entry.entryType !== "balance"
   );
@@ -2305,6 +2372,103 @@ function parseDailyNoteName(name, format) {
   return parseIsoDate(`${parts.YYYY}-${parts.MM}-${parts.DD}`);
 }
 
+// Post-trip reflection: once a trip has ended, the holiday dashboard switches
+// to this — per-category totals, averages per trip day, the single biggest
+// expense in each category, the most (and least) expensive days, and how the
+// whole trip landed against its budget.
+function buildTripReflection(goal, entries, referenceDate) {
+  const today = parseIsoDate(referenceDate) || todayIsoLocal();
+  const tripTag = normalizeHolidayKey(goal?.tripTag || "");
+  const startDate = parseIsoDate(goal?.startDate || "");
+  const endDate = parseIsoDate(goal?.endDate || "");
+  const currency = goal?.currency || "AUD";
+  const totalBudget = roundCurrencyAmount(goal?.totalBudget || 0);
+
+  const tripEntries = (entries || []).filter(
+    (entry) =>
+      entry.holidayKey === tripTag &&
+      !isPlannedExpenseEntry(entry) &&
+      !entry.isIncome &&
+      !entry.isGoalContribution &&
+      entry.entryType !== "balance"
+  );
+  const during = tripEntries.filter(
+    (entry) => (!startDate || String(entry.date || "") >= startDate) && (!endDate || String(entry.date || "") <= endDate)
+  );
+  const after = tripEntries.filter((entry) => endDate && String(entry.date || "") > endDate);
+  const sumList = (list) => roundCurrencyAmount(list.reduce((sum, entry) => sum + entrySpendAmount(entry), 0));
+  const totalSpent = sumList(during);
+  const afterTotal = sumList(after);
+  const allInTotal = roundCurrencyAmount(totalSpent + afterTotal);
+  const tripDays = startDate && endDate ? daysBetweenInclusive(startDate, endDate) : 0;
+
+  const categories = new Map();
+  for (const entry of during) {
+    const key = primaryCategory(entry.category || "uncategorized");
+    const current = categories.get(key) || { key, label: titleCaseSegment(key), total: 0, count: 0, maxEntry: null };
+    const amount = entrySpendAmount(entry);
+    current.total = roundCurrencyAmount(current.total + amount);
+    current.count += 1;
+    if (!current.maxEntry || amount > current.maxEntry.amount) {
+      current.maxEntry = {
+        amount: roundCurrencyAmount(amount),
+        date: entry.date || "",
+        merchant: normalizeWhitespace(entry.merchant || ""),
+      };
+    }
+    categories.set(key, current);
+  }
+  const categoryRows = Array.from(categories.values())
+    .sort((left, right) => right.total - left.total)
+    .map((row) => ({
+      ...row,
+      averagePerDay: tripDays > 0 ? roundCurrencyAmount(row.total / tripDays) : 0,
+      pct: totalSpent > 0 ? Number(((row.total / totalSpent) * 100).toFixed(1)) : 0,
+    }));
+
+  const byDay = new Map();
+  for (const entry of during) {
+    if (!entry.date) continue;
+    byDay.set(entry.date, roundCurrencyAmount((byDay.get(entry.date) || 0) + entrySpendAmount(entry)));
+  }
+  const dailySeries = [];
+  if (startDate && endDate) {
+    for (let day = startDate; day && day <= endDate; day = addDays(day, 1)) {
+      dailySeries.push({ date: day, total: byDay.get(day) || 0 });
+    }
+  } else {
+    for (const date of Array.from(byDay.keys()).sort()) {
+      dailySeries.push({ date, total: byDay.get(date) });
+    }
+  }
+  let maxDay = null;
+  let quietDay = null;
+  for (const point of dailySeries) {
+    if (!maxDay || point.total > maxDay.total) maxDay = point;
+    if (point.total > 0 && (!quietDay || point.total < quietDay.total)) quietDay = point;
+  }
+
+  return {
+    afterCount: after.length,
+    afterTotal,
+    allInTotal,
+    averagePerDay: tripDays > 0 ? roundCurrencyAmount(totalSpent / tripDays) : 0,
+    budgetDelta: totalBudget > 0 ? roundCurrencyAmount(totalBudget - allInTotal) : null,
+    categories: categoryRows,
+    currency,
+    dailySeries,
+    endDate,
+    entryCount: during.length,
+    isFinished: Boolean(endDate && today > endDate),
+    maxDay,
+    quietDay,
+    startDate,
+    totalBudget,
+    totalSpent,
+    tripDays,
+  };
+}
+
 // --- Goal archiving ------------------------------------------------------------
 // Frozen plain-markdown record written into a goal note when it is archived:
 // the savings steps (every contribution), and — for trips — how the money was
@@ -2343,6 +2507,20 @@ function buildGoalArchiveSummaryLines(goal, entries, referenceDate) {
     }
   }
 
+  const withdrawals = (entries || [])
+    .filter((entry) => entry.goalKey === goalKey && entry.entryType === "goal-withdrawal")
+    .sort((left, right) => String(left.date || "").localeCompare(String(right.date || "")));
+  if (withdrawals.length) {
+    lines.push("");
+    lines.push("### Withdrawals");
+    lines.push("");
+    lines.push("| Date | Amount | Category | Note |");
+    lines.push("| --- | ---: | --- | --- |");
+    for (const entry of withdrawals) {
+      lines.push(`| ${entry.date || ""} | ${formatCurrency(entry.amount, currency)} | ${displayCategoryPath(entry.category)} | ${normalizeWhitespace(entry.merchant || "")} |`);
+    }
+  }
+
   if (tripTag) {
     const tripEntries = (entries || []).filter(
       (entry) => entry.holidayKey === tripTag && !isPlannedExpenseEntry(entry) && !entry.isIncome && !entry.isGoalContribution
@@ -2376,6 +2554,8 @@ function buildGoalArchiveSummaryLines(goal, entries, referenceDate) {
 }
 
 module.exports = {
+  buildTripReflection,
+  computeRecurringReserve,
   buildGoalArchiveSummaryLines,
   addMonths,
   normalizeCadence,

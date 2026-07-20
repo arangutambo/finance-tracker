@@ -8,7 +8,18 @@ Support the project: [Buy Me a Coffee](https://buymeacoffee.com/tonyhad)
 
 ## First-time setup (empty vault)
 
-From a brand-new vault, in order:
+On a fresh install the **setup wizard** opens automatically (or run the
+**Run first-time setup** command / the button at the top of settings any time —
+it never overwrites existing notes). It asks three things — where your daily
+notes live, where finance notes should be stored, and your currency — then
+creates the starter notes from templates embedded in the plugin:
+
+- `💸 Budgets.md` — the budget table
+- `📊 Finance Dashboard.md` — weekly/monthly dashboards, net worth, forecast, a sample query
+- `🔁 Recurring Payments.md` — the bill management page
+- `🎯 Goals.md` — the goals overview with one-tap contributions
+
+The manual path, if you prefer:
 
 1. **Install & enable.** Copy this plugin to `.obsidian/plugins/finance-tracker/`,
    then Settings → Community plugins → enable **Finance Tracker**. (On mobile, turn
@@ -131,6 +142,12 @@ Budgets are a markdown table in `Utility/Budgets/💸 Budgets.md`:
   reflects whether you're ahead of pace (not just over the cap), and each bar
   shows the projected end-of-period spend and a safe `$/day` for the days left.
 - An `all` budget also drives the **Left / Day** card and the daily-spend trend line.
+- **Trip-tagged spending never counts toward home budgets.** An entry like
+  `- $40 #log/spending/26/japan/shopping` is a withdrawal from that trip's
+  savings goal: it shows on the holiday dashboard and reduces the goal, but is
+  excluded from regular budgets, dashboards, the sidebar totals, and the
+  forecast. Use `type: all` in a `finance-query` block for a report that
+  includes trip entries.
 
 ## Dashboards
 
@@ -153,7 +170,12 @@ savings activity. Export CSV from the header.
 
 `holiday-dashboard` — planned vs actual trip spend, per-day budget remaining, and a
 trip calendar. Reads a goal note that has a `trip_tag` (see [Goals](#goals-savings--trips)),
-plus its Planned/Allocated tables.
+plus its Planned/Allocated tables. **Once the trip has ended** (past `end_date`,
+or the note is archived) the same block automatically becomes a **trip
+reflection**: total and after-trip spend, how it landed against the budget,
+average per day, biggest and quietest days, a per-category table (total, avg/day,
+share, and the biggest single expense with its merchant), a spend-by-day chart,
+and planned-vs-paid. Force either mode with `view: live` or `view: reflection`.
 
 `savings-dashboard` — per-goal progress, contributions, sinking-fund set-aside and
 pace. Reads a goal note (frontmatter `goal_key`, `target_amount`, `due_date`, …).
@@ -207,19 +229,46 @@ Contributions are `- $500 #log/income/roadbike` bullets; withdrawals are
 `- $90 #log/spending/goal/roadbike/<category>`. The legacy `goal_key` /
 `holiday_tag` frontmatter still parses, so un-migrated notes keep rendering.
 
+### Contributing to goals
+
+Command: **Contribute to savings goal** (also the Contribute buttons in the
+goals block below)
+
+Logs a contribution bullet — `- $150.00 #log/income/roadbike` — into the chosen
+day's note. Contributions are **virtual envelopes**: nothing requires a real
+bank transfer, so this works whether each goal has its own account or every
+goal lives inside one lump-sum savings account.
+
+### Goals overview block
+
+Command: **Insert goals block**
+
+````md
+```finance-goals
+account: short-term-savings   # optional — reconcile against a real account
+```
+````
+
+One card per goal: saved vs target, the weekly set-aside still needed,
+ahead/behind pace, and a **Contribute** button. With `account:` it compares the
+sum of your goal envelopes against that account's latest `#log/balance/…`
+snapshot and shows the **unallocated** remainder — the piece of the lump sum
+not yet promised to any goal (or a warning when you've over-allocated).
+
 ### Multiple holidays & archiving
 
-Command: **Archive finished holidays** (or the per-note toggles and Archive
-buttons in Settings → Holiday budgets)
+Commands: **Archive finished holidays** · **Archive completed savings goals**
+(or the per-note toggles and Archive buttons in Settings → Holiday budgets)
 
 You can save for **several holidays at once** — every goal note with
 `active: true` shows in the sidebar and counts toward forecast set-asides, and
 capture routes to whichever trip's dates match.
 
-When a trip is over, archive it. Archiving writes a frozen **Archive summary**
-into the note — the savings steps (every contribution, dated) and how the money
-was spent, during the trip and after its end date — then marks it
-`archived: <date>` and moves it to the archive folder. The note keeps its full
+When a trip is over — or a savings goal has hit its target — archive it.
+Archiving writes a frozen **Archive summary** into the note: the savings steps
+(every contribution, dated), withdrawals, and for trips how the money was
+spent during the trip and after its end date. The note is then marked
+`archived: <date>` and moved to the archive folder. The note keeps its full
 history and its dashboards still render when you open it, but it leaves the
 active set: no more capture routing, sidebar cards, or forecast set-asides.
 
@@ -269,9 +318,20 @@ Then drop this block into any note:
 ```
 ````
 
-It shows upcoming bills, overdue items with a one-tap **Log now**, and the total
-subscription cost per month and per year. An optional setting (**Auto-log
-recurring payments**) logs each item automatically on its due day.
+It shows upcoming bills, overdue items with a one-tap **Log now**, the total
+due in the next 30 days, and the cost per month and per year. An optional
+setting (**Auto-log recurring payments**) logs each item automatically on its
+due day.
+
+**Managing bills** — command **Open recurring payments note** creates a
+management page (a normal note with a `manage: true` block). In manage mode
+every item gets **Log now** plus **Skip cycle** (logs a $0 entry on the due day,
+so the schedule moves on but the price is remembered — a price change is simply
+the next amount you log). The block also has a **Bill reserve** section: the
+sinking fund for bills. It shows how much should already be set aside (each
+bill accrues day by day since it was last paid — half a year after an annual
+bill, half its cost should be reserved) and the steady per-week / per-month
+set-aside that keeps every cadence covered.
 
 ## Split expenses
 
@@ -369,11 +429,11 @@ bars), `cumulative` (cumulative balance line).
 ## Daily Budget sidebar & status bar
 
 The **Daily Budget** sidebar (ribbon coin icon) shows today + period spend, a
-Left/Day card, a mini pie, pace-aware budget bars, savings goals, a **Needs a
-Category** triage list, and today's entries. Tap any entry to edit its amount,
-category or merchant, delete it, or tick "remember this merchant → category" to
-teach `Utility/Finance/Merchant Map.md`. Captures with a known merchant
-auto-categorise from that file.
+Left/Day card, a mini pie, compact pace-aware budget rows (tap a row for the
+detail), savings goals, split balances, and a **Needs a Category** triage list.
+Tap a triage entry to edit its amount, category or merchant, delete it, or tick
+"remember this merchant → category" to teach `Utility/Finance/Merchant Map.md`.
+Captures with a known merchant auto-categorise from that file.
 
 The **status bar** shows `💸 Today $X · Week $Y · 📥 N` (N = pending captures);
 click it to quick-add.
@@ -391,7 +451,9 @@ duplicates); unmatched charges can be sent to the capture inbox to log and triag
 - Reconcile bank/Wise CSV against logged spending
 - Open daily budget · Open finance budgets note
 - Add holiday exchange rate · Create savings goal
-- Log due recurring payments · Insert recurring payments block
+- Run first-time setup
+- Log due recurring payments · Open recurring payments note · Insert recurring payments block
+- Contribute to savings goal · Insert goals block · Archive completed savings goals
 - Settle up split expenses · Insert split expenses block
 - Start trip · End trip · Archive finished holidays
 - Snapshot balances · Insert net worth block
