@@ -5,6 +5,6 @@
   "minAppVersion": "1.0.0",
   "description": "Log spending as tags in your daily notes, then turn them into pace-aware budget, recurring-bill, split-expense, trip, forecast, net-worth, and savings dashboards. Capture via Apple Shortcuts or a quick-add modal.",
   "author": "Antoine Jhaddad",
-  "authorUrl": "https://github.com/antoinejhaddad",
+  "authorUrl": "https://github.com/arangutambo",
   "isDesktopOnly": false
 }
