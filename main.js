@@ -2593,6 +2593,7 @@ const DEFAULT_SETTINGS = {
   processedExternalIds: [],
   recurringTagPrefix: "subscriptions",
   autoLogRecurring: false,
+  quickAddUseNoteDate: false,
   tripModeActive: false,
   activeTripGoalPath: "",
 };
@@ -2928,6 +2929,24 @@ function describePieSlice(centerX, centerY, radius, startAngle, endAngle) {
 function centroidForSlice(centerX, centerY, radius, startAngle, endAngle) {
   const midpoint = startAngle + (endAngle - startAngle) / 2;
   return polarToCartesian(centerX, centerY, radius * 0.6, midpoint);
+}
+
+// Ring segment between two radii, for the outer subcategory ring of the donut.
+function describeAnnularSlice(centerX, centerY, innerRadius, outerRadius, startAngle, endAngle) {
+  const span = Math.min(endAngle - startAngle, 359.9);
+  const cappedEnd = startAngle + span;
+  const outerStart = polarToCartesian(centerX, centerY, outerRadius, cappedEnd);
+  const outerEnd = polarToCartesian(centerX, centerY, outerRadius, startAngle);
+  const innerStart = polarToCartesian(centerX, centerY, innerRadius, startAngle);
+  const innerEnd = polarToCartesian(centerX, centerY, innerRadius, cappedEnd);
+  const largeArcFlag = span <= 180 ? "0" : "1";
+  return [
+    "M", outerStart.x, outerStart.y,
+    "A", outerRadius, outerRadius, 0, largeArcFlag, 0, outerEnd.x, outerEnd.y,
+    "L", innerStart.x, innerStart.y,
+    "A", innerRadius, innerRadius, 0, largeArcFlag, 1, innerEnd.x, innerEnd.y,
+    "Z",
+  ].join(" ");
 }
 
 class FinanceTrackerPlugin extends Plugin {
@@ -3624,6 +3643,68 @@ class FinanceTrackerPlugin extends Plugin {
     if (!key) return "";
     const map = await this.loadMerchantMap();
     return map.get(key) || "";
+  }
+
+  // Suggestion data for quick-add autocomplete, derived from what has actually
+  // been logged (plus the budget table) instead of a hand-maintained list:
+  // categories by usage, merchants with their most recent category, and people
+  // from owed child lines.
+  async collectKnownSuggestions() {
+    const entries = await this.collectAllTransactions();
+    const categoryCounts = new Map();
+    const merchantInfo = new Map();
+    const people = new Map();
+
+    for (const entry of entries) {
+      if (entry.entryType === "balance" || entry.isIncome) {
+        continue;
+      }
+      const category = core.normalizeCategoryPath(entry.category || "");
+      if (category && category !== "uncategorized") {
+        categoryCounts.set(category, (categoryCounts.get(category) || 0) + 1);
+      }
+      const merchant = String(entry.merchant || "").trim();
+      if (merchant && !/^skipped\b/i.test(merchant)) {
+        const key = core.normalizeMerchant(merchant);
+        const current = merchantInfo.get(key) || { name: merchant, count: 0, category: "", lastDate: "" };
+        current.count += 1;
+        if (String(entry.date || "") >= current.lastDate) {
+          current.lastDate = String(entry.date || "");
+          current.name = merchant;
+          if (category && category !== "uncategorized") current.category = category;
+        }
+        merchantInfo.set(key, current);
+      }
+      for (const owed of entry.owed || []) {
+        if (owed.person) people.set(owed.person, owed.displayName || core.titleCaseSegment(owed.person));
+      }
+    }
+
+    try {
+      for (const budget of await this.loadBudgets("default")) {
+        const category = core.normalizeCategoryPath(budget.category || "");
+        if (category && category !== "all" && !categoryCounts.has(category)) {
+          categoryCounts.set(category, 0.5);
+        }
+      }
+    } catch (_error) {
+      // budgets note may not exist yet; history alone is fine
+    }
+    try {
+      for (const category of (await this.loadMerchantMap()).values()) {
+        if (category && !categoryCounts.has(category)) categoryCounts.set(category, 0.5);
+      }
+    } catch (_error) {
+      // merchant map is optional
+    }
+
+    return {
+      categories: Array.from(categoryCounts.entries())
+        .sort((left, right) => right[1] - left[1])
+        .map(([path]) => path),
+      merchants: Array.from(merchantInfo.values()).sort((left, right) => right.count - left.count),
+      people: Array.from(people.entries()).map(([person, displayName]) => ({ person, displayName })),
+    };
   }
 
   // Compares a statement CSV against logged spending. A row counts as already
@@ -5229,52 +5310,99 @@ class FinanceTrackerPlugin extends Plugin {
     }
   }
 
+  // Two-ring donut: the inner ring is the major categories, the outer ring is
+  // every subcategory as a shade of its parent's hue. Falls back to a flat pie
+  // when nothing has subcategories.
   renderPieChart(wrapper, hierarchy, currency, threshold = 0.08) {
     const pieSection = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
     pieSection.createEl("h4", { text: "Category proportions" });
 
-    const { slices, total } = this.buildPieSlices(hierarchy);
-    if (!total) {
+    const total = hierarchy.groups.reduce((sum, group) => sum + group.total, 0);
+    if (total <= 0) {
       pieSection.createDiv({ cls: "finance-tracker-empty", text: "No categorized spending found for this period." });
       return;
     }
 
+    const hasSubcategories = hierarchy.groups.some((group) =>
+      group.children.some((child) => child.key !== group.key)
+    );
     const size = 460;
     const center = size / 2;
-    const radius = 180;
+    const outerRadius = 180;
+    const innerRadius = hasSubcategories ? 118 : outerRadius;
+    const ringInner = 126;
+
+    let angle = 0;
+    const majorSlices = hierarchy.groups
+      .filter((group) => group.total > 0)
+      .map((group) => {
+        const ratio = group.total / total;
+        const startAngle = angle;
+        angle += ratio * 360;
+        return { ...group, ratio, startAngle, endAngle: angle };
+      });
 
     const chartLayout = pieSection.createDiv({ cls: "finance-tracker-pie-layout" });
     const chartHost = chartLayout.createDiv({ cls: "finance-tracker-pie-host" });
     const svg = chartHost.createSvg("svg", {
       cls: "finance-tracker-pie-svg",
-      attr: { viewBox: `0 0 ${size} ${size}`, role: "img", "aria-label": "Spending by category pie chart" },
+      attr: { viewBox: `0 0 ${size} ${size}`, role: "img", "aria-label": "Spending by category donut chart" },
     });
 
-    for (const slice of slices) {
+    for (const slice of majorSlices) {
       if (slice.ratio >= 0.999) {
         svg.createSvg("circle", {
           cls: "finance-tracker-pie-slice",
-          attr: { cx: center, cy: center, r: radius, fill: slice.color },
+          attr: { cx: center, cy: center, r: innerRadius, fill: slice.color },
         });
       } else {
         svg.createSvg("path", {
           cls: "finance-tracker-pie-slice",
-          attr: { d: describePieSlice(center, center, radius, slice.startAngle, slice.endAngle), fill: slice.color },
+          attr: { d: describePieSlice(center, center, innerRadius, slice.startAngle, slice.endAngle), fill: slice.color },
         });
       }
-
       if (slice.ratio >= threshold) {
-        const labelPoint = centroidForSlice(center, center, radius, slice.startAngle, slice.endAngle);
+        const labelPoint = centroidForSlice(center, center, innerRadius, slice.startAngle, slice.endAngle);
         svg.createSvg("text", {
           cls: "finance-tracker-pie-label",
-          text: slice.label.split(" / ").pop(),
-          attr: { x: labelPoint.x, y: labelPoint.y - 8, "text-anchor": "middle" },
+          text: slice.label,
+          attr: { x: labelPoint.x, y: labelPoint.y + (hasSubcategories ? 2 : -8), "text-anchor": "middle" },
         });
-        svg.createSvg("text", {
-          cls: "finance-tracker-pie-value",
-          text: core.formatCurrency(slice.total, currency),
-          attr: { x: labelPoint.x, y: labelPoint.y + 12, "text-anchor": "middle" },
-        });
+        if (!hasSubcategories) {
+          svg.createSvg("text", {
+            cls: "finance-tracker-pie-value",
+            text: core.formatCurrency(slice.total, currency),
+            attr: { x: labelPoint.x, y: labelPoint.y + 12, "text-anchor": "middle" },
+          });
+        }
+      }
+    }
+
+    if (hasSubcategories) {
+      for (const slice of majorSlices) {
+        let childAngle = slice.startAngle;
+        for (const child of slice.children.filter((item) => item.total > 0)) {
+          const childRatio = child.total / total;
+          const childEnd = childAngle + childRatio * 360;
+          svg.createSvg("path", {
+            cls: "finance-tracker-pie-slice",
+            attr: {
+              d: describeAnnularSlice(center, center, ringInner, outerRadius, childAngle, childEnd),
+              fill: child.color,
+            },
+          });
+          if (childRatio >= threshold) {
+            const midAngle = childAngle + (childEnd - childAngle) / 2;
+            const labelPoint = polarToCartesian(center, center, (ringInner + outerRadius) / 2, midAngle);
+            const leaf = child.label.split(" / ").pop();
+            svg.createSvg("text", {
+              cls: "finance-tracker-pie-label",
+              text: leaf,
+              attr: { x: labelPoint.x, y: labelPoint.y + 4, "text-anchor": "middle" },
+            });
+          }
+          childAngle = childEnd;
+        }
       }
     }
 
@@ -7524,7 +7652,7 @@ class FinanceTrackerPlugin extends Plugin {
 
     this.renderSummary(wrapper, entries, currency, range, { previousTotal });
 
-    const hierarchy = core.buildHierarchicalCategoryGroups(entries, groupBy);
+    const hierarchy = core.buildHierarchicalCategoryGroups(entries, "full");
     this.renderPieChart(wrapper, hierarchy, currency, Number(this.settings.dashboardSliceLabelThreshold || 0.08));
 
     const budgets = await this.loadBudgets("default");
@@ -7588,9 +7716,22 @@ class QuickAddTransactionModal extends Modal {
     super(app);
     this.plugin = plugin;
     this.date = core.parseIsoDate(options.date || "") || core.todayIsoLocal();
+    this.dateFromNote = false;
+    // Optionally pre-fill the date from the daily note that is open right now.
+    if (!options.date && plugin.settings.quickAddUseNoteDate) {
+      const activeFile = app.workspace.getActiveFile();
+      const prefix = normalizePath(`${plugin.settings.dailyNotesFolder}/`);
+      if (activeFile && activeFile.path.startsWith(prefix)) {
+        const noteDate = core.extractNoteDate("", activeFile.path) || plugin.dailyNoteDateFromFileName(activeFile.name);
+        if (noteDate) {
+          this.date = noteDate;
+          this.dateFromNote = true;
+        }
+      }
+    }
   }
 
-  onOpen() {
+  async onOpen() {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("finance-quick-add");
@@ -7608,12 +7749,120 @@ class QuickAddTransactionModal extends Modal {
       attr: { placeholder: "12 nobu restaurants   ·   24 dinner split=2   ·   4.50 coffee snacks @yesterday" },
     });
 
+    // Suggestions derived from logging history: categories, merchants, people.
+    // Arrows cycle, Tab accepts, Esc closes; Enter always submits the entry.
+    const known = await this.plugin.collectKnownSuggestions();
+    this._known = known;
+    const popup = contentEl.createDiv({ cls: "finance-quick-add-suggestions" });
+    popup.hide();
+    let suggestions = [];
+    let highlighted = 0;
+
+    const hideSuggestions = () => {
+      suggestions = [];
+      highlighted = 0;
+      popup.empty();
+      popup.hide();
+    };
+
+    const currentToken = () => {
+      const pos = input.selectionStart ?? input.value.length;
+      const before = input.value.slice(0, pos);
+      const match = before.match(/(\S+)$/);
+      return { token: match ? match[1] : "", start: match ? pos - match[1].length : pos, end: pos };
+    };
+
+    const buildSuggestions = (token) => {
+      const lower = token.toLowerCase();
+      if (!token || /^\$?-?[\d.,]+$/.test(token) || /^@/.test(token) || /^split=/i.test(lower)) return [];
+      const out = [];
+      if (/^owed=/i.test(lower)) {
+        const query = lower.slice(5).replace(/^\W*/, "");
+        for (const person of known.people) {
+          if (!query || person.displayName.toLowerCase().startsWith(query) || person.person.startsWith(query)) {
+            out.push({ kind: "person", text: `owed=${person.displayName}:`, label: `owed=${person.displayName}:$…` });
+          }
+        }
+        return out.slice(0, 6);
+      }
+      const isTag = token.startsWith("#");
+      const query = isTag ? lower.slice(1) : lower;
+      if (!query) return [];
+      for (const path of known.categories) {
+        const matches = path.startsWith(query) || path.split("/").some((segment) => segment.startsWith(query));
+        if (!matches) continue;
+        out.push({ kind: "category", text: isTag ? `#${path}` : path, label: path });
+        if (out.length >= (isTag || token.includes("/") ? 6 : 3)) break;
+      }
+      if (!isTag && !token.includes("/")) {
+        for (const merchant of known.merchants) {
+          const name = merchant.name.toLowerCase();
+          if (!(name.startsWith(query) || name.split(/\s+/).some((word) => word.startsWith(query)))) continue;
+          out.push({
+            kind: "merchant",
+            text: merchant.name,
+            label: merchant.name,
+            category: merchant.category,
+          });
+          if (out.length >= 6) break;
+        }
+      }
+      return out.slice(0, 6);
+    };
+
+    const renderSuggestions = () => {
+      popup.empty();
+      if (!suggestions.length) {
+        popup.hide();
+        return;
+      }
+      popup.show();
+      suggestions.forEach((suggestion, index) => {
+        const row = popup.createDiv({ cls: `finance-quick-add-suggestion${index === highlighted ? " is-highlighted" : ""}` });
+        row.createSpan({ cls: "finance-quick-add-suggestion-kind", text: suggestion.kind });
+        row.createSpan({ text: suggestion.label });
+        if (suggestion.kind === "merchant" && suggestion.category) {
+          row.createSpan({ cls: "finance-quick-add-suggestion-hint", text: ` → ${suggestion.category}` });
+        }
+        row.addEventListener("mousedown", (event) => {
+          event.preventDefault();
+          acceptSuggestion(suggestion);
+        });
+      });
+    };
+
+    const updateSuggestions = () => {
+      const { token } = currentToken();
+      suggestions = buildSuggestions(token);
+      highlighted = 0;
+      renderSuggestions();
+    };
+
+    const acceptSuggestion = (suggestion) => {
+      const { start, end } = currentToken();
+      let insert = suggestion.text;
+      if (suggestion.kind === "merchant" && suggestion.category) {
+        const parsedNow = core.parseQuickAddInput(input.value, known.categories);
+        if (!parsedNow.category) insert = `${suggestion.text} #${suggestion.category}`;
+      }
+      const trailing = suggestion.kind === "person" ? "" : " ";
+      input.value = `${input.value.slice(0, start)}${insert}${trailing}${input.value.slice(end)}`;
+      const caret = start + insert.length + trailing.length;
+      input.setSelectionRange(caret, caret);
+      input.focus();
+      hideSuggestions();
+      update();
+    };
+
     const preview = contentEl.createDiv({ cls: "finance-quick-add-preview" });
 
     const dateRow = contentEl.createDiv({ cls: "finance-quick-add-daterow" });
     dateRow.createSpan({ text: "Date " });
     const dateInput = dateRow.createEl("input", { type: "date" });
     dateInput.value = this.date;
+    if (this.dateFromNote) {
+      dateRow.createSpan({ cls: "finance-quick-add-keep", text: " from the open note" });
+    }
     dateInput.addEventListener("change", () => {
       this.date = core.parseIsoDate(dateInput.value) || this.date;
       update();
@@ -7626,7 +7875,7 @@ class QuickAddTransactionModal extends Modal {
     const submit = buttons.createEl("button", { text: "Add", cls: "mod-cta" });
 
     const parseCurrent = () => {
-      const parsed = core.parseQuickAddInput(input.value, this.plugin.settings.categoryOptions || []);
+      const parsed = core.parseQuickAddInput(input.value, known.categories);
       let date = this.date;
       if (parsed.dateToken) {
         const resolved = this.plugin.resolveDateToken(parsed.dateToken);
@@ -7690,10 +7939,40 @@ class QuickAddTransactionModal extends Modal {
       }
     };
 
-    input.addEventListener("input", update);
+    input.addEventListener("input", () => {
+      update();
+      updateSuggestions();
+    });
+    input.addEventListener("blur", () => window.setTimeout(hideSuggestions, 150));
     input.addEventListener("keydown", (event) => {
+      if (suggestions.length) {
+        if (event.key === "ArrowDown") {
+          event.preventDefault();
+          highlighted = (highlighted + 1) % suggestions.length;
+          renderSuggestions();
+          return;
+        }
+        if (event.key === "ArrowUp") {
+          event.preventDefault();
+          highlighted = (highlighted - 1 + suggestions.length) % suggestions.length;
+          renderSuggestions();
+          return;
+        }
+        if (event.key === "Tab") {
+          event.preventDefault();
+          acceptSuggestion(suggestions[highlighted]);
+          return;
+        }
+        if (event.key === "Escape") {
+          event.preventDefault();
+          event.stopPropagation();
+          hideSuggestions();
+          return;
+        }
+      }
       if (event.key === "Enter") {
         event.preventDefault();
+        hideSuggestions();
         commit();
       }
     });
@@ -7715,7 +7994,7 @@ class EditTransactionModal extends Modal {
     this.entry = entry;
   }
 
-  onOpen() {
+  async onOpen() {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("finance-edit");
@@ -7733,7 +8012,8 @@ class EditTransactionModal extends Modal {
     catInput.value = entry.category || "uncategorized";
 
     const chips = contentEl.createDiv({ cls: "finance-edit-chips" });
-    for (const option of this.plugin.settings.categoryOptions || []) {
+    const known = await this.plugin.collectKnownSuggestions();
+    for (const option of known.categories.slice(0, 12)) {
       const chip = chips.createEl("button", { cls: "finance-edit-chip", text: core.displayCategoryPath(option) });
       chip.addEventListener("click", () => {
         catInput.value = option;
@@ -8705,12 +8985,8 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
     containerEl.createEl("h2", { text: "Finance Tracker" });
     containerEl.createEl("p", {
       cls: "finance-tracker-settings-intro",
-      text: "Configure capture behavior, dashboard defaults, holiday budgets, and the category list you use in Apple Shortcuts.",
+      text: "Configure capture behavior, dashboard defaults, holiday budgets, goals, and recurring payments.",
     });
-
-    const setupActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
-    const setupButton = setupActions.createEl("button", { text: "Run first-time setup", cls: "mod-cta" });
-    setupButton.addEventListener("click", () => new SetupWizardModal(this.app, this.plugin).open());
 
     const addSection = (title, description) => {
       containerEl.createEl("h3", { text: title });
@@ -8765,6 +9041,16 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName("Quick add uses the open daily note's date")
+      .setDesc("When quick add opens while a daily note is active, pre-fill the date from that note instead of today.")
+      .addToggle((toggle) =>
+        toggle.setValue(Boolean(this.plugin.settings.quickAddUseNoteDate)).onChange(async (value) => {
+          this.plugin.settings.quickAddUseNoteDate = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
       .setName("Open note after capture")
       .setDesc("Open the daily note immediately after an Apple Shortcut logs a transaction.")
       .addToggle((toggle) =>
@@ -8773,23 +9059,6 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         })
       );
-
-    addSection("Categories", "Use one category per line. These are the values to mirror in your Apple Shortcuts menu.");
-
-    new Setting(containerEl)
-      .setName("Shortcut categories")
-      .setDesc("Examples: food/groceries, food/restaurants, transport, subscription")
-      .addTextArea((text) => {
-        text
-          .setPlaceholder(DEFAULT_SETTINGS.categoryOptions.join("\n"))
-          .setValue((this.plugin.settings.categoryOptions || []).join("\n"))
-          .onChange(async (value) => {
-            this.plugin.settings.categoryOptions = normalizeCategoryOptions(value);
-            await this.plugin.saveSettings();
-          });
-        text.inputEl.rows = 10;
-        text.inputEl.addClass("finance-tracker-settings-textarea");
-      });
 
     addSection("Dashboard", "These defaults shape the weekly finance dashboard code block.");
 
@@ -8959,6 +9228,11 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
       await this.plugin.endTrip();
       this.display();
     });
+
+    addSection("First-time setup", "Re-run the guided setup to create any missing starter notes. Existing notes are never overwritten.");
+    const setupActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
+    const setupButton = setupActions.createEl("button", { text: "Run first-time setup" });
+    setupButton.addEventListener("click", () => new SetupWizardModal(this.app, this.plugin).open());
   }
 
   // Lists every non-archived goal note with an Active toggle (several holidays
