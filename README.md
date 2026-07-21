@@ -15,6 +15,8 @@ finance notes should be stored, your currency, and what to name the recurring
 payments note (changeable later in settings) — then creates the starter notes
 from templates embedded in the plugin:
 
+![First-time setup wizard: folders, currency, recurring note name, and starter notes to create](docs/images/setup-wizard.jpg)
+
 - `💸 Budgets.md` — the budget table
 - `📊 Finance Dashboard.md` — weekly/monthly dashboards, net worth, forecast, a sample query
 - `🔁 Recurring Payments.md` — the bill management page
@@ -25,11 +27,13 @@ The manual path, if you prefer:
 1. **Install & enable.** Copy this plugin to `.obsidian/plugins/finance-tracker/`,
    then Settings → Community plugins → enable **Finance Tracker**. (On mobile, turn
    on community plugins first.)
-2. **Set two things** in the plugin's settings tab:
+2. **Set two things** in the plugin's settings tab (Settings → Finance Tracker → Capture):
    - **Default currency** (e.g. `AUD`, `USD`).
    - **Daily notes folder** — point it at where you keep daily notes. Default is
      `Journal/Periodics/1. Daily`; the plugin routes captures to `<folder>/YYYY-MM-DD.md`
      (or `<folder>/YYYY/MM/YYYY-MM-DD.md` if you already use that structure).
+
+   ![Settings tab: Capture — daily notes folder, finance heading, currency, and capture toggles](docs/images/settings-capture.jpg)
 3. **Open the panel.** Click the **coin** ribbon icon (or run *Open daily budget*).
    This creates, on first run:
    - `Utility/Budgets/💸 Budgets.md` — a starter budget table you can edit.
@@ -63,6 +67,10 @@ Every transaction is a bullet under a `## Finance` heading in a daily note
 	- $4.20 #log/spending/food/snacks
 ```
 
+The same thing rendered in a real daily note:
+
+![A daily note with a Finance section of logged spending bullets](docs/images/daily-note-example.jpg)
+
 You rarely type this by hand. Four ways to log:
 
 | Method | Use it for |
@@ -81,6 +89,16 @@ You rarely type this by hand. Four ways to log:
 ### URL Shortcut (works with any sync)
 A Shortcut opens `obsidian://finance-capture?amount=12.5&merchant=Coles&category=food/groceries&source=manual`.
 The plugin logs it to today's note. This briefly foregrounds Obsidian but needs no filesystem access.
+
+The URL method also works as an **automation** — no Save File step needed on an Obsidian Sync vault.
+This is the actual automation used against an ANZ Plus card (`source=anz`): a **Transaction**
+trigger set to Run Immediately —
+
+![Automation trigger firing on an ANZ Plus card tap](docs/images/shortcut-automation-trigger.webp)
+
+— followed by URL-encoding the merchant, building the `obsidian://finance-capture` URL, and opening it:
+
+![Shortcut actions: URL Encode, Text, and Open URLs building the capture link](docs/images/shortcut-url-action.webp)
 
 **Shortcut D — "Log + confirm in Obsidian"**: build an **Open URL** action —
 `obsidian://finance-capture?vault=<vault>&amount=12.5&category=food/groceries&merchant=Coles&source=manual` —
@@ -163,11 +181,16 @@ First number = amount · a `cat/sub`, `#tag` or known category word = category �
 `@date` (ISO, `yesterday`, weekday, or anything the Natural Language Dates plugin parses) ·
 the rest = merchant.
 
+![Quick add transaction modal with a split entry and a backdated entry](docs/images/quick-add-modal.jpg)
+
 **Autocomplete** — as you type, suggestions appear for **categories**,
 **merchants**, and **people** (`owed=…`), all derived from what you have
 actually logged plus your budget table — there is no category list to maintain.
-Arrow keys cycle, **Tab** accepts, **Esc** dismisses; **Enter always submits**
-the entry. Accepting a known merchant also fills in its remembered category.
+Arrow keys cycle, **Tab** or **Enter** accepts the highlighted suggestion, **Esc**
+dismisses. Once no suggestions are showing, **Enter** submits the entry — so
+typing a full line is just Enter-Enter-Enter through each token, finishing on
+a plain Enter with the popup closed. Accepting a known merchant also fills in
+its remembered category.
 
 **Date from the open note** — with the *Quick add uses the open daily note's
 date* setting on (off by default), opening quick add while a daily note is
@@ -189,6 +212,11 @@ active pre-fills that note's date, so backfilling an old day is frictionless.
 The amount is a `$`-prefixed number on the bullet; a child line is the merchant, a
 second child is a note. Categories are slash paths (`food/restaurants`).
 
+Because every entry is just a tag, Obsidian's own tag pane doubles as a category
+browser — nested paths become a real tree, with a live count per level:
+
+![Obsidian's tag pane showing the nested #log/spending category tree with counts](docs/images/tag-hierarchy.jpg)
+
 ## Budgets
 
 Budgets are a markdown table in `Utility/Budgets/💸 Budgets.md`:
@@ -200,6 +228,10 @@ Budgets are a markdown table in `Utility/Budgets/💸 Budgets.md`:
 | Shopping     | shopping   |   200 | month  | AUD      |
 | All Spending | all        |   250 | week   | AUD      |
 ```
+
+A real budgets note, with the free-form Notes section people tend to add below the table:
+
+![The Budgets note: the table plus a Notes section explaining Period/Category/all](docs/images/budgets-note.jpg)
 
 - **Category** is a top-level group (`food`) or a path (`food/restaurants`); `all`
   budgets everything.
@@ -242,6 +274,8 @@ subcategories.) Subcategory shades are ranked by spend — the biggest subcatego
 in a group gets the lightest shade of that hue, the smallest the darkest — and
 hovering any slice shows its name, amount, and share of the total.
 
+![Finance dashboard donut chart with a hover tooltip on a subcategory slice](docs/images/dashboard-donut-tooltip.jpg)
+
 `holiday-dashboard` — planned vs actual trip spend, per-day budget remaining, and a
 trip calendar. Reads a goal note that has a `trip_tag` (see [Goals](#goals-savings--trips)),
 plus its Planned/Allocated tables. **Once the trip has ended** (past `end_date`,
@@ -251,12 +285,21 @@ average per day, biggest and quietest days, a per-category table (total, avg/day
 share, and the biggest single expense with its merchant), a spend-by-day chart,
 and planned-vs-paid. Force either mode with `view: live` or `view: reflection`.
 
+![Trip reflection: category breakdown, spend-by-day chart, and planned vs paid](docs/images/trip-reflection.jpg)
+
 `savings-dashboard` — per-goal progress, contributions, sinking-fund set-aside and
 pace. Reads a goal note (frontmatter `goal_key`, `target_amount`, `due_date`, …).
+
+![Savings dashboard: target, saved, pace, and required-this-period cards](docs/images/savings-dashboard.jpg)
 
 Every chart shares one **hue-family colour system**: each major category gets a
 base hue, its subcategories render as lighter/darker shades of that hue, and
 pies and legends rank by major-group total with subgroups nested beneath.
+
+These defaults — grouping, the pie label threshold, week start, and the budget
+check period — live in Settings → Dashboard:
+
+![Settings tab: Dashboard defaults — grouping, pie label threshold, week start, budget check period](docs/images/settings-dashboard.jpg)
 
 ## Goals (savings + trips)
 
@@ -265,6 +308,8 @@ Savings goals and holiday budgets share **one frontmatter schema**. Any goal wit
 set-aside needed per week and whether you're ahead of or behind the linear pace.
 A holiday is simply a goal that also has a `trip_tag`, dates, and a currency.
 Command: **Create savings goal** (or the buttons in settings).
+
+![Create savings goal modal: name, key, and optional due date](docs/images/create-savings-goal-modal.jpg)
 
 ```md
 ---
@@ -397,6 +442,8 @@ due in the next 30 days, and the cost per month and per year. An optional
 setting (**Auto-log recurring payments**) logs each item automatically on its
 due day.
 
+![Recurring payments block: summary cards and the upcoming-bills list](docs/images/recurring-payments-block.jpg)
+
 **Managing bills** — command **Open recurring payments note** creates a
 management page (a normal note with a `manage: true` block). In manage mode
 every item gets **Log now**, **Skip cycle** (logs a $0 entry on the due day,
@@ -406,6 +453,8 @@ for bills. It shows how much should already be set aside (each bill accrues
 day by day since it was last paid — half a year after an annual bill, half its
 cost should be reserved) and the steady per-week / per-month set-aside that
 keeps every cadence covered.
+
+![Bill reserve section: set-aside totals and the per-bill accrual list](docs/images/bill-reserve.jpg)
 
 **Pausing, archiving, and removing a bill** — **Pause** moves a bill straight
 into a collapsed **Archived** section at the bottom of the block (click to open
@@ -422,6 +471,17 @@ directly, or schedule a future price change with an exact date (e.g. "this
 subscription becomes $15.99 on the 1st") — the new amount applies itself
 automatically once that date arrives, and until then the block shows
 "changing to $X on `<date>`" next to the bill.
+
+Manage mode with a scheduled price change (Aussie Broadband Nbn, "changing to
+$66.50 on 2026-08-15") and the Archived section expanded, showing Resume and
+Remove completely:
+
+![Manage mode: Edit button, a scheduled price change, and the expanded Archived section](docs/images/recurring-archived-section.jpg)
+
+Settings → Recurring payments — current bills only, as a scrollable checkbox
+table with the header pinned while you scroll:
+
+![Settings tab: Recurring payments checkbox list with a pinned Bill/Current/Auto-log header](docs/images/settings-recurring-payments.jpg)
 
 **The registry** — per-bill state lives in a hand-editable table in the
 recurring payments note (the source of truth; the checkboxes in settings and
@@ -473,6 +533,8 @@ per person. **Settle up** logs the repayment as income
 (`- $12.00 #log/income/settleup/sam`) and appends `· settled <date>` to the owed
 lines.
 
+![Settle up split expenses modal, showing nothing outstanding](docs/images/settle-up-modal.jpg)
+
 ## Trip mode
 
 Commands: **Start trip** · **End trip**
@@ -505,6 +567,8 @@ Command: **Snapshot balances** · **Insert net worth block**
 Snapshot balances logs one bullet per account into today's daily note (accounts
 you've snapshotted before are pre-filled):
 
+![Snapshot balances modal, pre-filled with the last known balance](docs/images/snapshot-balances-modal.jpg)
+
 ```md
 - $5,230.00 #log/balance/anz-plus
 - $812.40 #log/balance/wise
@@ -516,6 +580,8 @@ The dashboard renders the balance trend from those bullets — no extra files:
 ```networth-dashboard
 ```
 ````
+
+![Net worth block: total, accounts, and the balance-trend card](docs/images/networth-dashboard.jpg)
 
 ## Query block
 
@@ -545,9 +611,16 @@ bars), `cumulative` (cumulative balance line).
 The **Daily Budget** sidebar (ribbon coin icon) shows today + period spend, a
 Left/Day card, a mini pie, compact pace-aware budget rows (tap a row for the
 detail), savings goals, split balances, and a **Needs a Category** triage list.
+
+<img src="docs/images/daily-budget-sidebar.jpg" alt="Daily Budget sidebar: totals, mini pie, and pace-aware budget bars" width="320">
+
 Tap a triage entry to edit its amount, category or merchant, delete it, or tick
 "remember this merchant → category" to teach the [merchant map](#merchant-map).
 Captures with a known merchant auto-categorise from it.
+
+![Needs a Category triage card for an uncategorised entry](docs/images/needs-a-category.jpg)
+
+![Edit transaction modal: category chips and the remember-merchant checkbox](docs/images/edit-transaction-modal.jpg)
 
 The **status bar** shows `💸 Today $X · Week $Y · 📥 N` (N = pending captures);
 click it to quick-add.

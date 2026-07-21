@@ -3787,13 +3787,8 @@ class FinanceTrackerPlugin extends Plugin {
       // merchant map is optional
     }
 
-    // Recurring-bill categories (subscriptions/...) are managed from the
-    // recurring payments note, not picked ad hoc — keep them out of quick-add
-    // and edit-transaction category suggestions.
-    const recurringPrefix = `${this.settings.recurringTagPrefix || "subscriptions"}/`;
     return {
       categories: Array.from(categoryCounts.entries())
-        .filter(([path]) => !path.startsWith(recurringPrefix))
         .sort((left, right) => right[1] - left[1])
         .map(([path]) => path),
       merchants: Array.from(merchantInfo.values()).sort((left, right) => right.count - left.count),
@@ -8237,7 +8232,10 @@ class QuickAddTransactionModal extends Modal {
           renderSuggestions();
           return;
         }
-        if (event.key === "Tab") {
+        if (event.key === "Tab" || event.key === "Enter") {
+          // First Enter (like Tab) accepts the highlighted suggestion; once the
+          // popup has nothing open, a second Enter falls through below and
+          // submits the entry instead.
           event.preventDefault();
           acceptSuggestion(suggestions[highlighted]);
           return;
@@ -9537,7 +9535,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
     });
 
     const goalListEl = containerEl.createDiv({ cls: "finance-tracker-goal-list" });
-    this.renderGoalList(goalListEl).catch(() => {});
+    this.renderGoalList(goalListEl, "holiday").catch(() => {});
 
     addSection("Savings goals", "Create standalone savings goal notes for things like a house deposit or rainy day fund. Any goal with a target amount and a due date shows sinking-fund math automatically.");
     const savingsActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
@@ -9547,6 +9545,9 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
         this.display();
       }).open();
     });
+
+    const savingsGoalListEl = containerEl.createDiv({ cls: "finance-tracker-goal-list" });
+    this.renderGoalList(savingsGoalListEl, "savings").catch(() => {});
 
     addSection(
       "Recurring payments",
@@ -9699,9 +9700,12 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
     }
   }
 
-  // Lists every non-archived goal note with an Active toggle (several holidays
-  // can be saved for at once) and a per-note Archive button.
-  async renderGoalList(listEl) {
+  // Lists non-archived goal notes with an Active toggle (several holidays can
+  // be saved for at once) and a per-note Archive button. `kind` scopes the
+  // list to just trips ("holiday") or just plain savings goals ("savings") so
+  // each settings section only shows its own notes — a savings goal has no
+  // trip_tag and shouldn't render under Holiday budgets.
+  async renderGoalList(listEl, kind = "all") {
     listEl.empty();
     const today = core.todayIsoLocal();
     const files = this.plugin.getHolidayBudgetFiles();
@@ -9711,11 +9715,16 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
       const generic = meta?.holidayKey ? null : this.plugin.parseSavingsGoalContent(await this.app.vault.cachedRead(file), file.path);
       if (!meta?.holidayKey && !generic?.goalKey) continue;
       if (meta?.archivedDate || generic?.archivedDate) continue;
+      const isHoliday = Boolean(meta?.holidayKey);
+      if (kind === "holiday" && !isHoliday) continue;
+      if (kind === "savings" && isHoliday) continue;
       rows.push({ file, meta, generic });
     }
 
     if (!rows.length) {
-      listEl.createDiv({ cls: "finance-tracker-empty", text: "No goal or holiday notes yet." });
+      const emptyText =
+        kind === "holiday" ? "No holiday budgets yet." : kind === "savings" ? "No savings goals yet." : "No goal or holiday notes yet.";
+      listEl.createDiv({ cls: "finance-tracker-empty", text: emptyText });
       return;
     }
 
@@ -9747,7 +9756,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
         button.setButtonText("Archive").onClick(async () => {
           const archivePath = await this.plugin.archiveGoalNote(row.file);
           new Notice(`Archived ${name} to ${archivePath}`);
-          await this.renderGoalList(listEl);
+          await this.renderGoalList(listEl, kind);
         })
       );
     }
