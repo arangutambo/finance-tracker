@@ -1836,7 +1836,7 @@ function computeRecurringReserve(recurring, referenceDate) {
 
   for (const item of recurring?.items || []) {
     const spec = RECURRING_CADENCES[item.cadence];
-    if (!spec || !item.lastDate || !(item.lastAmount > 0)) continue;
+    if (!spec || !item.lastDate || !(item.lastAmount > 0) || item.active === false) continue;
     const cycleDays = spec.days || Math.round(30.44 * spec.months);
     const perYear = item.lastAmount * spec.perMonth * 12;
     const daysSinceLast = Math.max(0, daysBetweenInclusive(item.lastDate, today) - 1);
@@ -1871,6 +1871,70 @@ function computeRecurringReserve(recurring, referenceDate) {
       dueNext30Days: roundCurrencyAmount(dueSoonTotal),
       perMonth: roundCurrencyAmount(perYearTotal / 12),
       perWeek: roundCurrencyAmount(perYearTotal / 52),
+    },
+  };
+}
+
+// The recurring registry is a hand-editable markdown table (in the recurring
+// payments note) that holds per-item state the tags cannot: whether a bill is
+// still current (Active), whether it may be auto-logged (Auto-log), and an
+// optional amount override. Blank cells keep the defaults, so an absent table
+// changes nothing.
+function parseRecurringRegistry(content) {
+  const registry = new Map();
+  for (const rows of parseMarkdownTable(content)) {
+    for (const row of rows) {
+      const name = normalizeCategoryPath(row.item || row.name || "");
+      if (!name || !("active" in row || "auto-log" in row || "autolog" in row || "current" in row)) continue;
+      const activeRaw = String(row.active ?? row.current ?? "").trim();
+      const autoRaw = String(row["auto-log"] ?? row.autolog ?? row.auto ?? "").trim();
+      const amount = parseNumber(row.amount);
+      const nextAmount = parseNumber(row["next amount"] ?? row.nextamount);
+      const changeDate = parseIsoDate(row["change date"] ?? row.changedate ?? "");
+      registry.set(name, {
+        active: activeRaw ? !/^(?:no|false|0|inactive|paused)$/i.test(activeRaw) : true,
+        autoLog: autoRaw ? /^(?:yes|true|1|on)$/i.test(autoRaw) : null,
+        amount: Number.isFinite(amount) && amount > 0 ? roundCurrencyAmount(amount) : null,
+        nextAmount: Number.isFinite(nextAmount) && nextAmount > 0 ? roundCurrencyAmount(nextAmount) : null,
+        changeDate: changeDate || null,
+        cadence: normalizeCadence(row.cadence || ""),
+      });
+    }
+  }
+  return registry;
+}
+
+// Overlays registry state onto detected recurring items: inactive items are
+// kept (so they can be resumed) but flagged and excluded from the totals. A
+// scheduled Next Amount/Change Date pair is purely informational until the
+// change date arrives, at which point it is promoted to the effective amount.
+function applyRecurringRegistry(recurring, registry, referenceDate = todayIsoLocal()) {
+  const items = (recurring?.items || []).map((item) => {
+    const entry = registry?.get(item.name) || registry?.get(item.name.split("/").pop());
+    const active = entry ? entry.active !== false : true;
+    const autoLog = entry && entry.autoLog !== null && entry.autoLog !== undefined ? entry.autoLog : true;
+    const overrideAmount = entry?.amount > 0 ? entry.amount : item.lastAmount;
+    const changePending = entry?.nextAmount > 0 && entry?.changeDate && entry.changeDate > referenceDate;
+    const changeApplied = entry?.nextAmount > 0 && entry?.changeDate && entry.changeDate <= referenceDate;
+    const lastAmount = changeApplied ? entry.nextAmount : overrideAmount;
+    const spec = RECURRING_CADENCES[item.cadence];
+    return {
+      ...item,
+      active,
+      autoLog,
+      lastAmount,
+      nextAmount: changePending ? entry.nextAmount : null,
+      changeDate: changePending ? entry.changeDate : null,
+      monthlyCost: spec ? roundCurrencyAmount(lastAmount * spec.perMonth) : item.monthlyCost,
+      yearlyCost: spec ? roundCurrencyAmount(lastAmount * spec.perMonth * 12) : item.yearlyCost,
+    };
+  });
+  const activeItems = items.filter((item) => item.active);
+  return {
+    items,
+    totals: {
+      monthly: roundCurrencyAmount(activeItems.reduce((sum, item) => sum + item.monthlyCost, 0)),
+      yearly: roundCurrencyAmount(activeItems.reduce((sum, item) => sum + item.yearlyCost, 0)),
     },
   };
 }
@@ -2293,10 +2357,15 @@ function categoryBaseColor(rank) {
   return { hue, saturation: 58, lightness: 44 };
 }
 
-function categoryShadeColor(base, childIndex) {
-  const offsets = [0, 10, -9, 18, -15, 25, -20, 31];
-  const offset = offsets[childIndex % offsets.length] + Math.floor(childIndex / offsets.length) * 3;
-  const lightness = Math.max(22, Math.min(74, base.lightness + offset));
+// Ramps lightness monotonically across siblings: childIndex 0 (the biggest
+// spender, since children are ranked largest-first) gets the lightest shade,
+// the last sibling gets the darkest, so shade reads directly as rank.
+function categoryShadeColor(base, childIndex, siblingCount = 1) {
+  const maxLightness = Math.min(74, base.lightness + 22);
+  const minLightness = Math.max(22, base.lightness - 22);
+  if (siblingCount <= 1) return `hsl(${base.hue}, ${base.saturation}%, ${maxLightness}%)`;
+  const ratio = childIndex / (siblingCount - 1);
+  const lightness = Math.round(maxLightness - ratio * (maxLightness - minLightness));
   return `hsl(${base.hue}, ${base.saturation}%, ${lightness}%)`;
 }
 
@@ -2327,13 +2396,12 @@ function buildHierarchicalCategoryGroups(entries, groupBy = "primary") {
   const groups = ranked.map((major, majorIndex) => {
     const base = categoryBaseColor(majorIndex);
     const color = categoryShadeColor(base, 0);
-    const children = Array.from(major.children.values())
-      .sort((left, right) => right.total - left.total)
-      .map((child, childIndex) => ({
-        ...child,
-        color: categoryShadeColor(base, childIndex),
-        parent: major.key,
-      }));
+    const sortedChildren = Array.from(major.children.values()).sort((left, right) => right.total - left.total);
+    const children = sortedChildren.map((child, childIndex) => ({
+      ...child,
+      color: categoryShadeColor(base, childIndex, sortedChildren.length),
+      parent: major.key,
+    }));
     for (const child of children) slices.push(child);
     return { ...major, children, color };
   });
@@ -2554,6 +2622,8 @@ function buildGoalArchiveSummaryLines(goal, entries, referenceDate) {
 }
 
 module.exports = {
+  parseRecurringRegistry,
+  applyRecurringRegistry,
   buildTripReflection,
   computeRecurringReserve,
   buildGoalArchiveSummaryLines,

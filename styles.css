@@ -75,6 +75,7 @@
 }
 
 .finance-tracker-pie-host {
+  position: relative;
   display: flex;
   justify-content: center;
   align-items: center;
@@ -88,6 +89,34 @@
 .finance-tracker-pie-slice {
   stroke: var(--background-primary);
   stroke-width: 2;
+  cursor: pointer;
+}
+
+.finance-tracker-pie-tooltip {
+  position: absolute;
+  z-index: 2;
+  pointer-events: none;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-primary);
+  box-shadow: var(--shadow-s);
+  padding: 6px 10px;
+  font-size: 0.85em;
+  line-height: 1.4;
+  white-space: nowrap;
+  transform: translate(-50%, calc(-100% - 10px));
+}
+
+.finance-tracker-pie-tooltip.is-hidden {
+  display: none;
+}
+
+.finance-tracker-pie-tooltip-title {
+  font-weight: 600;
+}
+
+.finance-tracker-pie-tooltip-meta {
+  color: var(--text-muted);
 }
 
 .finance-tracker-pie-label,
@@ -675,6 +704,7 @@
 .finance-edit-chip { font-size: 0.8em; padding: 0.2em 0.55em; }
 .finance-edit-remember { display: block; color: var(--text-muted); font-size: 0.9em; margin: 0.4em 0; }
 .finance-edit-buttons { display: flex; justify-content: space-between; margin-top: 0.75em; }
+.finance-edit-schedule.is-hidden { display: none; }
 
 /* ============================================================
    0.2.0 — shared dashboard polish
@@ -1041,4 +1071,81 @@
 .finance-quick-add-suggestion-hint {
   color: var(--text-muted);
   font-size: 0.85em;
+}
+
+/* ---- Recurring registry: paused bills ---- */
+.finance-tracker-recurring-row.is-paused {
+  opacity: 0.55;
+}
+
+.finance-tracker-recurring-row.is-paused .finance-tracker-budget-title {
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
+.finance-tracker-archived > summary {
+  cursor: pointer;
+  font-size: 0.95em;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--text-normal);
+}
+
+.finance-tracker-archived[open] > summary {
+  margin-bottom: 12px;
+}
+
+.finance-tracker-archived .finance-tracker-budget-list {
+  margin-top: 4px;
+}
+
+/* ---- Settings: recurring payments list (scrollable, sticky header, checkboxes) ---- */
+.finance-tracker-recurring-settings-scroll {
+  max-height: 360px;
+  overflow-y: auto;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+}
+
+.finance-tracker-recurring-settings-header,
+.finance-tracker-recurring-settings-row {
+  display: grid;
+  grid-template-columns: 1fr 70px 70px;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+}
+
+.finance-tracker-recurring-settings-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--background-primary);
+  font-weight: 600;
+  font-size: 0.85em;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.finance-tracker-recurring-settings-header span:not(:first-child),
+.finance-tracker-recurring-settings-row .finance-tracker-recurring-check {
+  text-align: center;
+  justify-self: center;
+}
+
+.finance-tracker-recurring-settings-row {
+  border-bottom: 1px solid var(--background-modifier-border-hover);
+}
+
+.finance-tracker-recurring-settings-row:last-child {
+  border-bottom: none;
+}
+
+.finance-tracker-recurring-check {
+  display: flex;
+  justify-content: center;
+}
+
+.finance-tracker-recurring-check input[type="checkbox"] {
+  margin: 0;
 }

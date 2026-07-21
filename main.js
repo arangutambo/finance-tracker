@@ -1739,7 +1739,7 @@ const core = (() => {
 
     for (const item of recurring?.items || []) {
       const spec = RECURRING_CADENCES[item.cadence];
-      if (!spec || !item.lastDate || !(item.lastAmount > 0)) continue;
+      if (!spec || !item.lastDate || !(item.lastAmount > 0) || item.active === false) continue;
       const cycleDays = spec.days || Math.round(30.44 * spec.months);
       const perYear = item.lastAmount * spec.perMonth * 12;
       const daysSinceLast = Math.max(0, daysBetweenInclusive(item.lastDate, today) - 1);
@@ -1774,6 +1774,70 @@ const core = (() => {
         dueNext30Days: roundCurrencyAmount(dueSoonTotal),
         perMonth: roundCurrencyAmount(perYearTotal / 12),
         perWeek: roundCurrencyAmount(perYearTotal / 52),
+      },
+    };
+  }
+
+  // The recurring registry is a hand-editable markdown table (in the recurring
+  // payments note) that holds per-item state the tags cannot: whether a bill is
+  // still current (Active), whether it may be auto-logged (Auto-log), and an
+  // optional amount override. Blank cells keep the defaults, so an absent table
+  // changes nothing.
+  function parseRecurringRegistry(content) {
+    const registry = new Map();
+    for (const rows of parseMarkdownTable(content)) {
+      for (const row of rows) {
+        const name = normalizeCategoryPath(row.item || row.name || "");
+        if (!name || !("active" in row || "auto-log" in row || "autolog" in row || "current" in row)) continue;
+        const activeRaw = String(row.active ?? row.current ?? "").trim();
+        const autoRaw = String(row["auto-log"] ?? row.autolog ?? row.auto ?? "").trim();
+        const amount = parseNumber(row.amount);
+        const nextAmount = parseNumber(row["next amount"] ?? row.nextamount);
+        const changeDate = parseIsoDate(row["change date"] ?? row.changedate ?? "");
+        registry.set(name, {
+          active: activeRaw ? !/^(?:no|false|0|inactive|paused)$/i.test(activeRaw) : true,
+          autoLog: autoRaw ? /^(?:yes|true|1|on)$/i.test(autoRaw) : null,
+          amount: Number.isFinite(amount) && amount > 0 ? roundCurrencyAmount(amount) : null,
+          nextAmount: Number.isFinite(nextAmount) && nextAmount > 0 ? roundCurrencyAmount(nextAmount) : null,
+          changeDate: changeDate || null,
+          cadence: normalizeCadence(row.cadence || ""),
+        });
+      }
+    }
+    return registry;
+  }
+
+  // Overlays registry state onto detected recurring items: inactive items are
+  // kept (so they can be resumed) but flagged and excluded from the totals. A
+  // scheduled Next Amount/Change Date pair is purely informational until the
+  // change date arrives, at which point it is promoted to the effective amount.
+  function applyRecurringRegistry(recurring, registry, referenceDate = todayIsoLocal()) {
+    const items = (recurring?.items || []).map((item) => {
+      const entry = registry?.get(item.name) || registry?.get(item.name.split("/").pop());
+      const active = entry ? entry.active !== false : true;
+      const autoLog = entry && entry.autoLog !== null && entry.autoLog !== undefined ? entry.autoLog : true;
+      const overrideAmount = entry?.amount > 0 ? entry.amount : item.lastAmount;
+      const changePending = entry?.nextAmount > 0 && entry?.changeDate && entry.changeDate > referenceDate;
+      const changeApplied = entry?.nextAmount > 0 && entry?.changeDate && entry.changeDate <= referenceDate;
+      const lastAmount = changeApplied ? entry.nextAmount : overrideAmount;
+      const spec = RECURRING_CADENCES[item.cadence];
+      return {
+        ...item,
+        active,
+        autoLog,
+        lastAmount,
+        nextAmount: changePending ? entry.nextAmount : null,
+        changeDate: changePending ? entry.changeDate : null,
+        monthlyCost: spec ? roundCurrencyAmount(lastAmount * spec.perMonth) : item.monthlyCost,
+        yearlyCost: spec ? roundCurrencyAmount(lastAmount * spec.perMonth * 12) : item.yearlyCost,
+      };
+    });
+    const activeItems = items.filter((item) => item.active);
+    return {
+      items,
+      totals: {
+        monthly: roundCurrencyAmount(activeItems.reduce((sum, item) => sum + item.monthlyCost, 0)),
+        yearly: roundCurrencyAmount(activeItems.reduce((sum, item) => sum + item.yearlyCost, 0)),
       },
     };
   }
@@ -2196,10 +2260,15 @@ const core = (() => {
     return { hue, saturation: 58, lightness: 44 };
   }
 
-  function categoryShadeColor(base, childIndex) {
-    const offsets = [0, 10, -9, 18, -15, 25, -20, 31];
-    const offset = offsets[childIndex % offsets.length] + Math.floor(childIndex / offsets.length) * 3;
-    const lightness = Math.max(22, Math.min(74, base.lightness + offset));
+  // Ramps lightness monotonically across siblings: childIndex 0 (the biggest
+  // spender, since children are ranked largest-first) gets the lightest shade,
+  // the last sibling gets the darkest, so shade reads directly as rank.
+  function categoryShadeColor(base, childIndex, siblingCount = 1) {
+    const maxLightness = Math.min(74, base.lightness + 22);
+    const minLightness = Math.max(22, base.lightness - 22);
+    if (siblingCount <= 1) return `hsl(${base.hue}, ${base.saturation}%, ${maxLightness}%)`;
+    const ratio = childIndex / (siblingCount - 1);
+    const lightness = Math.round(maxLightness - ratio * (maxLightness - minLightness));
     return `hsl(${base.hue}, ${base.saturation}%, ${lightness}%)`;
   }
 
@@ -2230,13 +2299,12 @@ const core = (() => {
     const groups = ranked.map((major, majorIndex) => {
       const base = categoryBaseColor(majorIndex);
       const color = categoryShadeColor(base, 0);
-      const children = Array.from(major.children.values())
-        .sort((left, right) => right.total - left.total)
-        .map((child, childIndex) => ({
-          ...child,
-          color: categoryShadeColor(base, childIndex),
-          parent: major.key,
-        }));
+      const sortedChildren = Array.from(major.children.values()).sort((left, right) => right.total - left.total);
+      const children = sortedChildren.map((child, childIndex) => ({
+        ...child,
+        color: categoryShadeColor(base, childIndex, sortedChildren.length),
+        parent: major.key,
+      }));
       for (const child of children) slices.push(child);
       return { ...major, children, color };
     });
@@ -2457,6 +2525,8 @@ const core = (() => {
   }
   return {
     addMonths,
+    parseRecurringRegistry,
+    applyRecurringRegistry,
     buildTripReflection,
     computeRecurringReserve,
     buildGoalArchiveSummaryLines,
@@ -2589,9 +2659,12 @@ const DEFAULT_SETTINGS = {
   weekStartsOn: "monday",
   captureInboxFolder: "Utility/Finance/Inbox",
   merchantMapPath: "Utility/Finance/Merchant Map.md",
+  merchantMap: {},
   autoDrainInbox: true,
   processedExternalIds: [],
   recurringTagPrefix: "subscriptions",
+  recurringNoteName: "🔁 Recurring Payments.md",
+  excludedRecurringItems: [],
   autoLogRecurring: false,
   quickAddUseNoteDate: false,
   tripModeActive: false,
@@ -3371,6 +3444,8 @@ class FinanceTrackerPlugin extends Plugin {
       this.settings.defaultBudgetNoteName = DEFAULT_SETTINGS.defaultBudgetNoteName;
     }
     this.settings.activeHolidayBudgetPath = this.settings.activeHolidayBudgetPath || "";
+    this.settings.merchantMap = this.settings.merchantMap || {};
+    await this.migrateMerchantMapFile();
   }
 
   async saveSettings() {
@@ -3621,21 +3696,35 @@ class FinanceTrackerPlugin extends Plugin {
     await this.saveSettings();
   }
 
-  async loadMerchantMap() {
+  // The merchant map lives in plugin settings (data.json), not a vault file —
+  // it's populated automatically by the "remember this merchant" checkbox and
+  // edited/removed from Settings → Merchant map, never hand-edited as markdown.
+  loadMerchantMap() {
+    return new Map(Object.entries(this.settings.merchantMap || {}));
+  }
+
+  // One-time upgrade from the old markdown-file merchant map: reads whatever
+  // is there, folds it into settings, and removes the now-redundant file.
+  async migrateMerchantMapFile() {
+    if (this.settings.merchantMap && Object.keys(this.settings.merchantMap).length) return;
     const path = normalizePath(this.settings.merchantMapPath || "");
-    const map = new Map();
-    if (!path) return map;
+    if (!path) return;
     const file = this.app.vault.getAbstractFileByPath(path);
-    if (!(file instanceof TFile)) return map;
+    if (!(file instanceof TFile)) return;
     const content = await this.app.vault.cachedRead(file);
+    const migrated = {};
     for (const rows of core.parseMarkdownTable(content)) {
       for (const row of rows) {
         const merchant = core.normalizeMerchant(row.merchant || row.payee || row.name || "");
         const category = core.normalizeCategoryPath(row.category || row.cat || "");
-        if (merchant && category) map.set(merchant, category);
+        if (merchant && category) migrated[merchant] = category;
       }
     }
-    return map;
+    if (Object.keys(migrated).length) {
+      this.settings.merchantMap = migrated;
+      await this.saveSettings();
+    }
+    await this.app.vault.delete(file);
   }
 
   async guessCategoryForMerchant(merchant) {
@@ -3698,8 +3787,13 @@ class FinanceTrackerPlugin extends Plugin {
       // merchant map is optional
     }
 
+    // Recurring-bill categories (subscriptions/...) are managed from the
+    // recurring payments note, not picked ad hoc — keep them out of quick-add
+    // and edit-transaction category suggestions.
+    const recurringPrefix = `${this.settings.recurringTagPrefix || "subscriptions"}/`;
     return {
       categories: Array.from(categoryCounts.entries())
+        .filter(([path]) => !path.startsWith(recurringPrefix))
         .sort((left, right) => right[1] - left[1])
         .map(([path]) => path),
       merchants: Array.from(merchantInfo.values()).sort((left, right) => right.count - left.count),
@@ -3816,28 +3910,20 @@ class FinanceTrackerPlugin extends Plugin {
   }
 
   async rememberMerchantCategory(merchant, category) {
-    const cleanMerchant = String(merchant || "").replace(/\s+/g, " ").trim();
+    const cleanMerchant = core.normalizeMerchant(merchant);
     const cleanCategory = core.normalizeCategoryPath(category);
     if (!cleanMerchant || !cleanCategory) return;
-    const path = normalizePath(this.settings.merchantMapPath || "");
-    if (!path) return;
-    const existing = await this.loadMerchantMap();
-    if (existing.get(core.normalizeMerchant(cleanMerchant)) === cleanCategory) return;
-    const row = `| ${cleanMerchant} | ${cleanCategory} |`;
-    const file = this.app.vault.getAbstractFileByPath(path);
-    if (!(file instanceof TFile)) {
-      await this.upsertFile(path, `# Merchant Map\n\n| Merchant | Category |\n| --- | --- |\n${row}\n`);
-      return;
-    }
-    const content = await this.app.vault.cachedRead(file);
-    const lines = content.split("\n");
-    const sepIndex = lines.findIndex((line) => /^\s*\|[\s:\-|]+\|\s*$/.test(line));
-    if (sepIndex >= 0) {
-      lines.splice(sepIndex + 1, 0, row);
-    } else {
-      lines.push("", "| Merchant | Category |", "| --- | --- |", row);
-    }
-    await _ftModify(this.app,file, lines.join("\n"));
+    if (this.settings.merchantMap?.[cleanMerchant] === cleanCategory) return;
+    this.settings.merchantMap = { ...this.settings.merchantMap, [cleanMerchant]: cleanCategory };
+    await this.saveSettings();
+  }
+
+  async forgetMerchantCategory(merchant) {
+    if (!this.settings.merchantMap || !(merchant in this.settings.merchantMap)) return;
+    const next = { ...this.settings.merchantMap };
+    delete next[merchant];
+    this.settings.merchantMap = next;
+    await this.saveSettings();
   }
 
   countPendingCaptures() {
@@ -4575,26 +4661,26 @@ class FinanceTrackerPlugin extends Plugin {
     const budgetsPrefix = normalizePath(`${this.settings.budgetsFolderPath}/`);
     const archivePrefix = normalizePath(`${this.settings.budgetArchiveFolderPath}/`);
     const defaultBudgetPath = this.getDefaultBudgetNotePath();
+    const recurringNotePath = this.getRecurringNotePath();
     return this.app.vault
       .getMarkdownFiles()
       .filter((file) => file.path.startsWith(budgetsPrefix))
       .filter((file) => !file.path.startsWith(archivePrefix))
-      .filter((file) => file.path !== defaultBudgetPath);
+      .filter((file) => file.path !== defaultBudgetPath)
+      .filter((file) => file.path !== recurringNotePath);
   }
 
   getSavingsGoalFiles() {
     const budgetsPrefix = normalizePath(`${this.settings.budgetsFolderPath}/`);
     const archivePrefix = normalizePath(`${this.settings.budgetArchiveFolderPath}/`);
     const defaultBudgetPath = this.getDefaultBudgetNotePath();
+    const recurringNotePath = this.getRecurringNotePath();
     return this.app.vault
       .getMarkdownFiles()
       .filter((file) => file.path.startsWith(budgetsPrefix))
       .filter((file) => !file.path.startsWith(archivePrefix))
       .filter((file) => file.path !== defaultBudgetPath)
-      .filter((file) => {
-        const content = this.app.vault.cachedRead ? true : true;
-        return true;
-      });
+      .filter((file) => file.path !== recurringNotePath);
   }
 
   async createOrOpenHolidayBudget(definition) {
@@ -4781,7 +4867,10 @@ class FinanceTrackerPlugin extends Plugin {
       "",
       "- **Log now** logs the bill dated on its due day, so the cadence never drifts.",
       "- **Skip cycle** logs a $0 entry on the due day — the schedule moves on, the amount is remembered.",
-      "- A price change is just the next logged amount; the plugin always uses the latest.",
+      "- A price change is just the next logged amount; the plugin always uses the latest —",
+      "  or use **Edit** in manage mode to schedule a future change with an exact date.",
+      "- Pausing a bill moves it into the **Archived** section below, collapsed until you open it;",
+      "  from there you can **Resume** it or **Remove completely** so it's never tracked again.",
       "- **Bill reserve** below is the sinking fund for bills: what should already be set",
       "  aside so quarterly and yearly bills never surprise you, and the steady per-week amount that keeps it that way.",
       "",
@@ -4789,13 +4878,23 @@ class FinanceTrackerPlugin extends Plugin {
       "manage: true",
       "```",
       "",
+      "## Registry",
+      "",
+      "Hand-editable per-bill state (the checkboxes in settings and the manage block",
+      "write to this table): set **Active** to `no` to pause a cancelled bill,",
+      "**Auto-log** to `yes` to log it automatically on its due day, fill",
+      "**Amount** to override the inferred price, and fill **Next Amount** + **Change Date**",
+      "to schedule a future price change — it's applied automatically once the date arrives.",
+      "",
+      "| Item | Cadence | Amount | Active | Auto-log | Next Amount | Change Date |",
+      "| --- | --- | ---: | --- | --- | ---: | --- |",
+      "",
     ].join("\n");
   }
 
   async openRecurringNote() {
     await this.ensureBudgetInfrastructure();
-    const path = normalizePath(`${this.settings.budgetsFolderPath}/🔁 Recurring Payments.md`);
-    const file = await this.ensureTextFile(path, () => this.buildRecurringNoteContent());
+    const file = await this.ensureTextFile(this.getRecurringNotePath(), () => this.buildRecurringNoteContent());
     await this.app.workspace.getLeaf(true).openFile(file);
   }
 
@@ -5348,19 +5447,37 @@ class FinanceTrackerPlugin extends Plugin {
       cls: "finance-tracker-pie-svg",
       attr: { viewBox: `0 0 ${size} ${size}`, role: "img", "aria-label": "Spending by category donut chart" },
     });
+    const tooltip = chartHost.createDiv({ cls: "finance-tracker-pie-tooltip is-hidden" });
+    const tooltipTitle = tooltip.createDiv({ cls: "finance-tracker-pie-tooltip-title" });
+    const tooltipMeta = tooltip.createDiv({ cls: "finance-tracker-pie-tooltip-meta" });
+    const attachTooltip = (el, label, amount, ratio) => {
+      const show = (event) => {
+        tooltipTitle.setText(label);
+        tooltipMeta.setText(`${core.formatCurrency(amount, currency)} · ${Math.round(ratio * 100)}%`);
+        tooltip.removeClass("is-hidden");
+        const hostRect = chartHost.getBoundingClientRect();
+        tooltip.style.left = `${event.clientX - hostRect.left}px`;
+        tooltip.style.top = `${event.clientY - hostRect.top}px`;
+      };
+      el.addEventListener("pointerenter", show);
+      el.addEventListener("pointermove", show);
+      el.addEventListener("pointerleave", () => tooltip.addClass("is-hidden"));
+    };
 
     for (const slice of majorSlices) {
+      let majorEl;
       if (slice.ratio >= 0.999) {
-        svg.createSvg("circle", {
+        majorEl = svg.createSvg("circle", {
           cls: "finance-tracker-pie-slice",
           attr: { cx: center, cy: center, r: innerRadius, fill: slice.color },
         });
       } else {
-        svg.createSvg("path", {
+        majorEl = svg.createSvg("path", {
           cls: "finance-tracker-pie-slice",
           attr: { d: describePieSlice(center, center, innerRadius, slice.startAngle, slice.endAngle), fill: slice.color },
         });
       }
+      attachTooltip(majorEl, slice.label, slice.total, slice.ratio);
       if (slice.ratio >= threshold) {
         const labelPoint = centroidForSlice(center, center, innerRadius, slice.startAngle, slice.endAngle);
         svg.createSvg("text", {
@@ -5384,13 +5501,14 @@ class FinanceTrackerPlugin extends Plugin {
         for (const child of slice.children.filter((item) => item.total > 0)) {
           const childRatio = child.total / total;
           const childEnd = childAngle + childRatio * 360;
-          svg.createSvg("path", {
+          const childEl = svg.createSvg("path", {
             cls: "finance-tracker-pie-slice",
             attr: {
               d: describeAnnularSlice(center, center, ringInner, outerRadius, childAngle, childEnd),
               fill: child.color,
             },
           });
+          attachTooltip(childEl, child.label, child.total, childRatio);
           if (childRatio >= threshold) {
             const midAngle = childAngle + (childEnd - childAngle) / 2;
             const labelPoint = polarToCartesian(center, center, (ringInner + outerRadius) / 2, midAngle);
@@ -6889,10 +7007,103 @@ class FinanceTrackerPlugin extends Plugin {
 
   async detectRecurring(referenceDate, prefix = "") {
     const entries = await this.collectAllTransactions();
-    return core.detectRecurringPayments(entries, {
+    const today = referenceDate || core.todayIsoLocal();
+    const detected = core.detectRecurringPayments(entries, {
       prefix: prefix || this.settings.recurringTagPrefix || "subscriptions",
-      referenceDate: referenceDate || core.todayIsoLocal(),
+      referenceDate: today,
     });
+    const applied = core.applyRecurringRegistry(detected, await this.loadRecurringRegistry(), today);
+    return this.excludeRemovedRecurringItems(applied);
+  }
+
+  // Bills the user chose to "remove completely" from the Archived section
+  // never resurface, even though detection is tag-driven off history — this
+  // filter is the one place every consumer (settings, the dashboard block,
+  // auto-logging) shares, so a single exclusion list covers all of them.
+  excludeRemovedRecurringItems(applied) {
+    const excluded = new Set(this.settings.excludedRecurringItems || []);
+    if (!excluded.size) return applied;
+    return { ...applied, items: applied.items.filter((item) => !excluded.has(item.name)) };
+  }
+
+  async removeRecurringItemCompletely(item) {
+    const excluded = new Set(this.settings.excludedRecurringItems || []);
+    excluded.add(item.name);
+    this.settings.excludedRecurringItems = Array.from(excluded);
+    await this.saveSettings();
+  }
+
+  getRecurringNotePath() {
+    return normalizePath(`${this.settings.budgetsFolderPath}/${this.settings.recurringNoteName || DEFAULT_SETTINGS.recurringNoteName}`);
+  }
+
+  async loadRecurringRegistry() {
+    const file = this.app.vault.getAbstractFileByPath(this.getRecurringNotePath());
+    if (!(file instanceof TFile)) return new Map();
+    return core.parseRecurringRegistry(await this.app.vault.cachedRead(file));
+  }
+
+  // Upserts one row of the hand-editable registry table in the recurring
+  // payments note — the markdown stays the source of truth for per-bill state.
+  async updateRecurringRegistryEntry(item, patch = {}) {
+    await this.ensureBudgetInfrastructure();
+    const file = await this.ensureTextFile(this.getRecurringNotePath(), () => this.buildRecurringNoteContent());
+    const content = await this.app.vault.cachedRead(file);
+    const registry = core.parseRecurringRegistry(content);
+    const current = registry.get(item.name) || {};
+    const active = patch.active ?? (current.active !== false);
+    const autoLog = patch.autoLog ?? (current.autoLog === null || current.autoLog === undefined ? item.autoLog !== false : current.autoLog);
+    const amount = patch.amount !== undefined ? patch.amount : current.amount > 0 ? current.amount : item.lastAmount;
+    const amountCell = core.formatPlainNumber(amount);
+    const nextAmount = patch.nextAmount !== undefined ? patch.nextAmount : current.nextAmount;
+    const changeDate = patch.changeDate !== undefined ? patch.changeDate : current.changeDate;
+    const nextAmountCell = nextAmount > 0 ? core.formatPlainNumber(nextAmount) : "";
+    const changeDateCell = changeDate || "";
+    const row = `| ${item.name} | ${item.cadence} | ${amountCell} | ${active ? "yes" : "no"} | ${autoLog ? "yes" : "no"} | ${nextAmountCell} | ${changeDateCell} |`;
+
+    const lines = String(content).replace(/\r\n/g, "\n").split("\n");
+    const headerIndex = lines.findIndex(
+      (line) => /^\s*\|/.test(line) && /\bitem\b/i.test(line) && /\bactive\b/i.test(line)
+    );
+    if (headerIndex === -1) {
+      if (lines.length && lines[lines.length - 1].trim()) lines.push("");
+      lines.push("## Registry");
+      lines.push("");
+      lines.push("Hand-editable per-bill state: Active no pauses a bill, Auto-log yes logs it on its due day, a filled Amount overrides the inferred price. Next Amount + Change Date schedule a future price change, applied automatically once the date arrives.");
+      lines.push("");
+      lines.push("| Item | Cadence | Amount | Active | Auto-log | Next Amount | Change Date |");
+      lines.push("| --- | --- | ---: | --- | --- | ---: | --- |");
+      lines.push(row);
+      lines.push("");
+    } else {
+      // Older notes have a 5-column table (no Next Amount/Change Date) — widen
+      // the header and every existing row in place so the table stays one
+      // consistent width and parseMarkdownTable keeps matching every row.
+      const headerCellCount = lines[headerIndex].split("|").length - 2;
+      if (headerCellCount < 7) {
+        lines[headerIndex] = "| Item | Cadence | Amount | Active | Auto-log | Next Amount | Change Date |";
+        lines[headerIndex + 1] = "| --- | --- | ---: | --- | --- | ---: | --- |";
+        for (let index = headerIndex + 2; index < lines.length && /^\s*\|/.test(lines[index]); index += 1) {
+          const cells = lines[index].split("|").slice(1, -1).map((cell) => cell.trim());
+          while (cells.length < 5) cells.push("");
+          lines[index] = `| ${cells.slice(0, 5).join(" | ")} |  |  |`;
+        }
+      }
+
+      let insertAt = headerIndex + 2;
+      let replaced = false;
+      for (let index = headerIndex + 2; index < lines.length && /^\s*\|/.test(lines[index]); index += 1) {
+        insertAt = index + 1;
+        const firstCell = core.normalizeCategoryPath(lines[index].split("|")[1] || "");
+        if (firstCell === item.name) {
+          lines[index] = row;
+          replaced = true;
+          break;
+        }
+      }
+      if (!replaced) lines.splice(insertAt, 0, row);
+    }
+    await _ftModify(this.app, file, lines.join("\n"));
   }
 
   async logRecurringItem(item, date) {
@@ -6909,7 +7120,13 @@ class FinanceTrackerPlugin extends Plugin {
     let logged = 0;
     for (let pass = 0; pass < 24; pass += 1) {
       const recurring = await this.detectRecurring(today);
-      const due = recurring.items.filter((item) => item.nextDue && item.nextDue <= today);
+      const due = recurring.items.filter(
+        (item) =>
+          item.nextDue &&
+          item.nextDue <= today &&
+          item.active !== false &&
+          (!options.autoOnly || item.autoLog !== false)
+      );
       if (!due.length) break;
       for (const item of due) {
         await this.logRecurringItem(item, item.nextDue);
@@ -6970,19 +7187,49 @@ class FinanceTrackerPlugin extends Plugin {
     section.createEl("h4", { text: "Upcoming bills" });
     const list = section.createDiv({ cls: "finance-tracker-budget-list" });
     for (const item of recurring.items) {
+      // Paused bills live only in the Archived section below now, never inline.
+      if (item.active === false) continue;
       const row = list.createDiv({ cls: "finance-tracker-budget-card finance-tracker-recurring-row" });
       if (item.status === "overdue") row.addClass("is-overdue");
       const title = row.createDiv({ cls: "finance-tracker-budget-title" });
       title.createSpan({ text: `${item.label} — ${core.formatCurrency(item.lastAmount, currency)}` });
-      const statusText = item.status === "overdue"
-        ? `overdue since ${item.nextDue}`
-        : item.status === "due"
-          ? "due today"
-          : `due ${item.nextDue}`;
-      row.createDiv({
-        cls: "finance-tracker-budget-meta",
-        text: `${RECURRING_CADENCE_LABELS[item.cadence] || core.titleCaseSegment(item.cadence)} · ${statusText} · ${core.formatCurrency(item.monthlyCost, currency)}/month`,
-      });
+      const statusText =
+        item.status === "overdue"
+          ? `overdue since ${item.nextDue}`
+          : item.status === "due"
+            ? "due today"
+            : `due ${item.nextDue}`;
+      const metaBits = [
+        RECURRING_CADENCE_LABELS[item.cadence] || core.titleCaseSegment(item.cadence),
+        statusText,
+        `${core.formatCurrency(item.monthlyCost, currency)}/month`,
+      ];
+      if (manage) metaBits.push(item.autoLog !== false ? "auto-log on" : "auto-log off");
+      if (item.nextAmount > 0 && item.changeDate) {
+        metaBits.push(`changing to ${core.formatCurrency(item.nextAmount, currency)} on ${item.changeDate}`);
+      }
+      row.createDiv({ cls: "finance-tracker-budget-meta", text: metaBits.join(" · ") });
+      if (manage) {
+        const stateActions = row.createDiv({ cls: "finance-tracker-header-actions" });
+        const pauseButton = stateActions.createEl("button", { text: "Pause" });
+        pauseButton.addEventListener("click", async () => {
+          pauseButton.disabled = true;
+          await this.updateRecurringRegistryEntry(item, { active: false });
+          await this.renderRecurringBlock(source, el, ctx);
+        });
+        const autoButton = stateActions.createEl("button", {
+          text: item.autoLog !== false ? "Auto-log: on" : "Auto-log: off",
+        });
+        autoButton.addEventListener("click", async () => {
+          autoButton.disabled = true;
+          await this.updateRecurringRegistryEntry(item, { autoLog: item.autoLog === false });
+          await this.renderRecurringBlock(source, el, ctx);
+        });
+        const editButton = stateActions.createEl("button", { text: "Edit" });
+        editButton.addEventListener("click", () => {
+          new EditRecurringItemModal(this.app, this, item, () => this.renderRecurringBlock(source, el, ctx)).open();
+        });
+      }
       const isDue = item.status === "overdue" || item.status === "due";
       if (isDue || manage) {
         const actions = row.createDiv({ cls: "finance-tracker-header-actions" });
@@ -7013,6 +7260,38 @@ class FinanceTrackerPlugin extends Plugin {
             }
           });
         }
+      }
+    }
+
+    // Archived (paused) bills: collapsed by default, out of the way of the
+    // active list, but still reachable to resume or drop for good.
+    const archivedItems = recurring.items.filter((item) => item.active === false);
+    if (archivedItems.length) {
+      const archiveDetails = wrapper.createEl("details", { cls: "finance-tracker-chart-card finance-tracker-archived" });
+      archiveDetails.createEl("summary", { text: `Archived (${archivedItems.length})` });
+      const archiveList = archiveDetails.createDiv({ cls: "finance-tracker-budget-list" });
+      for (const item of archivedItems) {
+        const row = archiveList.createDiv({ cls: "finance-tracker-budget-card finance-tracker-recurring-row is-paused" });
+        const title = row.createDiv({ cls: "finance-tracker-budget-title" });
+        title.createSpan({ text: `${item.label} — ${core.formatCurrency(item.lastAmount, currency)}` });
+        row.createDiv({
+          cls: "finance-tracker-budget-meta",
+          text: `${RECURRING_CADENCE_LABELS[item.cadence] || core.titleCaseSegment(item.cadence)} · paused`,
+        });
+        const actions = row.createDiv({ cls: "finance-tracker-header-actions" });
+        const resumeButton = actions.createEl("button", { text: "Resume" });
+        resumeButton.addEventListener("click", async () => {
+          resumeButton.disabled = true;
+          await this.updateRecurringRegistryEntry(item, { active: true });
+          await this.renderRecurringBlock(source, el, ctx);
+        });
+        const removeButton = actions.createEl("button", { text: "Remove completely", cls: "mod-warning" });
+        removeButton.addEventListener("click", async () => {
+          removeButton.disabled = true;
+          await this.removeRecurringItemCompletely(item);
+          new Notice(`Removed ${item.label} — it won't be tracked as a recurring payment again.`);
+          await this.renderRecurringBlock(source, el, ctx);
+        });
       }
     }
 
@@ -8069,6 +8348,80 @@ class EditTransactionModal extends Modal {
   }
 }
 
+// Edits a recurring bill's amount, and optionally schedules a future price
+// change (an exact date, applied automatically once it arrives) instead of
+// waiting for the next logged entry to redefine the price.
+class EditRecurringItemModal extends Modal {
+  constructor(app, plugin, item, onSaved) {
+    super(app);
+    this.plugin = plugin;
+    this.item = item;
+    this.onSaved = onSaved;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("finance-edit");
+    const item = this.item;
+    contentEl.createEl("h3", { text: `Edit ${item.label}` });
+
+    const amountRow = contentEl.createDiv({ cls: "finance-edit-row" });
+    amountRow.createEl("label", { text: "Amount" });
+    const amountInput = amountRow.createEl("input", { type: "number", attr: { step: "0.01" } });
+    amountInput.value = String(item.lastAmount ?? "");
+
+    const scheduleLabel = contentEl.createEl("label", { cls: "finance-edit-remember" });
+    const scheduleCheckbox = scheduleLabel.createEl("input", { type: "checkbox" });
+    scheduleCheckbox.checked = Boolean(item.nextAmount && item.changeDate);
+    scheduleLabel.appendText(" Price changes on a future date");
+
+    const scheduleFields = contentEl.createDiv({ cls: "finance-edit-schedule" });
+    scheduleFields.toggleClass("is-hidden", !scheduleCheckbox.checked);
+
+    const nextAmountRow = scheduleFields.createDiv({ cls: "finance-edit-row" });
+    nextAmountRow.createEl("label", { text: "New amount" });
+    const nextAmountInput = nextAmountRow.createEl("input", { type: "number", attr: { step: "0.01" } });
+    nextAmountInput.value = String(item.nextAmount ?? "");
+
+    const changeDateRow = scheduleFields.createDiv({ cls: "finance-edit-row" });
+    changeDateRow.createEl("label", { text: "Changes on" });
+    const changeDateInput = changeDateRow.createEl("input", { type: "date" });
+    changeDateInput.value = item.changeDate || "";
+
+    scheduleCheckbox.addEventListener("change", () => {
+      scheduleFields.toggleClass("is-hidden", !scheduleCheckbox.checked);
+    });
+
+    const buttons = contentEl.createDiv({ cls: "finance-edit-buttons" });
+    const saveButton = buttons.createEl("button", { text: "Save", cls: "mod-cta" });
+    saveButton.addEventListener("click", async () => {
+      saveButton.disabled = true;
+      try {
+        const patch = { amount: core.parseNumber(amountInput.value) };
+        if (scheduleCheckbox.checked && nextAmountInput.value && changeDateInput.value) {
+          patch.nextAmount = core.parseNumber(nextAmountInput.value);
+          patch.changeDate = core.parseIsoDate(changeDateInput.value);
+        } else {
+          patch.nextAmount = null;
+          patch.changeDate = null;
+        }
+        await this.plugin.updateRecurringRegistryEntry(item, patch);
+        new Notice(`${item.label} updated`);
+        this.close();
+        if (typeof this.onSaved === "function") await this.onSaved();
+      } catch (error) {
+        new Notice(`Update failed: ${error.message}`);
+        saveButton.disabled = false;
+      }
+    });
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
 class BankReconcileModal extends Modal {
   constructor(app, plugin) {
     super(app);
@@ -8557,6 +8910,7 @@ class SetupWizardModal extends Modal {
       dailyNotesFolder: plugin.settings.dailyNotesFolder || "",
       budgetsFolder: plugin.settings.budgetsFolderPath || "Utility/Budgets",
       financeFolder: String(plugin.settings.captureInboxFolder || "Utility/Finance/Inbox").replace(/\/?Inbox\/?$/i, "") || "Utility/Finance",
+      recurringNoteName: plugin.settings.recurringNoteName || DEFAULT_SETTINGS.recurringNoteName,
     };
   }
 
@@ -8607,6 +8961,15 @@ class SetupWizardModal extends Modal {
         })
       );
 
+    new Setting(contentEl)
+      .setName("Recurring payments note name")
+      .setDesc("Filename for the bill-management note, inside the budgets folder. Changeable later in settings.")
+      .addText((text) =>
+        text.setPlaceholder(DEFAULT_SETTINGS.recurringNoteName).setValue(this.form.recurringNoteName).onChange((value) => {
+          this.form.recurringNoteName = value.trim();
+        })
+      );
+
     contentEl.createEl("h3", { text: "2. Starter notes to create" });
 
     const noteToggles = [
@@ -8652,6 +9015,7 @@ class SetupWizardModal extends Modal {
     const plugin = this.plugin;
     if (this.form.dailyNotesFolder) plugin.settings.dailyNotesFolder = this.form.dailyNotesFolder;
     if (this.form.budgetsFolder) plugin.settings.budgetsFolderPath = this.form.budgetsFolder;
+    plugin.settings.recurringNoteName = this.form.recurringNoteName || DEFAULT_SETTINGS.recurringNoteName;
     plugin.settings.defaultCurrency = core.normalizeCurrency(this.form.currency, plugin.settings.defaultCurrency);
     const financeFolder = (this.form.financeFolder || "Utility/Finance").replace(/\/+$/, "");
     plugin.settings.captureInboxFolder = normalizePath(`${financeFolder}/Inbox`);
@@ -8669,10 +9033,7 @@ class SetupWizardModal extends Modal {
       created.push(file.basename);
     }
     if (this.form.createRecurring) {
-      const file = await plugin.ensureTextFile(
-        normalizePath(`${plugin.settings.budgetsFolderPath}/🔁 Recurring Payments.md`),
-        () => plugin.buildRecurringNoteContent()
-      );
+      const file = await plugin.ensureTextFile(plugin.getRecurringNotePath(), () => plugin.buildRecurringNoteContent());
       created.push(file.basename);
     }
     if (this.form.createGoals) {
@@ -9151,6 +9512,13 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
     });
 
     addSection(
+      "Merchant map",
+      "Learned merchant → category associations, added automatically from the \"Remember this merchant → category\" checkbox when editing a transaction. Remove an entry here if it guesses wrong."
+    );
+    const merchantMapListEl = containerEl.createDiv({ cls: "finance-tracker-goal-list" });
+    this.renderMerchantMapList(merchantMapListEl);
+
+    addSection(
       "Holiday budgets",
       "Save for several holidays at once: each goal note below can be active at the same time. Spending is treated as holiday spending automatically when the note date falls inside a holiday's start and end dates. Archiving a finished holiday freezes its savings steps and spending record into the note and moves it out of the active set."
     );
@@ -9196,14 +9564,37 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName("Recurring payments note name")
+      .setDesc("Filename of the bill-management note, inside the budgets folder. Set once during first-time setup, changeable any time.")
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_SETTINGS.recurringNoteName)
+          .setValue(this.plugin.settings.recurringNoteName)
+          .onChange(async (value) => {
+            this.plugin.settings.recurringNoteName = value.trim() || DEFAULT_SETTINGS.recurringNoteName;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
       .setName("Auto-log recurring payments")
-      .setDesc("Log each recurring item automatically on its due day, dated on the due day.")
+      .setDesc("Master switch: log recurring items automatically on their due day. Each bill below can opt out with its Auto-log toggle.")
       .addToggle((toggle) =>
         toggle.setValue(Boolean(this.plugin.settings.autoLogRecurring)).onChange(async (value) => {
           this.plugin.settings.autoLogRecurring = value;
           await this.plugin.saveSettings();
         })
       );
+
+    containerEl.createEl("p", {
+      cls: "finance-tracker-settings-section-copy",
+      text: "Detected bills — Current: uncheck to pause a bill (it moves to the Archived section of the recurring payments block, where it can be resumed or removed for good); Auto-log: log this bill automatically on its due day. State is stored in the registry table of the recurring payments note.",
+    });
+    const recurringListEl = containerEl.createDiv({ cls: "finance-tracker-goal-list" });
+    this.renderRecurringList(recurringListEl).catch(() => {});
+    const recurringActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
+    const openRecurringButton = recurringActions.createEl("button", { text: "Open recurring payments note" });
+    openRecurringButton.addEventListener("click", () => this.plugin.openRecurringNote());
 
     addSection(
       "Trip mode",
@@ -9233,6 +9624,79 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
     const setupActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
     const setupButton = setupActions.createEl("button", { text: "Run first-time setup" });
     setupButton.addEventListener("click", () => new SetupWizardModal(this.app, this.plugin).open());
+  }
+
+  renderMerchantMapList(listEl) {
+    listEl.empty();
+    const entries = Object.entries(this.plugin.settings.merchantMap || {}).sort((left, right) =>
+      left[0].localeCompare(right[0])
+    );
+    if (!entries.length) {
+      listEl.createDiv({
+        cls: "finance-tracker-empty",
+        text: "No merchants learned yet — tick \"Remember this merchant → category\" when editing a transaction.",
+      });
+      return;
+    }
+    for (const [merchant, category] of entries) {
+      const setting = new Setting(listEl).setName(merchant).setDesc(core.displayCategoryPath(category));
+      setting.addButton((button) =>
+        button.setButtonText("Remove").onClick(async () => {
+          await this.plugin.forgetMerchantCategory(merchant);
+          this.renderMerchantMapList(listEl);
+        })
+      );
+    }
+  }
+
+  // Only current (non-paused) bills show here — pausing a bill moves it into
+  // the Archived section of the finance-recurring block instead, where it can
+  // be resumed or removed completely.
+  async renderRecurringList(listEl) {
+    listEl.empty();
+    const recurring = await this.plugin.detectRecurring();
+    const items = recurring.items.filter((item) => item.active !== false);
+    if (!items.length) {
+      listEl.createDiv({
+        cls: "finance-tracker-empty",
+        text: `No recurring payments detected yet. Log one with a cadence tag like #log/spending/${this.plugin.settings.recurringTagPrefix || "subscriptions"}/monthly/spotify.`,
+      });
+      return;
+    }
+    const scroll = listEl.createDiv({ cls: "finance-tracker-recurring-settings-scroll" });
+    const header = scroll.createDiv({ cls: "finance-tracker-recurring-settings-header" });
+    header.createSpan({ text: "Bill" });
+    header.createSpan({ text: "Current" });
+    header.createSpan({ text: "Auto-log" });
+    for (const item of items) {
+      const bits = [
+        RECURRING_CADENCE_LABELS[item.cadence] || item.cadence,
+        core.formatCurrency(item.lastAmount, item.currency || this.plugin.settings.defaultCurrency),
+      ];
+      if (item.nextDue) bits.push(`next due ${item.nextDue}`);
+      const row = scroll.createDiv({ cls: "finance-tracker-recurring-settings-row" });
+      const nameCell = row.createDiv({ cls: "finance-tracker-recurring-name" });
+      nameCell.createDiv({ text: item.label });
+      nameCell.createDiv({ cls: "finance-tracker-budget-meta", text: bits.join(" · ") });
+
+      const currentLabel = row.createEl("label", { cls: "finance-tracker-recurring-check", attr: { "aria-label": "Current" } });
+      const currentCheckbox = currentLabel.createEl("input", { type: "checkbox" });
+      currentCheckbox.checked = true;
+      currentCheckbox.addEventListener("change", async () => {
+        currentCheckbox.disabled = true;
+        await this.plugin.updateRecurringRegistryEntry(item, { active: currentCheckbox.checked });
+        await this.renderRecurringList(listEl);
+      });
+
+      const autoLabel = row.createEl("label", { cls: "finance-tracker-recurring-check", attr: { "aria-label": "Auto-log" } });
+      const autoCheckbox = autoLabel.createEl("input", { type: "checkbox" });
+      autoCheckbox.checked = item.autoLog !== false;
+      autoCheckbox.addEventListener("change", async () => {
+        autoCheckbox.disabled = true;
+        await this.plugin.updateRecurringRegistryEntry(item, { autoLog: autoCheckbox.checked });
+        autoCheckbox.disabled = false;
+      });
+    }
   }
 
   // Lists every non-archived goal note with an Active toggle (several holidays
@@ -9291,3 +9755,5 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
 }
 
 module.exports = FinanceTrackerPlugin;
+
+/* nosourcemap */

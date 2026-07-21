@@ -1045,9 +1045,13 @@ test("buildHierarchicalCategoryGroups ranks majors and shades subgroups from one
   assert.equal(hierarchy.groups[1].key, "transport");
   // both food shades share the food hue, distinct from the transport hue
   const hue = (color) => color.match(/hsl\((\d+)/)[1];
+  const lightness = (color) => Number(color.match(/,\s*(\d+)%\)$/)[1]);
   assert.equal(hue(hierarchy.groups[0].children[0].color), hue(hierarchy.groups[0].children[1].color));
   assert.notEqual(hue(hierarchy.groups[0].color), hue(hierarchy.groups[1].color));
   assert.notEqual(hierarchy.groups[0].children[0].color, hierarchy.groups[0].children[1].color);
+  // subcategories are ranked highest-spend-first, and shaded lightest-to-darkest
+  // to match: groceries ($90) is lighter than restaurants ($40).
+  assert.ok(lightness(hierarchy.groups[0].children[0].color) > lightness(hierarchy.groups[0].children[1].color));
   assert.equal(hierarchy.slices.length, 3);
 });
 
@@ -1250,4 +1254,80 @@ test("buildTripReflection summarises a finished trip by category and day", () =>
   assert.equal(reflection.quietDay.date, "2026-07-03");
   assert.equal(reflection.dailySeries.length, 4);
   assert.equal(reflection.dailySeries[3].total, 0); // 07-04 quiet travel day
+});
+
+// ---------------------------------------------------------------------------
+// v0.3.x: recurring registry (per-item active / auto-log / amount override)
+// ---------------------------------------------------------------------------
+
+test("parseRecurringRegistry reads the hand-editable registry table", () => {
+  const content = `
+## Registry
+
+| Item    | Cadence | Amount | Active | Auto-log |
+| ------- | ------- | -----: | ------ | -------- |
+| spotify | monthly |        | yes    | yes      |
+| gym     | weekly  |  19.50 | no     |          |
+| domain  | yearly  |        |        | no       |
+`.trim();
+  const registry = core.parseRecurringRegistry(content);
+  assert.equal(registry.get("spotify").active, true);
+  assert.equal(registry.get("spotify").autoLog, true);
+  assert.equal(registry.get("gym").active, false);
+  assert.equal(registry.get("gym").amount, 19.5);
+  assert.equal(registry.get("gym").autoLog, null); // blank keeps the default
+  assert.equal(registry.get("domain").active, true); // blank = active
+  assert.equal(registry.get("domain").autoLog, false);
+});
+
+test("applyRecurringRegistry pauses items and overrides amounts", () => {
+  const detected = core.detectRecurringPayments(
+    [
+      { amount: 12.99, category: "subscriptions/monthly/spotify", date: "2026-07-01", merchant: "Spotify" },
+      { amount: 18.5, category: "subscriptions/weekly/gym", date: "2026-07-13", merchant: "Gym" },
+    ],
+    { prefix: "subscriptions", referenceDate: "2026-07-21" }
+  );
+  const registry = core.parseRecurringRegistry(`
+| Item | Active | Auto-log | Amount |
+| ---- | ------ | -------- | -----: |
+| gym  | no     |          |  19.50 |
+`.trim());
+  const applied = core.applyRecurringRegistry(detected, registry);
+
+  const gym = applied.items.find((item) => item.name === "gym");
+  assert.equal(gym.active, false);
+  assert.equal(gym.lastAmount, 19.5); // override applied even while paused
+  const spotify = applied.items.find((item) => item.name === "spotify");
+  assert.equal(spotify.active, true);
+  assert.equal(spotify.autoLog, true);
+  // totals only count active items: just spotify's 12.99/month
+  assert.equal(applied.totals.monthly, 12.99);
+  // the reserve also skips paused items
+  const reserve = core.computeRecurringReserve(applied, "2026-07-21");
+  assert.equal(reserve.rows.length, 1);
+  assert.equal(reserve.rows[0].name, "spotify");
+});
+
+test("applyRecurringRegistry keeps a future price change pending until its date", () => {
+  const detected = core.detectRecurringPayments(
+    [{ amount: 12.99, category: "subscriptions/monthly/spotify", date: "2026-07-01", merchant: "Spotify" }],
+    { prefix: "subscriptions", referenceDate: "2026-07-21" }
+  );
+  const registry = core.parseRecurringRegistry(`
+| Item    | Cadence | Amount | Active | Auto-log | Next Amount | Change Date |
+| ------- | ------- | -----: | ------ | -------- | -----------: | ----------- |
+| spotify | monthly |  12.99 | yes    | yes      |        15.99 | 2026-08-01  |
+`.trim());
+
+  const beforeChange = core.applyRecurringRegistry(detected, registry, "2026-07-21");
+  const pending = beforeChange.items.find((item) => item.name === "spotify");
+  assert.equal(pending.lastAmount, 12.99); // not yet in effect
+  assert.equal(pending.nextAmount, 15.99);
+  assert.equal(pending.changeDate, "2026-08-01");
+
+  const afterChange = core.applyRecurringRegistry(detected, registry, "2026-08-01");
+  const applied = afterChange.items.find((item) => item.name === "spotify");
+  assert.equal(applied.lastAmount, 15.99); // promoted once the change date arrives
+  assert.equal(applied.nextAmount, null); // no longer "pending" — it's already in effect
 });

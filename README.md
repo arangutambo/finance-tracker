@@ -10,9 +10,10 @@ Support the project: [Buy Me a Coffee](https://buymeacoffee.com/tonyhad)
 
 On a fresh install the **setup wizard** opens automatically (or run the
 **Run first-time setup** command / the button at the top of settings any time —
-it never overwrites existing notes). It asks three things — where your daily
-notes live, where finance notes should be stored, and your currency — then
-creates the starter notes from templates embedded in the plugin:
+it never overwrites existing notes). It asks where your daily notes live, where
+finance notes should be stored, your currency, and what to name the recurring
+payments note (changeable later in settings) — then creates the starter notes
+from templates embedded in the plugin:
 
 - `💸 Budgets.md` — the budget table
 - `📊 Finance Dashboard.md` — weekly/monthly dashboards, net worth, forecast, a sample query
@@ -81,17 +82,74 @@ You rarely type this by hand. Four ways to log:
 A Shortcut opens `obsidian://finance-capture?amount=12.5&merchant=Coles&category=food/groceries&source=manual`.
 The plugin logs it to today's note. This briefly foregrounds Obsidian but needs no filesystem access.
 
+**Shortcut D — "Log + confirm in Obsidian"**: build an **Open URL** action —
+`obsidian://finance-capture?vault=<vault>&amount=12.5&category=food/groceries&merchant=Coles&source=manual` —
+and run it from the Home Screen, Lock Screen, or Action Button. This is the only phone method that
+works on an Obsidian Sync vault; use it whenever you want the dashboard to update immediately.
+
 ### Capture inbox (Files-writable vaults)
 A Shortcut (or Mac script, or the bank-CSV reconcile) drops a one-line file into the
 inbox folder (default `Utility/Finance/Inbox/`); the plugin drains it into the right daily
-note on arrival and on launch. Capture line format:
+note on arrival and on launch. Capture line format — one line, `key=value` pairs separated by ` | `:
 
 ```
-amount=12 | cat=food/restaurants | merchant=Nobu | date=2026-06-10 | source=apple-pay
+amount=12 | cat=food/restaurants | merchant=Nobu | date=2026-06-10 | cur=AUD | source=apple-pay
 ```
 
-Only `amount` is required; omit `cat` to log as `uncategorized` and categorise later.
+| Key | Meaning |
+| --- | --- |
+| `amount` (`amt`, `total`) | the amount to log — the only required key |
+| `cat` (`category`) | category path, e.g. `food/groceries`. Omit to log as `uncategorized` and categorise later. |
+| `merchant` (`payee`, `name`) | shown under the entry; also used to auto-guess the category from the merchant map |
+| `date` | `YYYY-MM-DD`; defaults to today. Set it for retroactive logging — the plugin routes to that day's note. |
+| `cur` (`currency`) | currency code; defaults to your vault default |
+| `origamt` / `origcur` | foreign amount + currency (travel); the holiday dashboard converts it |
+| `source` | free text, e.g. `apple-pay`, `wise`, `manual` |
+| `id` (`wiseid`, `ref`) | external id for de-duplication (used by Wise sync / CSV reconcile) |
+
 Bad files are moved to `Inbox/_failed/` with the error, never dropped.
+
+**Shortcut A — "Log Spend" (manual, everyday)** — put it on the Home Screen, Lock Screen, Action
+Button, and "Hey Siri, log spend":
+1. **Ask for Input** → *Number* → "Amount?"
+2. **Choose from Menu** → your categories + "Skip".
+3. **Ask for Input** → *Text* → "Merchant?" (allow empty).
+4. **Text** action: `amount=[Provided Input] | cat=[Menu Result] | merchant=[Text] | date=[Current Date · yyyy-MM-dd] | source=manual`
+   (leave `cat=` empty if "Skip" was chosen).
+5. **Save File** → iCloud Drive → the inbox folder → "Ask Where to Save" **off**, "Overwrite" **off**.
+   Filename: `[Current Date · yyyy-MM-dd'T'HHmmss]-[Random 4 chars].txt`.
+
+**Shortcut B — "Log Apple Pay" (automation, the important one)** — for a card you don't sync via
+Wise: Shortcuts → **Automation** → **Transaction** trigger, filtered to that card, **Run Immediately**.
+Build the same **Text** line from `Transaction Amount` / `Transaction Merchant`, leave `cat=` empty
+(it auto-guesses from the merchant map or lands as `uncategorized`), add `source=anz`, then **Save
+File** to the inbox as above. Every tap-to-pay now auto-logs with zero interaction. Don't also make
+an Apple Pay automation for a card that's covered by Wise sync (below) — that would double-log it.
+
+**Shortcut C — "Log Spend (pick date)"** — same as Shortcut A plus an **Ask for Input → Date** step
+feeding `date=`, for backfilling a day you forgot.
+
+### Wise sync (covers all Wise spending, with real FX)
+Wise personal API tokens support **balance statements**, so a scheduled Shortcut can pull every Wise
+transaction — card, online, transfers — including the real exchange rate for foreign spends. Keep
+the token in the Shortcut, never in the vault (generate it in Wise → Settings → API tokens; rotate
+or revoke it there if needed).
+1. **Get Contents of URL** → `GET https://api.wise.com/v1/profiles`, header `Authorization: Bearer <token>` → `profileId`.
+2. **Get Contents of URL** → `GET /v4/profiles/{profileId}/balances?types=STANDARD` → `balanceId` per currency.
+3. **Get Contents of URL** → `GET /v1/profiles/{profileId}/balance-statements/{balanceId}/statement.json?currency=AUD&intervalStart=<lastSync>&intervalEnd=<now>&type=COMPACT`.
+4. For each activity newer than the last sync, **Save File** one inbox file: `amount=<spend> | merchant=<details> | date=<YYYY-MM-DD> | cur=AUD | source=wise | id=<referenceNumber>` (add `origamt=`/`origcur=` for foreign spends).
+5. Store `lastSync` and schedule the Shortcut nightly. The `id=` field means re-runs never double-log.
+
+### ANZ Plus reconcile (catch what Apple Pay missed)
+The Apple Pay automation only sees in-person taps — not online, direct debits, or BPAY. Monthly,
+export the bank CSV and run **Reconcile bank/Wise CSV against logged spending**; unmatched charges
+can be sent to the capture inbox. Matching is by date+amount, so already-logged taps aren't duplicated.
+
+### Deferred categorisation
+Capture is instant and dumb; categorisation is a quick daily review. Anything logged as
+`uncategorized` (or auto-guessed wrong) can be fixed from the sidebar's **Needs a Category** triage
+list or the daily note directly. Tick "remember this merchant → category" while fixing one and
+future captures from that merchant categorise themselves (see [Merchant map](#merchant-map)).
 
 ### Quick add modal
 Command **Quick add transaction** (bind a hotkey) or click the status bar. One field,
@@ -180,7 +238,9 @@ every subcategory as a shade of its parent's hue, with a nested legend — a
 daily-spend sparkline with your budget line, pace-aware budget bars, and
 savings activity. Export CSV from the header. (The sidebar's mini pie stays at
 major categories; the donut falls back to a flat pie when nothing has
-subcategories.)
+subcategories.) Subcategory shades are ranked by spend — the biggest subcategory
+in a group gets the lightest shade of that hue, the smallest the darkest — and
+hovering any slice shows its name, amount, and share of the total.
 
 `holiday-dashboard` — planned vs actual trip spend, per-day budget remaining, and a
 trip calendar. Reads a goal note that has a `trip_tag` (see [Goals](#goals-savings--trips)),
@@ -339,13 +399,53 @@ due day.
 
 **Managing bills** — command **Open recurring payments note** creates a
 management page (a normal note with a `manage: true` block). In manage mode
-every item gets **Log now** plus **Skip cycle** (logs a $0 entry on the due day,
-so the schedule moves on but the price is remembered — a price change is simply
-the next amount you log). The block also has a **Bill reserve** section: the
-sinking fund for bills. It shows how much should already be set aside (each
-bill accrues day by day since it was last paid — half a year after an annual
-bill, half its cost should be reserved) and the steady per-week / per-month
-set-aside that keeps every cadence covered.
+every item gets **Log now**, **Skip cycle** (logs a $0 entry on the due day,
+so the schedule moves on but the price is remembered), **Pause**, **Auto-log**,
+and **Edit**. The block also has a **Bill reserve** section: the sinking fund
+for bills. It shows how much should already be set aside (each bill accrues
+day by day since it was last paid — half a year after an annual bill, half its
+cost should be reserved) and the steady per-week / per-month set-aside that
+keeps every cadence covered.
+
+**Pausing, archiving, and removing a bill** — **Pause** moves a bill straight
+into a collapsed **Archived** section at the bottom of the block (click to open
+it) — it stops counting toward totals, the bill reserve, and auto-logging, but
+its history stays intact. From Archived you can **Resume** it, or **Remove
+completely**, which drops it from consideration for good — even if you log
+another entry with the same tag later, it won't resurface. Archived/removed
+bills never appear in Settings → Recurring payments; that list only shows
+current bills, as a scrollable checkbox table (Current / Auto-log columns,
+header pinned while you scroll).
+
+**Editing a bill** — **Edit** (manage mode) lets you correct the amount
+directly, or schedule a future price change with an exact date (e.g. "this
+subscription becomes $15.99 on the 1st") — the new amount applies itself
+automatically once that date arrives, and until then the block shows
+"changing to $X on `<date>`" next to the bill.
+
+**The registry** — per-bill state lives in a hand-editable table in the
+recurring payments note (the source of truth; the checkboxes in settings and
+the manage block just write to it):
+
+```md
+## Registry
+
+| Item    | Cadence | Amount | Active | Auto-log | Next Amount | Change Date |
+| ------- | ------- | -----: | ------ | -------- | -----------: | ----------- |
+| spotify | monthly |  12.99 | yes    | yes      |        15.99 | 2026-08-01  |
+| gym     | weekly  |        | no     |          |              |             |
+```
+
+Set **Active** to `no` to pause a cancelled bill. **Auto-log** opts a bill in
+or out of the automatic due-day logging (the master switch is in settings). A
+filled **Amount** overrides the inferred price. **Next Amount** + **Change
+Date** schedule a future price change. Blank cells keep the defaults; older
+notes with the 5-column table are widened automatically the first time a bill
+is edited.
+
+**Where the note lives** — the recurring payments note's filename (inside your
+budgets folder) is a setting: asked once during first-time setup, changeable
+any time in Settings → Recurring payments → "Recurring payments note name".
 
 ## Split expenses
 
@@ -446,11 +546,25 @@ The **Daily Budget** sidebar (ribbon coin icon) shows today + period spend, a
 Left/Day card, a mini pie, compact pace-aware budget rows (tap a row for the
 detail), savings goals, split balances, and a **Needs a Category** triage list.
 Tap a triage entry to edit its amount, category or merchant, delete it, or tick
-"remember this merchant → category" to teach `Utility/Finance/Merchant Map.md`.
-Captures with a known merchant auto-categorise from that file.
+"remember this merchant → category" to teach the [merchant map](#merchant-map).
+Captures with a known merchant auto-categorise from it.
 
 The **status bar** shows `💸 Today $X · Week $Y · 📥 N` (N = pending captures);
 click it to quick-add.
+
+## Merchant map
+
+Learned merchant → category associations live in plugin settings (`data.json`),
+not a vault note — there's nothing to hand-edit. The only way in is the
+"Remember this merchant → category" checkbox (in the sidebar triage list or the
+edit-transaction modal); the only way out is **Settings → Merchant map**, which
+lists every learned merchant with a **Remove** button. Future captures from a
+known merchant auto-categorise using this map (see
+[Deferred categorisation](#deferred-categorisation)).
+
+If you're upgrading from an older version, any existing `Merchant Map.md` note
+is read once, folded into settings, and then deleted automatically — no action
+needed.
 
 ## Reconciling against the bank
 
@@ -460,27 +574,44 @@ duplicates); unmatched charges can be sent to the capture inbox to log and triag
 
 ## Commands
 
-- Quick add transaction
-- Drain capture inbox now
-- Reconcile bank/Wise CSV against logged spending
-- Open daily budget · Open finance budgets note
-- Add holiday exchange rate · Create savings goal
-- Run first-time setup
-- Log due recurring payments · Open recurring payments note · Insert recurring payments block
-- Contribute to savings goal · Insert goals block · Archive completed savings goals
-- Settle up split expenses · Insert split expenses block
-- Start trip · End trip · Archive finished holidays
-- Snapshot balances · Insert net worth block
-- Insert forecast block · Insert finance query block
-- Export finance transactions to CSV
+Run any of these from the command palette (`Cmd/Ctrl+P`).
+
+| Command | What it does |
+| --- | --- |
+| **Quick add transaction** | Opens the quick-add modal — one field, natural language, live preview. |
+| **Drain capture inbox now** | Processes every file waiting in the capture inbox folder immediately, instead of waiting for the next automatic drain. |
+| **Reconcile bank/Wise CSV against logged spending** | Opens the bank-reconcile modal — paste a CSV export, matches rows by date+amount, and can send unmatched charges to the capture inbox. |
+| **Open daily budget** | Opens the Daily Budget sidebar (same as clicking the ribbon coin icon). |
+| **Open finance budgets note** | Opens (creating if needed) the default `💸 Budgets.md` note. |
+| **Add holiday exchange rate** | Opens a modal to add or update an `exchange_rates` entry on the active trip goal note. |
+| **Create savings goal** | Opens a modal to create a new savings-goal note from the shared goal/trip frontmatter schema. |
+| **Run first-time setup** | Opens the guided setup wizard — picks folders and currency, then creates any missing starter notes (never overwrites existing ones). |
+| **Log due recurring payments** | Logs every recurring bill whose next-due date has arrived (loops to catch up several missed cycles), same as clicking **Log all due** in the block. |
+| **Open recurring payments note** | Opens (creating if needed) the recurring payments management note. |
+| **Insert recurring payments block** | Inserts a ` ```finance-recurring``` ` block at the cursor. |
+| **Contribute to savings goal** | Opens a modal to log a contribution bullet to a chosen goal and date. |
+| **Insert goals block** | Inserts a ` ```finance-goals``` ` block at the cursor. |
+| **Archive completed savings goals** | Archives every savings goal that has reached its target amount — writes a frozen summary, marks it archived, and moves the note to the archive folder. |
+| **Settle up split expenses** | Opens a modal showing outstanding split balances per person, with one-tap settle (logs the repayment as income). |
+| **Insert split expenses block** | Inserts a ` ```finance-splits``` ` block at the cursor. |
+| **Start trip** | Picks a trip goal note and switches quick-add/URL capture to default to that trip's tag (and currency, if set) until you end the trip. |
+| **End trip** | Turns off trip mode, returning captures to normal home-currency logging. |
+| **Archive finished holidays** | Archives every holiday budget past its `end_date` that isn't already archived — same frozen-summary treatment as savings goals. |
+| **Snapshot balances** | Opens a modal to log one balance bullet per account into today's note (pre-filled with each account's last snapshotted value). |
+| **Insert net worth block** | Inserts a ` ```networth-dashboard``` ` block at the cursor. |
+| **Insert forecast block** | Inserts a ` ```finance-forecast``` ` block (default `months: 6`) at the cursor. |
+| **Insert finance query block** | Inserts a ` ```finance-query``` ` block pre-filled with a monthly category-table template at the cursor. |
+| **Export finance transactions to CSV** | Exports every transaction ever logged (all time, all categories) to a CSV file. |
 
 ## Key settings
 
 `dailyNotesFolder`, `spendingHeading` (`## Finance`), `defaultCurrency`,
 `budgetsFolderPath` / `defaultBudgetNoteName`, `captureInboxFolder`,
-`merchantMapPath`, `autoDrainInbox`, `budgetCheckPeriod`, `weekStartsOn`,
-`activeHolidayBudgetPath`, `recurringTagPrefix` (`subscriptions`),
-`autoLogRecurring`, `quickAddUseNoteDate`, `tripModeActive` / `activeTripGoalPath`.
+`merchantMap` (learned merchant → category pairs), `autoDrainInbox`,
+`budgetCheckPeriod`, `weekStartsOn`, `activeHolidayBudgetPath`,
+`recurringTagPrefix` (`subscriptions`), `recurringNoteName`
+(`🔁 Recurring Payments.md`), `excludedRecurringItems`, `autoLogRecurring`,
+`quickAddUseNoteDate`, `tripModeActive` / `activeTripGoalPath`.
 
 The daily-note folder and date format are auto-detected from the **Journals**
 community plugin or the core **Daily notes** plugin when present; the manual
