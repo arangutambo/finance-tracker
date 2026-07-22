@@ -391,7 +391,6 @@
 .finance-tracker-calendar-filter-button.is-active {
   border-color: var(--interactive-accent);
   background: var(--background-modifier-hover);
-  background: color-mix(in srgb, var(--background-primary) 75%, var(--interactive-accent) 25%);
 }
 
 .finance-tracker-planned-list {
