@@ -390,6 +390,7 @@
 
 .finance-tracker-calendar-filter-button.is-active {
   border-color: var(--interactive-accent);
+  background: var(--background-modifier-hover);
   background: color-mix(in srgb, var(--background-primary) 75%, var(--interactive-accent) 25%);
 }
 
@@ -1080,7 +1081,6 @@
 
 .finance-tracker-recurring-row.is-paused .finance-tracker-budget-title {
   text-decoration: line-through;
-  text-decoration-thickness: 1px;
 }
 
 .finance-tracker-archived > summary {
