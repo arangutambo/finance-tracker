@@ -1,7 +1,7 @@
 {
   "id": "finance-tracker",
   "name": "Finance Tracker",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "minAppVersion": "1.0.0",
   "description": "Log spending as tags in your daily notes, then turn them into pace-aware budget, recurring-bill, split-expense, trip, forecast, net-worth, and savings dashboards. Capture via Apple Shortcuts or a quick-add modal.",
   "author": "Antoine Jhaddad",
