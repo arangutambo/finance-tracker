@@ -606,6 +606,43 @@ Views: `table` (grouped sums), `categories` (ranked category table with
 percentages), `bars` (ranked bars), `income-expense` (monthly income-vs-expense
 bars), `cumulative` (cumulative balance line).
 
+## Year & quarter reviews
+
+Commands: **Insert yearly review** · **Insert quarterly review**
+
+Unlike every other `Insert ___ block` command, these don't insert a live code
+block — they compute the numbers once, right now, and insert the finished
+markdown at your cursor. Run one inside a "Yearly Review" or "Quarterly
+Review" note (or any note) to drop in a frozen snapshot for the current
+year/quarter: total spent and income, the best and worst month by spend, the
+top spending categories with their share of the total, and a transfers
+summary (savings contributions, savings withdrawals, and settled split
+repayments received). Re-running the command later produces a fresh snapshot
+reflecting whatever you've logged since.
+
+```md
+## 2026 Year in Review
+
+- Period: 2026-01-01 to 2026-12-31
+- Total spent: $18,240.55
+- Total income: $64,000.00
+- Best month (lowest spend): 2026-02 — $980.10
+- Worst month (highest spend): 2026-07 — $4,011.45
+
+### Top spending categories
+
+| Category | Total | % of spend |
+| --- | ---: | ---: |
+| Food | $5,120.30 | 28% |
+| Subscriptions | $2,890.00 | 16% |
+
+### Transfers
+
+- Savings contributions: $3,000.00 (4)
+- Savings withdrawals: $250.00 (1)
+- Settled repayments received: $120.00 (2)
+```
+
 ## Daily Budget sidebar & status bar
 
 The **Daily Budget** sidebar (ribbon coin icon) shows today + period spend, a
@@ -674,6 +711,8 @@ Run any of these from the command palette (`Cmd/Ctrl+P`).
 | **Insert net worth block** | Inserts a ` ```networth-dashboard``` ` block at the cursor. |
 | **Insert forecast block** | Inserts a ` ```finance-forecast``` ` block (default `months: 6`) at the cursor. |
 | **Insert finance query block** | Inserts a ` ```finance-query``` ` block pre-filled with a monthly category-table template at the cursor. |
+| **Insert yearly review** | Computes the current year's totals, best/worst month, top categories, and transfers summary, and inserts the finished markdown at the cursor (a frozen snapshot, not a live block). |
+| **Insert quarterly review** | Same as above, scoped to the current quarter. |
 | **Export finance transactions to CSV** | Exports every transaction ever logged (all time, all categories) to a CSV file. |
 
 ## Key settings

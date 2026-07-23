@@ -2325,6 +2325,86 @@ function buildMonthlyIncomeExpense(entries, options = {}) {
     .sort((left, right) => left.month.localeCompare(right.month));
 }
 
+// A frozen year/quarter review snippet: total spend and income, best/worst
+// month, top spending categories, and a transfers summary (savings
+// contributions/withdrawals, settled split repayments). Unlike the dashboard
+// blocks this is computed once and meant to be inserted as plain text, not
+// recomputed on every render. Returns full markdown lines, heading included.
+// `goalKeys` must be the vault's actual savings-goal keys — an
+// `#log/income/<key>` tag is only a real contribution when <key> matches one;
+// otherwise it's just regular income under that name (e.g. salary).
+function buildPeriodReviewLines(entries, options = {}) {
+  const period = options.period === "quarter" ? "quarter" : "year";
+  const currency = options.currency || "AUD";
+  const range = toPeriodRange({ period, referenceDate: options.referenceDate });
+  const goalKeys = new Set((options.goalKeys || []).map((key) => normalizeCategoryPath(key)).filter(Boolean));
+  const inRange = (entries || []).filter((entry) => isDateInRange(entry.date, range));
+
+  const spendEntries = inRange.filter((entry) => isSpendingEntry(entry));
+  const totalSpend = roundCurrencyAmount(spendEntries.reduce((sum, entry) => sum + entrySpendAmount(entry), 0));
+
+  const incomeEntries = inRange.filter((entry) => entry.entryType === "income");
+  const contributions = incomeEntries.filter((entry) => goalKeys.has(entry.goalKey));
+  const settleUps = incomeEntries.filter(
+    (entry) => !goalKeys.has(entry.goalKey) && normalizeCategoryPath(entry.category || "").startsWith("settleup/")
+  );
+  const regularIncome = incomeEntries.filter((entry) => !goalKeys.has(entry.goalKey) && !settleUps.includes(entry));
+  const withdrawals = inRange.filter((entry) => entry.entryType === "goal-withdrawal");
+
+  const totalIncome = roundCurrencyAmount(regularIncome.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
+  const contributedTotal = roundCurrencyAmount(contributions.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
+  const withdrawnTotal = roundCurrencyAmount(withdrawals.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
+  const settledTotal = roundCurrencyAmount(settleUps.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
+
+  const months = buildMonthlyIncomeExpense(inRange, { goalKeys: Array.from(goalKeys) }).filter((month) => month.expense > 0);
+  const bestMonth = months.length ? months.reduce((min, month) => (month.expense < min.expense ? month : min)) : null;
+  const worstMonth = months.length ? months.reduce((max, month) => (month.expense > max.expense ? month : max)) : null;
+
+  const categoryTotals = new Map();
+  for (const entry of spendEntries) {
+    const key = primaryCategory(entry.category || "uncategorized");
+    categoryTotals.set(key, roundCurrencyAmount((categoryTotals.get(key) || 0) + entrySpendAmount(entry)));
+  }
+  const topCategories = Array.from(categoryTotals.entries())
+    .map(([key, value]) => ({ key, label: titleCaseSegment(key), value }))
+    .sort((left, right) => right.value - left.value)
+    .slice(0, 5);
+
+  const year = range.start.slice(0, 4);
+  const quarterNumber = Math.floor((Number(range.start.slice(5, 7)) - 1) / 3) + 1;
+  const label = period === "quarter" ? `${year} Q${quarterNumber} Review` : `${year} Year in Review`;
+
+  const lines = [`## ${label}`, ""];
+  lines.push(`- Period: ${range.start} to ${range.end}`);
+  lines.push(`- Total spent: ${formatCurrency(totalSpend, currency)}`);
+  lines.push(`- Total income: ${formatCurrency(totalIncome, currency)}`);
+  if (bestMonth) lines.push(`- Best month (lowest spend): ${bestMonth.month} — ${formatCurrency(bestMonth.expense, currency)}`);
+  if (worstMonth && worstMonth.month !== bestMonth.month) {
+    lines.push(`- Worst month (highest spend): ${worstMonth.month} — ${formatCurrency(worstMonth.expense, currency)}`);
+  }
+
+  if (topCategories.length) {
+    lines.push("");
+    lines.push("### Top spending categories");
+    lines.push("");
+    lines.push("| Category | Total | % of spend |");
+    lines.push("| --- | ---: | ---: |");
+    for (const category of topCategories) {
+      const pct = totalSpend > 0 ? Math.round((category.value / totalSpend) * 100) : 0;
+      lines.push(`| ${category.label} | ${formatCurrency(category.value, currency)} | ${pct}% |`);
+    }
+  }
+
+  lines.push("");
+  lines.push("### Transfers");
+  lines.push("");
+  lines.push(`- Savings contributions: ${formatCurrency(contributedTotal, currency)} (${contributions.length})`);
+  lines.push(`- Savings withdrawals: ${formatCurrency(withdrawnTotal, currency)} (${withdrawals.length})`);
+  lines.push(`- Settled repayments received: ${formatCurrency(settledTotal, currency)} (${settleUps.length})`);
+
+  return lines;
+}
+
 // Cumulative income-minus-spend line over time.
 function buildCumulativeBalanceSeries(entries, options = {}) {
   const goalKeys = new Set((options.goalKeys || []).map((key) => normalizeCategoryPath(key)).filter(Boolean));
@@ -2646,6 +2726,7 @@ module.exports = {
   runFinanceQuery,
   buildMonthlyIncomeExpense,
   buildCumulativeBalanceSeries,
+  buildPeriodReviewLines,
   buildHierarchicalCategoryGroups,
   categoryBaseColor,
   categoryShadeColor,

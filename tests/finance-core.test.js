@@ -1331,3 +1331,52 @@ test("applyRecurringRegistry keeps a future price change pending until its date"
   assert.equal(applied.lastAmount, 15.99); // promoted once the change date arrives
   assert.equal(applied.nextAmount, null); // no longer "pending" — it's already in effect
 });
+
+// ---------------------------------------------------------------------------
+// Year/quarter review command
+// ---------------------------------------------------------------------------
+
+test("buildPeriodReviewLines summarises a year: totals, best/worst month, top categories, transfers", () => {
+  const entries = [
+    // January: a quiet month
+    { entryType: "spending", category: "food/groceries", amount: 100, date: "2026-01-10" },
+    // June: the big month, plus a settled repayment and a real goal contribution
+    { entryType: "spending", category: "food/groceries", amount: 400, date: "2026-06-05" },
+    { entryType: "spending", category: "transport", amount: 100, date: "2026-06-12" },
+    { entryType: "income", isIncome: true, isGoalContribution: true, category: "settleup/sam", goalKey: "", amount: 50, date: "2026-06-15" },
+    { entryType: "income", isIncome: true, isGoalContribution: true, category: "roadbike", goalKey: "roadbike", amount: 300, date: "2026-06-20" },
+    // regular salary income — tagged #log/income/salary, NOT a real goal
+    { entryType: "income", isIncome: true, isGoalContribution: true, category: "salary", goalKey: "salary", amount: 3000, date: "2026-06-01" },
+    // a goal withdrawal
+    { entryType: "goal-withdrawal", isGoalWithdrawal: true, category: "repairs", goalKey: "roadbike", amount: 120, date: "2026-06-25" },
+    // outside the year — must not count
+    { entryType: "spending", category: "food/groceries", amount: 9999, date: "2025-12-31" },
+  ];
+
+  const lines = core.buildPeriodReviewLines(entries, { period: "year", referenceDate: "2026-06-30", goalKeys: ["roadbike"] });
+  const text = lines.join("\n");
+
+  assert.equal(lines[0], "## 2026 Year in Review");
+  assert.match(text, /Total spent: \$600\.00/); // 100 (Jan) + 400 + 100 (Jun); the withdrawal is NOT spend
+  assert.match(text, /Total income: \$3,000\.00/); // salary only — settleup and goal contribution excluded
+  assert.match(text, /Best month \(lowest spend\): 2026-01 — \$100\.00/);
+  assert.match(text, /Worst month \(highest spend\): 2026-06 — \$500\.00/);
+  assert.match(text, /\| Food \| \$500\.00 \| 83% \|/);
+  assert.match(text, /Savings contributions: \$300\.00 \(1\)/);
+  assert.match(text, /Savings withdrawals: \$120\.00 \(1\)/);
+  assert.match(text, /Settled repayments received: \$50\.00 \(1\)/);
+});
+
+test("buildPeriodReviewLines scopes to a single quarter", () => {
+  const entries = [
+    { entryType: "spending", category: "food/restaurants", amount: 200, date: "2026-04-05" },
+    { entryType: "spending", category: "transport", amount: 50, date: "2026-05-05" },
+    { entryType: "spending", category: "food/restaurants", amount: 999, date: "2026-01-01" }, // wrong quarter
+    { entryType: "spending", category: "food/restaurants", amount: 999, date: "2026-07-01" }, // wrong quarter
+  ];
+  const lines = core.buildPeriodReviewLines(entries, { period: "quarter", referenceDate: "2026-05-15" });
+  const text = lines.join("\n");
+  assert.equal(lines[0], "## 2026 Q2 Review");
+  assert.match(text, /Period: 2026-04-01 to 2026-06-30/);
+  assert.match(text, /Total spent: \$250\.00/);
+});
