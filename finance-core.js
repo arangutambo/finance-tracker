@@ -1770,10 +1770,12 @@ function detectRecurringPayments(entries, options = {}) {
         lastAmount: amount,
         lastDate: date,
         count: 1,
+        history: amount > 0 ? [{ date, amount }] : [],
       });
       continue;
     }
     current.count += 1;
+    if (amount > 0) current.history.push({ date, amount });
     if (date >= current.lastDate) {
       current.lastDate = date;
       current.category = category;
@@ -1786,7 +1788,7 @@ function detectRecurringPayments(entries, options = {}) {
     }
   }
 
-  const rows = Array.from(items.values()).map((item) => {
+  const rows = Array.from(items.values()).map(({ history, ...item }) => {
     const spec = RECURRING_CADENCES[item.cadence];
     const nextDue = item.lastDate ? nextRecurringDate(item.lastDate, item.cadence) : null;
     const status = !nextDue
@@ -1796,8 +1798,17 @@ function detectRecurringPayments(entries, options = {}) {
         : nextDue === referenceDate
           ? "due"
           : "upcoming";
+    // Recent amounts (oldest to newest, last 6 real payments) let variable
+    // bills — utilities and the like — project off an average instead of
+    // whatever the last bill happened to cost.
+    const recentAmounts = history.sort((left, right) => left.date.localeCompare(right.date)).slice(-6).map((entry) => entry.amount);
+    const averageAmount = recentAmounts.length
+      ? roundCurrencyAmount(recentAmounts.reduce((sum, value) => sum + value, 0) / recentAmounts.length)
+      : item.lastAmount;
     return {
       ...item,
+      recentAmounts,
+      averageAmount,
       monthlyCost: roundCurrencyAmount(item.lastAmount * spec.perMonth),
       yearlyCost: roundCurrencyAmount(item.lastAmount * spec.perMonth * 12),
       nextDue,
@@ -1824,12 +1835,15 @@ function detectRecurringPayments(entries, options = {}) {
 
 // Sinking-fund maths for recurring bills: how much of each bill has "accrued"
 // since it was last paid (money that should already be set aside), what is due
-// within the next 30 days, and the steady per-week/per-month set-aside that
-// keeps every cadence covered.
+// within the next 30 days, and the steady per-week/per-month/per-quarter
+// set-aside that keeps every cadence covered — both combined, and broken down
+// per cadence (e.g. "monthly bills need $X/week and $Y/month set aside",
+// separately from "weekly bills need $Z/week").
 function computeRecurringReserve(recurring, referenceDate) {
   const today = parseIsoDate(referenceDate) || todayIsoLocal();
   const horizon = addDays(today, 30);
   const rows = [];
+  const perYearByCadence = new Map();
   let accruedTotal = 0;
   let perYearTotal = 0;
   let dueSoonTotal = 0;
@@ -1853,6 +1867,7 @@ function computeRecurringReserve(recurring, referenceDate) {
     accruedTotal += accrued;
     perYearTotal += perYear;
     dueSoonTotal += dueSoon;
+    perYearByCadence.set(item.cadence, (perYearByCadence.get(item.cadence) || 0) + perYear);
     rows.push({
       accrued,
       cadence: item.cadence,
@@ -1864,13 +1879,30 @@ function computeRecurringReserve(recurring, referenceDate) {
   }
 
   rows.sort((left, right) => right.accrued - left.accrued);
+
+  const byCadence = Object.keys(RECURRING_CADENCES)
+    .filter((cadence) => perYearByCadence.has(cadence))
+    .map((cadence) => {
+      const perYear = perYearByCadence.get(cadence);
+      return {
+        cadence,
+        label: RECURRING_CADENCES[cadence].label,
+        perWeek: roundCurrencyAmount(perYear / 52),
+        perMonth: roundCurrencyAmount(perYear / 12),
+        perQuarter: roundCurrencyAmount(perYear / 4),
+        perYear: roundCurrencyAmount(perYear),
+      };
+    });
+
   return {
     rows,
+    byCadence,
     totals: {
       accrued: roundCurrencyAmount(accruedTotal),
       dueNext30Days: roundCurrencyAmount(dueSoonTotal),
-      perMonth: roundCurrencyAmount(perYearTotal / 12),
       perWeek: roundCurrencyAmount(perYearTotal / 52),
+      perMonth: roundCurrencyAmount(perYearTotal / 12),
+      perQuarter: roundCurrencyAmount(perYearTotal / 4),
     },
   };
 }
@@ -1888,15 +1920,19 @@ function parseRecurringRegistry(content) {
       if (!name || !("active" in row || "auto-log" in row || "autolog" in row || "current" in row)) continue;
       const activeRaw = String(row.active ?? row.current ?? "").trim();
       const autoRaw = String(row["auto-log"] ?? row.autolog ?? row.auto ?? "").trim();
+      const variableRaw = String(row.variable ?? "").trim();
       const amount = parseNumber(row.amount);
       const nextAmount = parseNumber(row["next amount"] ?? row.nextamount);
       const changeDate = parseIsoDate(row["change date"] ?? row.changedate ?? "");
+      const nextDue = parseIsoDate(row["next due"] ?? row.nextdue ?? "");
       registry.set(name, {
         active: activeRaw ? !/^(?:no|false|0|inactive|paused)$/i.test(activeRaw) : true,
         autoLog: autoRaw ? /^(?:yes|true|1|on)$/i.test(autoRaw) : null,
+        variable: /^(?:yes|true|1|on)$/i.test(variableRaw),
         amount: Number.isFinite(amount) && amount > 0 ? roundCurrencyAmount(amount) : null,
         nextAmount: Number.isFinite(nextAmount) && nextAmount > 0 ? roundCurrencyAmount(nextAmount) : null,
         changeDate: changeDate || null,
+        nextDue: nextDue || null,
         cadence: normalizeCadence(row.cadence || ""),
       });
     }
@@ -1908,23 +1944,49 @@ function parseRecurringRegistry(content) {
 // kept (so they can be resumed) but flagged and excluded from the totals. A
 // scheduled Next Amount/Change Date pair is purely informational until the
 // change date arrives, at which point it is promoted to the effective amount.
+// A Next Due override lets the due-date schedule stay anchored to its own
+// cadence even when a bill is logged late (or early) — without it, logging a
+// bill's real payment date would silently push every future due date out by
+// however many days late it was.
 function applyRecurringRegistry(recurring, registry, referenceDate = todayIsoLocal()) {
   const items = (recurring?.items || []).map((item) => {
     const entry = registry?.get(item.name) || registry?.get(item.name.split("/").pop());
     const active = entry ? entry.active !== false : true;
     const autoLog = entry && entry.autoLog !== null && entry.autoLog !== undefined ? entry.autoLog : true;
-    const overrideAmount = entry?.amount > 0 ? entry.amount : item.lastAmount;
+    const variable = Boolean(entry?.variable);
+    // A manual Amount override always wins. Otherwise a variable bill (a
+    // fluctuating utility, say) projects off the average of its recent
+    // payments rather than whatever the last one happened to cost; a fixed
+    // bill just uses the last logged amount, as before.
+    const baseAmount = entry?.amount > 0 ? entry.amount : variable ? item.averageAmount ?? item.lastAmount : item.lastAmount;
     const changePending = entry?.nextAmount > 0 && entry?.changeDate && entry.changeDate > referenceDate;
     const changeApplied = entry?.nextAmount > 0 && entry?.changeDate && entry.changeDate <= referenceDate;
-    const lastAmount = changeApplied ? entry.nextAmount : overrideAmount;
+    const lastAmount = changeApplied ? entry.nextAmount : baseAmount;
     const spec = RECURRING_CADENCES[item.cadence];
+    const nextDue = entry?.nextDue || item.nextDue;
+    const status = !nextDue
+      ? "unknown"
+      : nextDue < referenceDate
+        ? "overdue"
+        : nextDue === referenceDate
+          ? "due"
+          : "upcoming";
+    const daysUntilDue = nextDue
+      ? nextDue >= referenceDate
+        ? daysBetweenInclusive(referenceDate, nextDue) - 1
+        : -(daysBetweenInclusive(nextDue, referenceDate) - 1)
+      : null;
     return {
       ...item,
       active,
       autoLog,
+      variable,
       lastAmount,
       nextAmount: changePending ? entry.nextAmount : null,
       changeDate: changePending ? entry.changeDate : null,
+      nextDue,
+      status,
+      daysUntilDue,
       monthlyCost: spec ? roundCurrencyAmount(lastAmount * spec.perMonth) : item.monthlyCost,
       yearlyCost: spec ? roundCurrencyAmount(lastAmount * spec.perMonth * 12) : item.yearlyCost,
     };
@@ -2348,13 +2410,19 @@ function buildPeriodReviewLines(entries, options = {}) {
   const settleUps = incomeEntries.filter(
     (entry) => !goalKeys.has(entry.goalKey) && normalizeCategoryPath(entry.category || "").startsWith("settleup/")
   );
-  const regularIncome = incomeEntries.filter((entry) => !goalKeys.has(entry.goalKey) && !settleUps.includes(entry));
+  const billReserveContributions = incomeEntries.filter(
+    (entry) => !goalKeys.has(entry.goalKey) && normalizeCategoryPath(entry.category || "") === "billreserve"
+  );
+  const regularIncome = incomeEntries.filter(
+    (entry) => !goalKeys.has(entry.goalKey) && !settleUps.includes(entry) && !billReserveContributions.includes(entry)
+  );
   const withdrawals = inRange.filter((entry) => entry.entryType === "goal-withdrawal");
 
   const totalIncome = roundCurrencyAmount(regularIncome.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
   const contributedTotal = roundCurrencyAmount(contributions.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
   const withdrawnTotal = roundCurrencyAmount(withdrawals.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
   const settledTotal = roundCurrencyAmount(settleUps.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
+  const billReserveTotal = roundCurrencyAmount(billReserveContributions.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
 
   const months = buildMonthlyIncomeExpense(inRange, { goalKeys: Array.from(goalKeys) }).filter((month) => month.expense > 0);
   const bestMonth = months.length ? months.reduce((min, month) => (month.expense < min.expense ? month : min)) : null;
@@ -2401,6 +2469,7 @@ function buildPeriodReviewLines(entries, options = {}) {
   lines.push(`- Savings contributions: ${formatCurrency(contributedTotal, currency)} (${contributions.length})`);
   lines.push(`- Savings withdrawals: ${formatCurrency(withdrawnTotal, currency)} (${withdrawals.length})`);
   lines.push(`- Settled repayments received: ${formatCurrency(settledTotal, currency)} (${settleUps.length})`);
+  lines.push(`- Bill reserve contributions: ${formatCurrency(billReserveTotal, currency)} (${billReserveContributions.length})`);
 
   return lines;
 }

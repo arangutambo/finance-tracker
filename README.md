@@ -440,21 +440,42 @@ Then drop this block into any note:
 It shows upcoming bills, overdue items with a one-tap **Log now**, the total
 due in the next 30 days, and the cost per month and per year. An optional
 setting (**Auto-log recurring payments**) logs each item automatically on its
-due day.
+due day. Anything due or overdue also stays pinned in the **Daily Budget**
+sidebar until you log it — see [below](#daily-budget-sidebar--status-bar).
 
 ![Recurring payments block: summary cards and the upcoming-bills list](docs/images/recurring-payments-block.jpg)
 
+**Log now logs today, not the due date** — click it (from the sidebar, the
+block, or manage mode) and the bullet is dated on the real day you actually
+paid it, even if that's a few days after it was due. The cadence schedule
+itself doesn't drift because of this: it keeps advancing from the due date
+that was just fulfilled, not from today, so a late payment never pushes every
+future due date out by the same number of days. **Skip cycle** works the same
+way (logs a $0 entry, the schedule moves on, the price is remembered).
+
 **Managing bills** — command **Open recurring payments note** creates a
 management page (a normal note with a `manage: true` block). In manage mode
-every item gets **Log now**, **Skip cycle** (logs a $0 entry on the due day,
-so the schedule moves on but the price is remembered), **Pause**, **Auto-log**,
-and **Edit**. The block also has a **Bill reserve** section: the sinking fund
+every item gets **Log now**, **Skip cycle**, **Pause**, **Auto-log**, and
+**Edit**. The block also has a **Bill reserve** section: the sinking fund
 for bills. It shows how much should already be set aside (each bill accrues
 day by day since it was last paid — half a year after an annual bill, half its
-cost should be reserved) and the steady per-week / per-month set-aside that
-keeps every cadence covered.
+cost should be reserved) and the steady per-week / per-month / per-quarter
+set-aside that keeps every cadence covered — both combined, and broken down
+per cadence, since weekly bills only need a per-week figure but monthly (and
+longer) cadences need both a per-week *and* a per-month number tracked
+separately. **Contribute** logs an actual set-aside contribution — one shared
+envelope for every bill, the same virtual-envelope idea as a savings goal —
+so **Saved so far** can be compared against what should already be set aside.
 
 ![Bill reserve section: set-aside totals and the per-bill accrual list](docs/images/bill-reserve.jpg)
+
+**Variable bills** (utilities and the like) — mark a bill **Variable** (in
+**Edit**, or the registry table) and it projects off the average of its last
+six payments instead of just the last one, so a single unusually high or low
+bill doesn't skew the monthly/yearly totals or the bill reserve math. **Log
+now** on a variable bill also prompts for the actual amount (pre-filled with
+the recent average as a starting guess) rather than silently repeating a
+fixed number that was never going to be right for a fluctuating bill.
 
 **Pausing, archiving, and removing a bill** — **Pause** moves a bill straight
 into a collapsed **Archived** section at the bottom of the block (click to open
@@ -467,10 +488,13 @@ current bills, as a scrollable checkbox table (Current / Auto-log columns,
 header pinned while you scroll).
 
 **Editing a bill** — **Edit** (manage mode) lets you correct the amount
-directly, or schedule a future price change with an exact date (e.g. "this
+directly, schedule a future price change with an exact date (e.g. "this
 subscription becomes $15.99 on the 1st") — the new amount applies itself
 automatically once that date arrives, and until then the block shows
-"changing to $X on `<date>`" next to the bill.
+"changing to $X on `<date>`" next to the bill — mark it **Variable**, or
+correct the **Next due** date directly if the automatic schedule ever needs a
+manual nudge (logging or skipping a cycle normally keeps it on track by
+itself, so this is mostly an escape hatch).
 
 Manage mode with a scheduled price change (Aussie Broadband Nbn, "changing to
 $66.50 on 2026-08-15") and the Archived section expanded, showing Resume and
@@ -490,18 +514,20 @@ the manage block just write to it):
 ```md
 ## Registry
 
-| Item    | Cadence | Amount | Active | Auto-log | Next Amount | Change Date |
-| ------- | ------- | -----: | ------ | -------- | -----------: | ----------- |
-| spotify | monthly |  12.99 | yes    | yes      |        15.99 | 2026-08-01  |
-| gym     | weekly  |        | no     |          |              |             |
+| Item    | Cadence | Amount | Active | Auto-log | Variable | Next Amount | Change Date | Next Due   |
+| ------- | ------- | -----: | ------ | -------- | -------- | -----------: | ----------- | ---------- |
+| spotify | monthly |  12.99 | yes    | yes      | no       |        15.99 | 2026-08-01  | 2026-07-23 |
+| power   | monthly |        | yes    | yes      | yes      |              |             |            |
+| gym     | weekly  |        | no     |          | no       |              |             |            |
 ```
 
 Set **Active** to `no` to pause a cancelled bill. **Auto-log** opts a bill in
 or out of the automatic due-day logging (the master switch is in settings). A
-filled **Amount** overrides the inferred price. **Next Amount** + **Change
-Date** schedule a future price change. Blank cells keep the defaults; older
-notes with the 5-column table are widened automatically the first time a bill
-is edited.
+filled **Amount** overrides the inferred price. **Variable** projects the
+average of recent payments instead of just the last one. **Next Amount** +
+**Change Date** schedule a future price change. **Next Due** overrides the
+computed due date directly. Blank cells keep the defaults; older notes with a
+narrower table are widened automatically the first time a bill is edited.
 
 **Where the note lives** — the recurring payments note's filename (inside your
 budgets folder) is a setting: asked once during first-time setup, changeable
@@ -616,9 +642,9 @@ markdown at your cursor. Run one inside a "Yearly Review" or "Quarterly
 Review" note (or any note) to drop in a frozen snapshot for the current
 year/quarter: total spent and income, the best and worst month by spend, the
 top spending categories with their share of the total, and a transfers
-summary (savings contributions, savings withdrawals, and settled split
-repayments received). Re-running the command later produces a fresh snapshot
-reflecting whatever you've logged since.
+summary (savings contributions, savings withdrawals, settled split repayments
+received, and bill reserve contributions). Re-running the command later
+produces a fresh snapshot reflecting whatever you've logged since.
 
 ```md
 ## 2026 Year in Review
@@ -641,15 +667,21 @@ reflecting whatever you've logged since.
 - Savings contributions: $3,000.00 (4)
 - Savings withdrawals: $250.00 (1)
 - Settled repayments received: $120.00 (2)
+- Bill reserve contributions: $400.00 (4)
 ```
 
 ## Daily Budget sidebar & status bar
 
 The **Daily Budget** sidebar (ribbon coin icon) shows today + period spend, a
 Left/Day card, a mini pie, compact pace-aware budget rows (tap a row for the
-detail), savings goals, split balances, and a **Needs a Category** triage list.
+detail), savings goals, split balances, a **Recurring bills due** card, and a
+**Needs a Category** triage list.
 
 <img src="docs/images/daily-budget-sidebar.jpg" alt="Daily Budget sidebar: totals, mini pie, and pace-aware budget bars" width="320">
+
+**Recurring bills due** lists every overdue or due-today bill with a one-tap
+**Log now**, and stays put — it doesn't disappear until each bill is actually
+logged, so it can't get lost among the rest of the sidebar.
 
 Tap a triage entry to edit its amount, category or merchant, delete it, or tick
 "remember this merchant → category" to teach the [merchant map](#merchant-map).
@@ -700,6 +732,7 @@ Run any of these from the command palette (`Cmd/Ctrl+P`).
 | **Open recurring payments note** | Opens (creating if needed) the recurring payments management note. |
 | **Insert recurring payments block** | Inserts a ` ```finance-recurring``` ` block at the cursor. |
 | **Contribute to savings goal** | Opens a modal to log a contribution bullet to a chosen goal and date. |
+| **Contribute to bill reserve** | Opens a modal to log a set-aside contribution to the shared bill-reserve envelope. |
 | **Insert goals block** | Inserts a ` ```finance-goals``` ` block at the cursor. |
 | **Archive completed savings goals** | Archives every savings goal that has reached its target amount — writes a frozen summary, marks it archived, and moves the note to the archive folder. |
 | **Settle up split expenses** | Opens a modal showing outstanding split balances per person, with one-tap settle (logs the repayment as income). |

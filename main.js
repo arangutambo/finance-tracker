@@ -1673,10 +1673,12 @@ const core = (() => {
           lastAmount: amount,
           lastDate: date,
           count: 1,
+          history: amount > 0 ? [{ date, amount }] : [],
         });
         continue;
       }
       current.count += 1;
+      if (amount > 0) current.history.push({ date, amount });
       if (date >= current.lastDate) {
         current.lastDate = date;
         current.category = category;
@@ -1689,7 +1691,7 @@ const core = (() => {
       }
     }
 
-    const rows = Array.from(items.values()).map((item) => {
+    const rows = Array.from(items.values()).map(({ history, ...item }) => {
       const spec = RECURRING_CADENCES[item.cadence];
       const nextDue = item.lastDate ? nextRecurringDate(item.lastDate, item.cadence) : null;
       const status = !nextDue
@@ -1699,8 +1701,17 @@ const core = (() => {
           : nextDue === referenceDate
             ? "due"
             : "upcoming";
+      // Recent amounts (oldest to newest, last 6 real payments) let variable
+      // bills — utilities and the like — project off an average instead of
+      // whatever the last bill happened to cost.
+      const recentAmounts = history.sort((left, right) => left.date.localeCompare(right.date)).slice(-6).map((entry) => entry.amount);
+      const averageAmount = recentAmounts.length
+        ? roundCurrencyAmount(recentAmounts.reduce((sum, value) => sum + value, 0) / recentAmounts.length)
+        : item.lastAmount;
       return {
         ...item,
+        recentAmounts,
+        averageAmount,
         monthlyCost: roundCurrencyAmount(item.lastAmount * spec.perMonth),
         yearlyCost: roundCurrencyAmount(item.lastAmount * spec.perMonth * 12),
         nextDue,
@@ -1727,12 +1738,15 @@ const core = (() => {
 
   // Sinking-fund maths for recurring bills: how much of each bill has "accrued"
   // since it was last paid (money that should already be set aside), what is due
-  // within the next 30 days, and the steady per-week/per-month set-aside that
-  // keeps every cadence covered.
+  // within the next 30 days, and the steady per-week/per-month/per-quarter
+  // set-aside that keeps every cadence covered — both combined, and broken down
+  // per cadence (e.g. "monthly bills need $X/week and $Y/month set aside",
+  // separately from "weekly bills need $Z/week").
   function computeRecurringReserve(recurring, referenceDate) {
     const today = parseIsoDate(referenceDate) || todayIsoLocal();
     const horizon = addDays(today, 30);
     const rows = [];
+    const perYearByCadence = new Map();
     let accruedTotal = 0;
     let perYearTotal = 0;
     let dueSoonTotal = 0;
@@ -1756,6 +1770,7 @@ const core = (() => {
       accruedTotal += accrued;
       perYearTotal += perYear;
       dueSoonTotal += dueSoon;
+      perYearByCadence.set(item.cadence, (perYearByCadence.get(item.cadence) || 0) + perYear);
       rows.push({
         accrued,
         cadence: item.cadence,
@@ -1767,13 +1782,30 @@ const core = (() => {
     }
 
     rows.sort((left, right) => right.accrued - left.accrued);
+
+    const byCadence = Object.keys(RECURRING_CADENCES)
+      .filter((cadence) => perYearByCadence.has(cadence))
+      .map((cadence) => {
+        const perYear = perYearByCadence.get(cadence);
+        return {
+          cadence,
+          label: RECURRING_CADENCES[cadence].label,
+          perWeek: roundCurrencyAmount(perYear / 52),
+          perMonth: roundCurrencyAmount(perYear / 12),
+          perQuarter: roundCurrencyAmount(perYear / 4),
+          perYear: roundCurrencyAmount(perYear),
+        };
+      });
+
     return {
       rows,
+      byCadence,
       totals: {
         accrued: roundCurrencyAmount(accruedTotal),
         dueNext30Days: roundCurrencyAmount(dueSoonTotal),
-        perMonth: roundCurrencyAmount(perYearTotal / 12),
         perWeek: roundCurrencyAmount(perYearTotal / 52),
+        perMonth: roundCurrencyAmount(perYearTotal / 12),
+        perQuarter: roundCurrencyAmount(perYearTotal / 4),
       },
     };
   }
@@ -1791,15 +1823,19 @@ const core = (() => {
         if (!name || !("active" in row || "auto-log" in row || "autolog" in row || "current" in row)) continue;
         const activeRaw = String(row.active ?? row.current ?? "").trim();
         const autoRaw = String(row["auto-log"] ?? row.autolog ?? row.auto ?? "").trim();
+        const variableRaw = String(row.variable ?? "").trim();
         const amount = parseNumber(row.amount);
         const nextAmount = parseNumber(row["next amount"] ?? row.nextamount);
         const changeDate = parseIsoDate(row["change date"] ?? row.changedate ?? "");
+        const nextDue = parseIsoDate(row["next due"] ?? row.nextdue ?? "");
         registry.set(name, {
           active: activeRaw ? !/^(?:no|false|0|inactive|paused)$/i.test(activeRaw) : true,
           autoLog: autoRaw ? /^(?:yes|true|1|on)$/i.test(autoRaw) : null,
+          variable: /^(?:yes|true|1|on)$/i.test(variableRaw),
           amount: Number.isFinite(amount) && amount > 0 ? roundCurrencyAmount(amount) : null,
           nextAmount: Number.isFinite(nextAmount) && nextAmount > 0 ? roundCurrencyAmount(nextAmount) : null,
           changeDate: changeDate || null,
+          nextDue: nextDue || null,
           cadence: normalizeCadence(row.cadence || ""),
         });
       }
@@ -1811,23 +1847,49 @@ const core = (() => {
   // kept (so they can be resumed) but flagged and excluded from the totals. A
   // scheduled Next Amount/Change Date pair is purely informational until the
   // change date arrives, at which point it is promoted to the effective amount.
+  // A Next Due override lets the due-date schedule stay anchored to its own
+  // cadence even when a bill is logged late (or early) — without it, logging a
+  // bill's real payment date would silently push every future due date out by
+  // however many days late it was.
   function applyRecurringRegistry(recurring, registry, referenceDate = todayIsoLocal()) {
     const items = (recurring?.items || []).map((item) => {
       const entry = registry?.get(item.name) || registry?.get(item.name.split("/").pop());
       const active = entry ? entry.active !== false : true;
       const autoLog = entry && entry.autoLog !== null && entry.autoLog !== undefined ? entry.autoLog : true;
-      const overrideAmount = entry?.amount > 0 ? entry.amount : item.lastAmount;
+      const variable = Boolean(entry?.variable);
+      // A manual Amount override always wins. Otherwise a variable bill (a
+      // fluctuating utility, say) projects off the average of its recent
+      // payments rather than whatever the last one happened to cost; a fixed
+      // bill just uses the last logged amount, as before.
+      const baseAmount = entry?.amount > 0 ? entry.amount : variable ? item.averageAmount ?? item.lastAmount : item.lastAmount;
       const changePending = entry?.nextAmount > 0 && entry?.changeDate && entry.changeDate > referenceDate;
       const changeApplied = entry?.nextAmount > 0 && entry?.changeDate && entry.changeDate <= referenceDate;
-      const lastAmount = changeApplied ? entry.nextAmount : overrideAmount;
+      const lastAmount = changeApplied ? entry.nextAmount : baseAmount;
       const spec = RECURRING_CADENCES[item.cadence];
+      const nextDue = entry?.nextDue || item.nextDue;
+      const status = !nextDue
+        ? "unknown"
+        : nextDue < referenceDate
+          ? "overdue"
+          : nextDue === referenceDate
+            ? "due"
+            : "upcoming";
+      const daysUntilDue = nextDue
+        ? nextDue >= referenceDate
+          ? daysBetweenInclusive(referenceDate, nextDue) - 1
+          : -(daysBetweenInclusive(nextDue, referenceDate) - 1)
+        : null;
       return {
         ...item,
         active,
         autoLog,
+        variable,
         lastAmount,
         nextAmount: changePending ? entry.nextAmount : null,
         changeDate: changePending ? entry.changeDate : null,
+        nextDue,
+        status,
+        daysUntilDue,
         monthlyCost: spec ? roundCurrencyAmount(lastAmount * spec.perMonth) : item.monthlyCost,
         yearlyCost: spec ? roundCurrencyAmount(lastAmount * spec.perMonth * 12) : item.yearlyCost,
       };
@@ -2251,13 +2313,19 @@ const core = (() => {
     const settleUps = incomeEntries.filter(
       (entry) => !goalKeys.has(entry.goalKey) && normalizeCategoryPath(entry.category || "").startsWith("settleup/")
     );
-    const regularIncome = incomeEntries.filter((entry) => !goalKeys.has(entry.goalKey) && !settleUps.includes(entry));
+    const billReserveContributions = incomeEntries.filter(
+      (entry) => !goalKeys.has(entry.goalKey) && normalizeCategoryPath(entry.category || "") === "billreserve"
+    );
+    const regularIncome = incomeEntries.filter(
+      (entry) => !goalKeys.has(entry.goalKey) && !settleUps.includes(entry) && !billReserveContributions.includes(entry)
+    );
     const withdrawals = inRange.filter((entry) => entry.entryType === "goal-withdrawal");
 
     const totalIncome = roundCurrencyAmount(regularIncome.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
     const contributedTotal = roundCurrencyAmount(contributions.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
     const withdrawnTotal = roundCurrencyAmount(withdrawals.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
     const settledTotal = roundCurrencyAmount(settleUps.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
+    const billReserveTotal = roundCurrencyAmount(billReserveContributions.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
 
     const months = buildMonthlyIncomeExpense(inRange, { goalKeys: Array.from(goalKeys) }).filter((month) => month.expense > 0);
     const bestMonth = months.length ? months.reduce((min, month) => (month.expense < min.expense ? month : min)) : null;
@@ -2304,6 +2372,7 @@ const core = (() => {
     lines.push(`- Savings contributions: ${formatCurrency(contributedTotal, currency)} (${contributions.length})`);
     lines.push(`- Savings withdrawals: ${formatCurrency(withdrawnTotal, currency)} (${withdrawals.length})`);
     lines.push(`- Settled repayments received: ${formatCurrency(settledTotal, currency)} (${settleUps.length})`);
+    lines.push(`- Bill reserve contributions: ${formatCurrency(billReserveTotal, currency)} (${billReserveContributions.length})`);
 
     return lines;
   }
@@ -2770,6 +2839,11 @@ const RECURRING_CADENCE_LABELS = {
   quarterly: "Quarterly",
   yearly: "Yearly",
 };
+
+// Reserved category key for bill-reserve contributions (`#log/income/billreserve`)
+// — a single shared envelope you top up like a savings goal, compared against
+// the accrued "should be set aside now" figure in the Bill reserve section.
+const BILL_RESERVE_KEY = "billreserve";
 
 function escapeHtml(value) {
   return String(value || "")
@@ -3265,6 +3339,12 @@ class FinanceTrackerPlugin extends Plugin {
       id: "finance-tracker-contribute-goal",
       name: "Contribute to savings goal",
       callback: () => new ContributeGoalModal(this.app, this).open(),
+    });
+
+    this.addCommand({
+      id: "finance-tracker-contribute-bill-reserve",
+      name: "Contribute to bill reserve",
+      callback: () => new ContributeBillReserveModal(this.app, this).open(),
     });
 
     this.addCommand({
@@ -4949,6 +5029,27 @@ class FinanceTrackerPlugin extends Plugin {
     return file;
   }
 
+  // The bill reserve is one shared envelope (not per-bill) you top up like a
+  // savings goal — "Saved so far" (the sum of these) is compared against
+  // "Should be set aside now" (the accrued figure computeRecurringReserve
+  // already calculates) so you can see whether you're ahead of or behind it.
+  async logBillReserveContribution(amount, date, note = "") {
+    const lines = [`- ${core.formatCurrency(amount, this.settings.defaultCurrency)} #log/income/${BILL_RESERVE_KEY}`];
+    lines.push(`\t- ${String(note || "").replace(/\s+/g, " ").trim() || "Bill reserve contribution"}`);
+    const file = await this.appendFinanceLines(date || core.todayIsoLocal(), lines);
+    this.refreshDailyBudgetView();
+    return file;
+  }
+
+  async getBillReserveSaved() {
+    const entries = await this.collectAllTransactions();
+    return core.roundCurrencyAmount(
+      entries
+        .filter((entry) => entry.entryType === "income" && core.normalizeCategoryPath(entry.category || "") === BILL_RESERVE_KEY)
+        .reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
+    );
+  }
+
   buildRecurringNoteContent() {
     const prefix = this.settings.recurringTagPrefix || "subscriptions";
     return [
@@ -4958,10 +5059,12 @@ class FinanceTrackerPlugin extends Plugin {
       `first time you log it with a cadence tag like \`#log/spending/${prefix}/monthly/spotify\``,
       "(cadences: `weekly`, `fortnightly`, `monthly`, `quarterly`, `yearly`).",
       "",
-      "- **Log now** logs the bill dated on its due day, so the cadence never drifts.",
+      "- **Log now** logs the bill dated today, whenever you actually click it — the due-date",
+      "  schedule stays anchored to its cadence regardless, even if you log it a few days late.",
       "- **Skip cycle** logs a $0 entry on the due day — the schedule moves on, the amount is remembered.",
       "- A price change is just the next logged amount; the plugin always uses the latest —",
-      "  or use **Edit** in manage mode to schedule a future change with an exact date.",
+      "  or use **Edit** in manage mode to schedule a future change with an exact date, or",
+      "  correct the next due date directly.",
       "- Pausing a bill moves it into the **Archived** section below, collapsed until you open it;",
       "  from there you can **Resume** it or **Remove completely** so it's never tracked again.",
       "- **Bill reserve** below is the sinking fund for bills: what should already be set",
@@ -4976,11 +5079,15 @@ class FinanceTrackerPlugin extends Plugin {
       "Hand-editable per-bill state (the checkboxes in settings and the manage block",
       "write to this table): set **Active** to `no` to pause a cancelled bill,",
       "**Auto-log** to `yes` to log it automatically on its due day, fill",
-      "**Amount** to override the inferred price, and fill **Next Amount** + **Change Date**",
-      "to schedule a future price change — it's applied automatically once the date arrives.",
+      "**Amount** to override the inferred price. Set **Variable** to `yes` for a",
+      "fluctuating bill like a utility — it projects off the average of its recent",
+      "payments instead of just the last one, and **Log now** prompts for the actual",
+      "amount each time rather than repeating a fixed one. Fill **Next Amount** +",
+      "**Change Date** to schedule a future price change — it's applied automatically",
+      "once the date arrives — and fill **Next Due** to correct the due-date schedule directly.",
       "",
-      "| Item | Cadence | Amount | Active | Auto-log | Next Amount | Change Date |",
-      "| --- | --- | ---: | --- | --- | ---: | --- |",
+      "| Item | Cadence | Amount | Active | Auto-log | Variable | Next Amount | Change Date | Next Due |",
+      "| --- | --- | ---: | --- | --- | --- | ---: | --- | --- |",
       "",
     ].join("\n");
   }
@@ -7041,6 +7148,42 @@ class FinanceTrackerPlugin extends Plugin {
       }
     }
 
+    // Recurring bills due or overdue — stays here until each is logged.
+    const dueRecurring = (await this.detectRecurring(referenceDate)).items.filter(
+      (item) => item.active !== false && (item.status === "overdue" || item.status === "due")
+    );
+    if (dueRecurring.length) {
+      const recurringSection = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
+      recurringSection.createEl("h4", { text: `Recurring bills due (${dueRecurring.length})` });
+      for (const item of dueRecurring.slice(0, 8)) {
+        const row = recurringSection.createDiv({ cls: "finance-tracker-budget-card" });
+        row.createDiv({
+          cls: "finance-tracker-budget-title",
+          text: `${item.label} — ${core.formatCurrency(item.lastAmount, item.currency || currency)}`,
+        });
+        row.createDiv({
+          cls: "finance-tracker-budget-meta",
+          text: item.status === "overdue" ? `overdue since ${item.nextDue}` : "due today",
+        });
+        const actions = row.createDiv({ cls: "finance-tracker-header-actions" });
+        const logButton = actions.createEl("button", { text: "Log now" });
+        logButton.addEventListener("click", async () => {
+          if (item.variable) {
+            new LogVariableBillModal(this.app, this, item, () => this.refreshDailyBudgetView()).open();
+            return;
+          }
+          logButton.disabled = true;
+          try {
+            await this.logRecurringNow(item);
+            this.refreshDailyBudgetView();
+          } catch (error) {
+            new Notice(`Could not log ${item.label}: ${error.message}`);
+            logButton.disabled = false;
+          }
+        });
+      }
+    }
+
     // Triage: period entries still needing a category (tap to fix).
     const needsCategory = spendEntries.filter((entry) => !entry.category || entry.category === "uncategorized");
     if (needsCategory.length) {
@@ -7146,13 +7289,16 @@ class FinanceTrackerPlugin extends Plugin {
     const current = registry.get(item.name) || {};
     const active = patch.active ?? (current.active !== false);
     const autoLog = patch.autoLog ?? (current.autoLog === null || current.autoLog === undefined ? item.autoLog !== false : current.autoLog);
+    const variable = patch.variable ?? Boolean(current.variable);
     const amount = patch.amount !== undefined ? patch.amount : current.amount > 0 ? current.amount : item.lastAmount;
     const amountCell = core.formatPlainNumber(amount);
     const nextAmount = patch.nextAmount !== undefined ? patch.nextAmount : current.nextAmount;
     const changeDate = patch.changeDate !== undefined ? patch.changeDate : current.changeDate;
+    const nextDue = patch.nextDue !== undefined ? patch.nextDue : current.nextDue;
     const nextAmountCell = nextAmount > 0 ? core.formatPlainNumber(nextAmount) : "";
     const changeDateCell = changeDate || "";
-    const row = `| ${item.name} | ${item.cadence} | ${amountCell} | ${active ? "yes" : "no"} | ${autoLog ? "yes" : "no"} | ${nextAmountCell} | ${changeDateCell} |`;
+    const nextDueCell = nextDue || "";
+    const row = `| ${item.name} | ${item.cadence} | ${amountCell} | ${active ? "yes" : "no"} | ${autoLog ? "yes" : "no"} | ${variable ? "yes" : "no"} | ${nextAmountCell} | ${changeDateCell} | ${nextDueCell} |`;
 
     const lines = String(content).replace(/\r\n/g, "\n").split("\n");
     const headerIndex = lines.findIndex(
@@ -7162,24 +7308,31 @@ class FinanceTrackerPlugin extends Plugin {
       if (lines.length && lines[lines.length - 1].trim()) lines.push("");
       lines.push("## Registry");
       lines.push("");
-      lines.push("Hand-editable per-bill state: Active no pauses a bill, Auto-log yes logs it on its due day, a filled Amount overrides the inferred price. Next Amount + Change Date schedule a future price change, applied automatically once the date arrives.");
+      lines.push("Hand-editable per-bill state: Active no pauses a bill, Auto-log yes logs it on its due day, a filled Amount overrides the inferred price. Variable yes projects the average of recent payments instead of just the last one (for fluctuating bills like utilities) — Log now then prompts for the actual amount each time. Next Amount + Change Date schedule a future price change, applied automatically once the date arrives. Next Due overrides the computed due date — the schedule stays anchored to it even if a bill is logged late or early.");
       lines.push("");
-      lines.push("| Item | Cadence | Amount | Active | Auto-log | Next Amount | Change Date |");
-      lines.push("| --- | --- | ---: | --- | --- | ---: | --- |");
+      lines.push("| Item | Cadence | Amount | Active | Auto-log | Variable | Next Amount | Change Date | Next Due |");
+      lines.push("| --- | --- | ---: | --- | --- | --- | ---: | --- | --- |");
       lines.push(row);
       lines.push("");
     } else {
-      // Older notes have a 5-column table (no Next Amount/Change Date) — widen
-      // the header and every existing row in place so the table stays one
-      // consistent width and parseMarkdownTable keeps matching every row.
+      // Older notes have a narrower table (missing Next Amount/Change Date,
+      // Next Due, and/or Variable) — widen the header and every existing row
+      // in place so the table stays one consistent width and
+      // parseMarkdownTable keeps matching every row. Column counts seen in
+      // the wild: 5 (original), 7 (+ Next Amount/Change Date), 8 (+ Next Due).
+      // Variable slots in at position 5 (0-indexed), ahead of the columns
+      // added after it, so those need shifting rather than just padding.
       const headerCellCount = lines[headerIndex].split("|").length - 2;
-      if (headerCellCount < 7) {
-        lines[headerIndex] = "| Item | Cadence | Amount | Active | Auto-log | Next Amount | Change Date |";
-        lines[headerIndex + 1] = "| --- | --- | ---: | --- | --- | ---: | --- |";
+      if (headerCellCount < 9) {
+        lines[headerIndex] = "| Item | Cadence | Amount | Active | Auto-log | Variable | Next Amount | Change Date | Next Due |";
+        lines[headerIndex + 1] = "| --- | --- | ---: | --- | --- | --- | ---: | --- | --- |";
         for (let index = headerIndex + 2; index < lines.length && /^\s*\|/.test(lines[index]); index += 1) {
           const cells = lines[index].split("|").slice(1, -1).map((cell) => cell.trim());
-          while (cells.length < 5) cells.push("");
-          lines[index] = `| ${cells.slice(0, 5).join(" | ")} |  |  |`;
+          // Insert a blank Variable cell at position 5 (0-indexed) if this row
+          // predates that column, i.e. it has 5, 7, or 8 cells rather than 9.
+          if (cells.length === 5 || cells.length === 7 || cells.length === 8) cells.splice(5, 0, "");
+          while (cells.length < 9) cells.push("");
+          lines[index] = `| ${cells.slice(0, 9).join(" | ")} |`;
         }
       }
 
@@ -7199,10 +7352,26 @@ class FinanceTrackerPlugin extends Plugin {
     await _ftModify(this.app, file, lines.join("\n"));
   }
 
-  async logRecurringItem(item, date) {
-    const bullet = [`\t- ${core.formatCurrency(item.lastAmount, item.currency || this.settings.defaultCurrency)} ${item.tag}`];
+  async logRecurringItem(item, date, amountOverride) {
+    const amount = Number.isFinite(amountOverride) && amountOverride > 0 ? amountOverride : item.lastAmount;
+    const bullet = [`\t- ${core.formatCurrency(amount, item.currency || this.settings.defaultCurrency)} ${item.tag}`];
     if (item.merchant) bullet.push(`\t\t- ${item.merchant}`);
     return this.appendFinanceLines(date || core.todayIsoLocal(), bullet);
+  }
+
+  // Shared "Log now" behavior for both the finance-recurring block and the
+  // sidebar's due-bills card: logs on the real date it was actually paid, but
+  // advances the schedule from the due date just fulfilled (not from today),
+  // so a late payment never drifts the cadence. `amountOverride` is used for
+  // variable bills, where the caller has already prompted for the real amount
+  // rather than repeating the projected/average one.
+  async logRecurringNow(item, amountOverride) {
+    const logDate = core.todayIsoLocal();
+    await this.logRecurringItem(item, logDate, amountOverride);
+    if (item.nextDue) {
+      await this.updateRecurringRegistryEntry(item, { nextDue: core.nextRecurringDate(item.nextDue, item.cadence) });
+    }
+    return logDate;
   }
 
   // Logs every recurring item whose next-due date has arrived, dated on the due
@@ -7223,6 +7392,10 @@ class FinanceTrackerPlugin extends Plugin {
       if (!due.length) break;
       for (const item of due) {
         await this.logRecurringItem(item, item.nextDue);
+        // Keep any Next Due override advancing too — otherwise a stale
+        // override would never move forward and the item would look
+        // perpetually (re-)due on every future pass/check.
+        await this.updateRecurringRegistryEntry(item, { nextDue: core.nextRecurringDate(item.nextDue, item.cadence) });
         logged += 1;
       }
     }
@@ -7298,6 +7471,7 @@ class FinanceTrackerPlugin extends Plugin {
         `${core.formatCurrency(item.monthlyCost, currency)}/month`,
       ];
       if (manage) metaBits.push(item.autoLog !== false ? "auto-log on" : "auto-log off");
+      if (item.variable) metaBits.push("variable");
       if (item.nextAmount > 0 && item.changeDate) {
         metaBits.push(`changing to ${core.formatCurrency(item.nextAmount, currency)} on ${item.changeDate}`);
       }
@@ -7328,10 +7502,13 @@ class FinanceTrackerPlugin extends Plugin {
         const actions = row.createDiv({ cls: "finance-tracker-header-actions" });
         const logButton = actions.createEl("button", { text: "Log now" });
         logButton.addEventListener("click", async () => {
+          if (item.variable) {
+            new LogVariableBillModal(this.app, this, item, () => this.renderRecurringBlock(source, el, ctx)).open();
+            return;
+          }
           logButton.disabled = true;
           try {
-            const logDate = isDue ? item.nextDue : core.todayIsoLocal();
-            await this.logRecurringItem(item, logDate);
+            const logDate = await this.logRecurringNow(item);
             new Notice(`Logged ${item.label} for ${logDate}`);
             await this.renderRecurringBlock(source, el, ctx);
           } catch (error) {
@@ -7345,7 +7522,9 @@ class FinanceTrackerPlugin extends Plugin {
             skipButton.disabled = true;
             try {
               await this.logRecurringSkip(item);
-              new Notice(`Skipped ${item.label} — next due moves to ${core.nextRecurringDate(item.nextDue, item.cadence)}`);
+              const nextDue = core.nextRecurringDate(item.nextDue, item.cadence);
+              await this.updateRecurringRegistryEntry(item, { nextDue });
+              new Notice(`Skipped ${item.label} — next due moves to ${nextDue}`);
               await this.renderRecurringBlock(source, el, ctx);
             } catch (error) {
               new Notice(`Could not skip ${item.label}: ${error.message}`);
@@ -7393,22 +7572,54 @@ class FinanceTrackerPlugin extends Plugin {
     // when it lands, and the steady set-aside that keeps it that way.
     if (reserve.rows.length) {
       const reserveSection = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
-      reserveSection.createEl("h4", { text: "Bill reserve" });
+      const reserveHeader = reserveSection.createDiv({ cls: "finance-tracker-header" });
+      reserveHeader.createEl("h4", { text: "Bill reserve" });
+      const contributeButton = reserveHeader
+        .createDiv({ cls: "finance-tracker-header-actions" })
+        .createEl("button", { text: "Contribute" });
+      contributeButton.addEventListener("click", () => {
+        new ContributeBillReserveModal(this.app, this, () => this.renderRecurringBlock(source, el, ctx)).open();
+      });
       reserveSection.createDiv({
         cls: "finance-tracker-budget-meta",
         text: "Money to keep set aside so bills never surprise you — accrued since each bill was last paid.",
       });
+      const saved = await this.getBillReserveSaved();
       const reserveCards = reserveSection.createDiv({ cls: "finance-tracker-summary" });
       const reserveData = [
         { label: "Should be set aside now", value: core.formatCurrency(reserve.totals.accrued, currency) },
+        { label: "Saved so far", value: core.formatCurrency(saved, currency) },
         { label: "Set aside / week", value: core.formatCurrency(reserve.totals.perWeek, currency) },
         { label: "Set aside / month", value: core.formatCurrency(reserve.totals.perMonth, currency) },
+        { label: "Set aside / quarter", value: core.formatCurrency(reserve.totals.perQuarter, currency) },
       ];
       for (const card of reserveData) {
         const element = reserveCards.createDiv({ cls: "finance-tracker-summary-card" });
         element.createDiv({ cls: "finance-tracker-summary-label", text: card.label });
         element.createDiv({ cls: "finance-tracker-summary-value", text: card.value });
       }
+
+      // By cadence: weekly bills only need a per-week figure, but monthly (and
+      // longer) cadences need both — how much to set aside each week AND each
+      // month towards those specifically, kept separate from the combined
+      // totals above.
+      if (reserve.byCadence.length) {
+        reserveSection.createEl("h5", { text: "By cadence" });
+        const cadenceTable = reserveSection.createEl("table", { cls: "finance-tracker-table" });
+        const headRow = cadenceTable.createEl("thead").createEl("tr");
+        for (const label of ["Cadence", "Per week", "Per month", "Per quarter"]) {
+          headRow.createEl("th", { text: label });
+        }
+        const body = cadenceTable.createEl("tbody");
+        for (const row of reserve.byCadence) {
+          const tr = body.createEl("tr");
+          tr.createEl("td", { text: row.label });
+          tr.createEl("td", { text: core.formatCurrency(row.perWeek, currency), cls: "is-numeric" });
+          tr.createEl("td", { text: core.formatCurrency(row.perMonth, currency), cls: "is-numeric" });
+          tr.createEl("td", { text: core.formatCurrency(row.perQuarter, currency), cls: "is-numeric" });
+        }
+      }
+
       const reserveList = reserveSection.createDiv({ cls: "ft-budget-rows" });
       for (const row of reserve.rows.filter((item) => item.accrued > 0).slice(0, 10)) {
         const line = reserveList.createDiv({ cls: "ft-budget-row" });
@@ -8482,6 +8693,24 @@ class EditRecurringItemModal extends Modal {
     const amountInput = amountRow.createEl("input", { type: "number", attr: { step: "0.01" } });
     amountInput.value = String(item.lastAmount ?? "");
 
+    const nextDueRow = contentEl.createDiv({ cls: "finance-edit-row" });
+    nextDueRow.createEl("label", { text: "Next due" });
+    const nextDueInput = nextDueRow.createEl("input", { type: "date" });
+    nextDueInput.value = item.nextDue || "";
+    contentEl.createEl("p", {
+      cls: "finance-edit-hint",
+      text: "Corrects the due-date schedule directly — logging or skipping a cycle normally keeps it on track by itself.",
+    });
+
+    const variableLabel = contentEl.createEl("label", { cls: "finance-edit-remember" });
+    const variableCheckbox = variableLabel.createEl("input", { type: "checkbox" });
+    variableCheckbox.checked = Boolean(item.variable);
+    variableLabel.appendText(" Variable amount (e.g. a utility bill)");
+    contentEl.createEl("p", {
+      cls: "finance-edit-hint",
+      text: "Projects off the average of recent payments instead of the last one, and Log now prompts for the actual amount each time.",
+    });
+
     const scheduleLabel = contentEl.createEl("label", { cls: "finance-edit-remember" });
     const scheduleCheckbox = scheduleLabel.createEl("input", { type: "checkbox" });
     scheduleCheckbox.checked = Boolean(item.nextAmount && item.changeDate);
@@ -8509,7 +8738,11 @@ class EditRecurringItemModal extends Modal {
     saveButton.addEventListener("click", async () => {
       saveButton.disabled = true;
       try {
-        const patch = { amount: core.parseNumber(amountInput.value) };
+        const patch = {
+          amount: core.parseNumber(amountInput.value),
+          nextDue: core.parseIsoDate(nextDueInput.value) || null,
+          variable: variableCheckbox.checked,
+        };
         if (scheduleCheckbox.checked && nextAmountInput.value && changeDateInput.value) {
           patch.nextAmount = core.parseNumber(nextAmountInput.value);
           patch.changeDate = core.parseIsoDate(changeDateInput.value);
@@ -8526,6 +8759,58 @@ class EditRecurringItemModal extends Modal {
         saveButton.disabled = false;
       }
     });
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+// "Log now" for a Variable bill (a fluctuating utility, say) prompts for the
+// actual amount instead of silently repeating the last/average one — logging
+// a made-up fixed number for something that genuinely varies would just be
+// wrong in the daily note.
+class LogVariableBillModal extends Modal {
+  constructor(app, plugin, item, onLogged) {
+    super(app);
+    this.plugin = plugin;
+    this.item = item;
+    this.onLogged = onLogged;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("finance-edit");
+    const item = this.item;
+    const currency = item.currency || this.plugin.settings.defaultCurrency;
+    contentEl.createEl("h3", { text: `Log ${item.label}` });
+    contentEl.createEl("p", {
+      cls: "finance-edit-hint",
+      text: `This bill is variable — enter today's actual amount (recent average: ${core.formatCurrency(item.averageAmount ?? item.lastAmount, currency)}).`,
+    });
+
+    const amountRow = contentEl.createDiv({ cls: "finance-edit-row" });
+    amountRow.createEl("label", { text: "Amount" });
+    const amountInput = amountRow.createEl("input", { type: "number", attr: { step: "0.01" } });
+    amountInput.value = String(item.averageAmount ?? item.lastAmount ?? "");
+
+    const buttons = contentEl.createDiv({ cls: "finance-edit-buttons" });
+    const logButton = buttons.createEl("button", { text: "Log", cls: "mod-cta" });
+    logButton.addEventListener("click", async () => {
+      logButton.disabled = true;
+      try {
+        const amount = core.parseNumber(amountInput.value);
+        const logDate = await this.plugin.logRecurringNow(item, amount);
+        new Notice(`Logged ${item.label} for ${logDate}`);
+        this.close();
+        if (typeof this.onLogged === "function") await this.onLogged();
+      } catch (error) {
+        new Notice(`Could not log ${item.label}: ${error.message}`);
+        logButton.disabled = false;
+      }
+    });
+    window.setTimeout(() => amountInput.focus(), 0);
   }
 
   onClose() {
@@ -9256,6 +9541,78 @@ class ContributeGoalModal extends Modal {
         const goal = goals.find((item) => item.goalKey === this.goalKey);
         await this.plugin.logGoalContribution(this.goalKey, goal?.goalName || this.goalKey, amount, this.form.date, this.form.note);
         new Notice(`Logged ${core.formatCurrency(amount, this.plugin.settings.defaultCurrency)} to ${goal?.goalName || this.goalKey}`);
+        if (typeof this.onDone === "function") await this.onDone();
+        this.close();
+      } catch (error) {
+        new Notice(`Contribution failed: ${error.message}`);
+        saveButton.disabled = false;
+      }
+    });
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+class ContributeBillReserveModal extends Modal {
+  constructor(app, plugin, onDone) {
+    super(app);
+    this.plugin = plugin;
+    this.onDone = onDone;
+    this.form = { amount: "", date: core.todayIsoLocal(), note: "" };
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Contribute to bill reserve" });
+    contentEl.createEl("p", {
+      cls: "finance-tracker-settings-section-copy",
+      text: "Logs a contribution bullet like `- $50.00 #log/income/billreserve` into the chosen day's note — one shared envelope for every recurring bill, the same virtual-envelope idea as a savings goal.",
+    });
+
+    new Setting(contentEl)
+      .setName("Amount")
+      .addText((text) => {
+        text.inputEl.type = "number";
+        text.inputEl.step = "0.01";
+        text.setPlaceholder("50").onChange((value) => {
+          this.form.amount = value;
+        });
+        window.setTimeout(() => text.inputEl.focus(), 0);
+      });
+
+    new Setting(contentEl)
+      .setName("Date")
+      .addText((text) => {
+        text.inputEl.type = "date";
+        text.setValue(this.form.date).onChange((value) => {
+          this.form.date = core.parseIsoDate(value) || core.todayIsoLocal();
+        });
+      });
+
+    new Setting(contentEl)
+      .setName("Note")
+      .setDesc("Optional — defaults to \"Bill reserve contribution\".")
+      .addText((text) => {
+        text.setPlaceholder("Payday transfer").onChange((value) => {
+          this.form.note = value;
+        });
+      });
+
+    const actions = contentEl.createDiv({ cls: "finance-tracker-settings-actions" });
+    const saveButton = actions.createEl("button", { text: "Log contribution", cls: "mod-cta" });
+    saveButton.addEventListener("click", async () => {
+      const amount = core.parseNumber(this.form.amount);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        new Notice("Enter a contribution amount first.");
+        return;
+      }
+      saveButton.disabled = true;
+      try {
+        await this.plugin.logBillReserveContribution(amount, this.form.date, this.form.note);
+        new Notice(`Logged ${core.formatCurrency(amount, this.plugin.settings.defaultCurrency)} to the bill reserve`);
         if (typeof this.onDone === "function") await this.onDone();
         this.close();
       } catch (error) {

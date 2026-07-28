@@ -1204,6 +1204,17 @@ test("computeRecurringReserve accrues per bill and totals the next 30 days", () 
   assert.equal(domain.dueSoon, 0); // not due until 2027
   assert.equal(reserve.totals.perWeek, core.roundCurrencyAmount(14 + 120 / 52));
   assert.equal(reserve.totals.dueNext30Days, gym.dueSoon);
+
+  // Per-cadence breakdown: weekly and yearly bills kept separate, plus the
+  // combined week/month/quarter totals across everything.
+  const weekly = reserve.byCadence.find((row) => row.cadence === "weekly");
+  const yearly = reserve.byCadence.find((row) => row.cadence === "yearly");
+  assert.equal(weekly.perWeek, 14);
+  assert.equal(weekly.perMonth, core.roundCurrencyAmount((14 * 52) / 12));
+  assert.equal(yearly.perWeek, core.roundCurrencyAmount(120 / 52));
+  assert.equal(yearly.perMonth, core.roundCurrencyAmount(120 / 12));
+  assert.equal(yearly.perQuarter, core.roundCurrencyAmount(120 / 4));
+  assert.equal(reserve.totals.perQuarter, core.roundCurrencyAmount((14 * 52 + 120) / 4));
 });
 
 test("archive summary includes a withdrawals table for plain savings goals", () => {
@@ -1349,6 +1360,8 @@ test("buildPeriodReviewLines summarises a year: totals, best/worst month, top ca
     { entryType: "income", isIncome: true, isGoalContribution: true, category: "salary", goalKey: "salary", amount: 3000, date: "2026-06-01" },
     // a goal withdrawal
     { entryType: "goal-withdrawal", isGoalWithdrawal: true, category: "repairs", goalKey: "roadbike", amount: 120, date: "2026-06-25" },
+    // a bill reserve top-up — excluded from Total income, like settleup
+    { entryType: "income", isIncome: true, isGoalContribution: true, category: "billreserve", goalKey: "", amount: 40, date: "2026-06-10" },
     // outside the year — must not count
     { entryType: "spending", category: "food/groceries", amount: 9999, date: "2025-12-31" },
   ];
@@ -1358,13 +1371,14 @@ test("buildPeriodReviewLines summarises a year: totals, best/worst month, top ca
 
   assert.equal(lines[0], "## 2026 Year in Review");
   assert.match(text, /Total spent: \$600\.00/); // 100 (Jan) + 400 + 100 (Jun); the withdrawal is NOT spend
-  assert.match(text, /Total income: \$3,000\.00/); // salary only — settleup and goal contribution excluded
+  assert.match(text, /Total income: \$3,000\.00/); // salary only — settleup, bill reserve, and goal contribution excluded
   assert.match(text, /Best month \(lowest spend\): 2026-01 — \$100\.00/);
   assert.match(text, /Worst month \(highest spend\): 2026-06 — \$500\.00/);
   assert.match(text, /\| Food \| \$500\.00 \| 83% \|/);
   assert.match(text, /Savings contributions: \$300\.00 \(1\)/);
   assert.match(text, /Savings withdrawals: \$120\.00 \(1\)/);
   assert.match(text, /Settled repayments received: \$50\.00 \(1\)/);
+  assert.match(text, /Bill reserve contributions: \$40\.00 \(1\)/);
 });
 
 test("buildPeriodReviewLines scopes to a single quarter", () => {
@@ -1379,4 +1393,67 @@ test("buildPeriodReviewLines scopes to a single quarter", () => {
   assert.equal(lines[0], "## 2026 Q2 Review");
   assert.match(text, /Period: 2026-04-01 to 2026-06-30/);
   assert.match(text, /Total spent: \$250\.00/);
+});
+
+test("a Variable bill projects off the average of its recent payments, not just the last one", () => {
+  const detected = core.detectRecurringPayments(
+    [
+      { amount: 80, category: "subscriptions/monthly/power", date: "2026-04-01", merchant: "Power Co" },
+      { amount: 160, category: "subscriptions/monthly/power", date: "2026-05-01", merchant: "Power Co" },
+      { amount: 120, category: "subscriptions/monthly/power", date: "2026-06-01", merchant: "Power Co" },
+    ],
+    { prefix: "subscriptions", referenceDate: "2026-06-15" }
+  );
+  const power = detected.items.find((item) => item.name === "power");
+  assert.deepEqual(power.recentAmounts, [80, 160, 120]); // oldest to newest
+  assert.equal(power.averageAmount, 120); // (80 + 160 + 120) / 3
+  assert.equal(power.lastAmount, 120); // the raw last-logged amount happens to match here
+
+  // Without the Variable flag, applyRecurringRegistry keeps using the last
+  // logged amount, same as any fixed bill.
+  const fixed = core.applyRecurringRegistry(detected, new Map());
+  assert.equal(fixed.items.find((item) => item.name === "power").lastAmount, 120);
+
+  // Marked Variable, a genuinely lopsided sequence should project off the
+  // average instead of an unusually high or low final bill.
+  const detectedSpiky = core.detectRecurringPayments(
+    [
+      { amount: 80, category: "subscriptions/monthly/power", date: "2026-04-01", merchant: "Power Co" },
+      { amount: 90, category: "subscriptions/monthly/power", date: "2026-05-01", merchant: "Power Co" },
+      { amount: 250, category: "subscriptions/monthly/power", date: "2026-06-01", merchant: "Power Co" },
+    ],
+    { prefix: "subscriptions", referenceDate: "2026-06-15" }
+  );
+  const registry = core.parseRecurringRegistry(`
+| Item  | Cadence | Active | Auto-log | Variable |
+| ----- | ------- | ------ | -------- | -------- |
+| power | monthly | yes    | yes      | yes      |
+`.trim());
+  const applied = core.applyRecurringRegistry(detectedSpiky, registry);
+  const appliedPower = applied.items.find((item) => item.name === "power");
+  assert.equal(appliedPower.variable, true);
+  assert.equal(appliedPower.lastAmount, 140); // (80 + 90 + 250) / 3, not the spiky $250
+  assert.equal(appliedPower.monthlyCost, 140);
+});
+
+test("a Next Due override keeps the schedule anchored even when a bill is logged late", () => {
+  // Tag-derived: last logged 2026-06-01, monthly cadence -> would naturally be
+  // due 2026-07-01. Simulate having clicked "Log now" a few days late on that
+  // cycle already, which should have advanced the override to 2026-08-01
+  // (not drifted to whatever late date it was actually logged on).
+  const detected = core.detectRecurringPayments(
+    [{ amount: 12.99, category: "subscriptions/monthly/spotify", date: "2026-06-01", merchant: "Spotify" }],
+    { prefix: "subscriptions", referenceDate: "2026-07-20" }
+  );
+  const registry = core.parseRecurringRegistry(`
+| Item    | Cadence | Amount | Active | Auto-log | Next Amount | Change Date | Next Due   |
+| ------- | ------- | -----: | ------ | -------- | -----------: | ----------- | ---------- |
+| spotify | monthly |        | yes    | yes      |               |             | 2026-08-01 |
+`.trim());
+
+  const applied = core.applyRecurringRegistry(detected, registry, "2026-07-20");
+  const spotify = applied.items.find((item) => item.name === "spotify");
+  assert.equal(spotify.nextDue, "2026-08-01"); // override wins over the tag-derived 2026-07-01
+  assert.equal(spotify.status, "upcoming"); // not overdue, thanks to the override
+  assert.equal(spotify.daysUntilDue, 12);
 });
