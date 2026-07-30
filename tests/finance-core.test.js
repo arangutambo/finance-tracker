@@ -1055,6 +1055,31 @@ test("buildHierarchicalCategoryGroups ranks majors and shades subgroups from one
   assert.equal(hierarchy.slices.length, 3);
 });
 
+test("buildHierarchicalCategoryGroups splits a genuine third level into its own leaves, but passes a two-level category through untouched", () => {
+  const entries = [
+    { amount: 50, myShare: 50, category: "food/groceries/chais" },
+    { amount: 30, myShare: 30, category: "food/groceries/milk" },
+    { amount: 90, myShare: 90, category: "shopping/amazon" },
+  ];
+  const hierarchy = core.buildHierarchicalCategoryGroups(entries, "full");
+  const food = hierarchy.groups.find((group) => group.key === "food");
+  const groceries = food.children.find((sub) => sub.key === "food/groceries");
+  assert.equal(groceries.total, 80);
+  // A real third level: two distinct leaves, ranked highest-spend-first.
+  assert.equal(groceries.children.length, 2);
+  assert.equal(groceries.children[0].key, "food/groceries/chais");
+  assert.equal(groceries.children[1].key, "food/groceries/milk");
+
+  const shopping = hierarchy.groups.find((group) => group.key === "shopping");
+  const amazon = shopping.children.find((sub) => sub.key === "shopping/amazon");
+  // No third level here — the single leaf passes through as the subcategory
+  // itself rather than an artificial extra split.
+  assert.equal(amazon.children.length, 1);
+  assert.equal(amazon.children[0].key, "shopping/amazon");
+
+  assert.equal(hierarchy.slices.length, 3);
+});
+
 // ---------------------------------------------------------------------------
 // v0.2.0: daily-note name helpers
 // ---------------------------------------------------------------------------
@@ -1186,7 +1211,7 @@ test("a zero-amount skip entry advances the recurring anchor without changing th
   assert.equal(recurring.items[0].nextDue, "2026-07-20");
 });
 
-test("computeRecurringReserve accrues per bill and totals the next 30 days", () => {
+test("computeRunway targets the bills that actually land inside the window", () => {
   const recurring = core.detectRecurringPayments(
     [
       { amount: 14, category: "subscriptions/weekly/gym", date: "2026-07-13", merchant: "Gym" },
@@ -1194,27 +1219,58 @@ test("computeRecurringReserve accrues per bill and totals the next 30 days", () 
     ],
     { prefix: "subscriptions", referenceDate: "2026-07-16" }
   );
-  const reserve = core.computeRecurringReserve(recurring, "2026-07-16");
-  const gym = reserve.rows.find((row) => row.name === "gym");
-  assert.equal(gym.accrued, 6); // 3 of 7 days through the cycle: 14 * 3/7
-  assert.equal(gym.perWeek, 14);
-  assert.equal(gym.dueSoon, 56); // 4 occurrences inside 30 days: 07-20, 07-27, 08-03, 08-10
-  const domain = reserve.rows.find((row) => row.name === "domain");
-  assert.ok(domain.accrued > 55 && domain.accrued < 65); // ~half the year elapsed
-  assert.equal(domain.dueSoon, 0); // not due until 2027
-  assert.equal(reserve.totals.perWeek, core.roundCurrencyAmount(14 + 120 / 52));
-  assert.equal(reserve.totals.dueNext30Days, gym.dueSoon);
 
-  // Per-cadence breakdown: weekly and yearly bills kept separate, plus the
-  // combined week/month/quarter totals across everything.
-  const weekly = reserve.byCadence.find((row) => row.cadence === "weekly");
-  const yearly = reserve.byCadence.find((row) => row.cadence === "yearly");
-  assert.equal(weekly.perWeek, 14);
-  assert.equal(weekly.perMonth, core.roundCurrencyAmount((14 * 52) / 12));
-  assert.equal(yearly.perWeek, core.roundCurrencyAmount(120 / 52));
-  assert.equal(yearly.perMonth, core.roundCurrencyAmount(120 / 12));
-  assert.equal(yearly.perQuarter, core.roundCurrencyAmount(120 / 4));
-  assert.equal(reserve.totals.perQuarter, core.roundCurrencyAmount((14 * 52 + 120) / 4));
+  const runway = core.computeRunway(recurring, { referenceDate: "2026-07-16", period: "1 month", mode: "bills" });
+
+  // A 1-month window starting 2026-07-16 is exclusive of 2026-08-16, so two
+  // consecutive windows never double-count a bill on the boundary.
+  assert.equal(runway.windowEnd, "2026-08-15");
+  assert.equal(runway.windowDays, 31);
+
+  // Four gym occurrences fall inside: 07-20, 07-27, 08-03, 08-10. The yearly
+  // domain renewal is not due until 2027, so it contributes nothing yet —
+  // this is the whole point of walking the schedule instead of averaging.
+  assert.equal(runway.bills, 56);
+  assert.equal(runway.target, 56);
+  assert.deepEqual(
+    runway.occurrences.map((item) => item.date),
+    ["2026-07-20", "2026-07-27", "2026-08-03", "2026-08-10"]
+  );
+});
+
+test("a yearly bill is worth nothing to runway until it enters the window, then all of it", () => {
+  const recurring = core.detectRecurringPayments(
+    [{ amount: 900, category: "subscriptions/yearly/insurance", date: "2026-09-01", merchant: "AAMI" }],
+    { prefix: "subscriptions", referenceDate: "2026-07-16" }
+  );
+
+  // Renewal is 2027-09-01. A one-month window in July 2027 misses it...
+  assert.equal(core.computeRunway(recurring, { referenceDate: "2027-07-16", period: "1 month", mode: "bills" }).target, 0);
+  // ...and one in August 2027 catches the whole thing.
+  assert.equal(core.computeRunway(recurring, { referenceDate: "2027-08-16", period: "1 month", mode: "bills" }).target, 900);
+});
+
+test("parseRunwayPeriod normalizes the shorthand people actually type", () => {
+  assert.deepEqual(core.parseRunwayPeriod("1 month").label, "1 month");
+  assert.deepEqual(core.parseRunwayPeriod("2 weeks").label, "2 weeks");
+  assert.deepEqual(core.parseRunwayPeriod("3mo").label, "3 months");
+  assert.deepEqual(core.parseRunwayPeriod("6 months").label, "6 months");
+  assert.deepEqual(core.parseRunwayPeriod("").label, "1 month", "blank falls back to one month");
+  assert.deepEqual(core.parseRunwayPeriod("nonsense").label, "1 month");
+});
+
+test("a paused bill is excluded from runway, like it is from every other total", () => {
+  const detected = core.detectRecurringPayments(
+    [
+      { amount: 50, category: "subscriptions/monthly/spotify", date: "2026-07-01", merchant: "Spotify" },
+      { amount: 80, category: "subscriptions/monthly/gym", date: "2026-07-05", merchant: "Gym" },
+    ],
+    { prefix: "subscriptions", referenceDate: "2026-07-16" }
+  );
+  const applied = core.applyRecurringRegistry(detected, new Map([["gym", { active: false, autoLog: null }]]), "2026-07-16");
+  const runway = core.computeRunway(applied, { referenceDate: "2026-07-16", period: "1 month", mode: "bills" });
+  assert.equal(runway.target, 50);
+  assert.deepEqual(runway.occurrences.map((item) => item.name), ["spotify"]);
 });
 
 test("archive summary includes a withdrawals table for plain savings goals", () => {
@@ -1314,10 +1370,9 @@ test("applyRecurringRegistry pauses items and overrides amounts", () => {
   assert.equal(spotify.autoLog, true);
   // totals only count active items: just spotify's 12.99/month
   assert.equal(applied.totals.monthly, 12.99);
-  // the reserve also skips paused items
-  const reserve = core.computeRecurringReserve(applied, "2026-07-21");
-  assert.equal(reserve.rows.length, 1);
-  assert.equal(reserve.rows[0].name, "spotify");
+  // runway also skips paused items
+  const runway = core.computeRunway(applied, { referenceDate: "2026-07-21", period: "1 month", mode: "bills" });
+  assert.deepEqual([...new Set(runway.occurrences.map((item) => item.name))], ["spotify"]);
 });
 
 test("applyRecurringRegistry keeps a future price change pending until its date", () => {
@@ -1378,7 +1433,7 @@ test("buildPeriodReviewLines summarises a year: totals, best/worst month, top ca
   assert.match(text, /Savings contributions: \$300\.00 \(1\)/);
   assert.match(text, /Savings withdrawals: \$120\.00 \(1\)/);
   assert.match(text, /Settled repayments received: \$50\.00 \(1\)/);
-  assert.match(text, /Bill reserve contributions: \$40\.00 \(1\)/);
+  assert.match(text, /Runway contributions: \$40\.00 \(1\)/);
 });
 
 test("buildPeriodReviewLines scopes to a single quarter", () => {

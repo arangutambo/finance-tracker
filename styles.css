@@ -45,13 +45,26 @@
 
 .finance-tracker-summary-label {
   color: var(--text-muted);
-  font-size: 0.86em;
-  margin-bottom: 6px;
+  font-size: 0.78em;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 4px;
 }
 
+/* The figure carries the card. At 1.1em/600 against a 0.86em label there was
+   barely any contrast to read, so every card landed with equal weight. */
 .finance-tracker-summary-value {
-  font-size: 1.1em;
-  font-weight: 600;
+  font-size: 1.5em;
+  font-weight: 650;
+  line-height: 1.15;
+}
+
+/* Supporting detail that must not compete with the figure above it. */
+.finance-tracker-summary-hint {
+  color: var(--text-muted);
+  font-size: 0.8em;
+  margin-top: 4px;
+  line-height: 1.3;
 }
 
 .finance-tracker-chart-card {
@@ -167,6 +180,24 @@
   display: grid;
   gap: 10px;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+
+.finance-tracker-budget-list.is-recurring-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  align-items: start;
+}
+
+.finance-tracker-budget-list.is-recurring-grid .finance-tracker-recurring-row {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.finance-tracker-budget-list.is-recurring-grid .finance-tracker-recurring-row .finance-tracker-header-actions {
+  margin-top: auto;
+  flex-wrap: wrap;
 }
 
 .finance-tracker-calendar-grid {
@@ -503,8 +534,7 @@
   background: #c53030;
 }
 
-.finance-tracker-empty,
-.finance-tracker-settings-help {
+.finance-tracker-empty {
   color: var(--text-muted);
 }
 
@@ -518,11 +548,6 @@
   gap: 8px;
   margin: 10px 0 14px;
   flex-wrap: wrap;
-}
-
-.finance-tracker-settings-textarea {
-  width: 100%;
-  min-height: 180px;
 }
 
 .finance-tracker-holiday-input {
@@ -565,10 +590,6 @@
   overflow-wrap: anywhere;
 }
 
-.finance-tracker-settings-help p {
-  margin: 10px 0;
-}
-
 @media (max-width: 720px) {
   .finance-tracker-header {
     flex-direction: column;
@@ -600,22 +621,6 @@
 
 .finance-tracker-legend--mini .finance-tracker-legend-label {
   font-size: 0.82em;
-}
-
-/* Journal calendar integration — daily spend badge */
-.finance-tracker-spend-badge {
-  position: absolute;
-  bottom: 1px;
-  left: 0;
-  right: 0;
-  font-size: 0.5em;
-  line-height: 1;
-  text-align: center;
-  color: var(--text-muted);
-  pointer-events: none;
-  z-index: 3;
-  white-space: nowrap;
-  overflow: hidden;
 }
 
 /* ---- Quick add modal ---- */
@@ -1148,4 +1153,200 @@
 
 .finance-tracker-recurring-check input[type="checkbox"] {
   margin: 0;
+}
+
+/* ============================================================
+   Button weight hierarchy
+   Every in-block action used to render as an identical default
+   button, so a row with six of them gave the eye nothing to
+   land on. Block buttons are now quiet outlines by default and
+   only the row's primary action (Log now, Contribute, Settle
+   up) is filled. Modals already did this with .mod-cta.
+   ============================================================ */
+
+.finance-tracker-header-actions button {
+  background: transparent;
+  box-shadow: none;
+  border: 1px solid var(--background-modifier-border);
+  color: var(--text-muted);
+  font-size: 0.86em;
+  padding: 4px 10px;
+  height: auto;
+  cursor: pointer;
+}
+
+.finance-tracker-header-actions button:hover {
+  background: var(--background-modifier-hover);
+  border-color: var(--background-modifier-border-hover);
+  color: var(--text-normal);
+  box-shadow: none;
+}
+
+.finance-tracker-header-actions button.mod-cta {
+  background: var(--interactive-accent);
+  border-color: transparent;
+  color: var(--text-on-accent);
+  font-size: 0.92em;
+  font-weight: 600;
+}
+
+.finance-tracker-header-actions button.mod-cta:hover {
+  background: var(--interactive-accent-hover);
+  color: var(--text-on-accent);
+}
+
+.finance-tracker-header-actions button.mod-warning {
+  background: transparent;
+  border-color: var(--background-modifier-border);
+  color: var(--text-faint);
+}
+
+.finance-tracker-header-actions button.mod-warning:hover {
+  border-color: var(--text-error, #c0392b);
+  color: var(--text-error, #c0392b);
+  background: transparent;
+}
+
+.finance-tracker-header-actions button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Secondary action rows (Edit / Pause / Auto-log) sit below the primary row
+   and recede further still. */
+.finance-tracker-header-actions.is-secondary {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--background-modifier-border);
+  align-items: center;
+}
+
+.finance-tracker-header-actions.is-secondary button {
+  border-color: transparent;
+  padding: 4px 8px;
+}
+
+.finance-tracker-header-actions.is-secondary button:hover {
+  border-color: var(--background-modifier-border);
+}
+
+/* A boolean reads as a checkbox, not as a button that reports its own state. */
+.ft-inline-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-muted);
+  font-size: 0.86em;
+  cursor: pointer;
+}
+
+.ft-inline-toggle input[type="checkbox"] {
+  margin: 0;
+}
+
+/* ============================================================
+   Row hierarchy — name left, money right and heavier
+   Call sites used to concatenate "Spotify — $13.99" into one
+   span at one weight; a receipt reads better with the price
+   isolated.
+   ============================================================ */
+
+.ft-row-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.ft-row-name {
+  font-weight: 500;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ft-row-amount {
+  font-size: 1.15em;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.finance-tracker-recurring-row.is-overdue .ft-row-amount {
+  color: var(--text-error, #c0392b);
+}
+
+.finance-tracker-summary-card.is-good .finance-tracker-summary-value {
+  color: var(--color-green, #2f855a);
+}
+
+/* The sidebar keeps its tighter scale. */
+.finance-tracker-dashboard.is-sidebar .finance-tracker-summary-value {
+  font-size: 1.2em;
+}
+
+.finance-tracker-dashboard.is-sidebar .ft-row-amount {
+  font-size: 1em;
+}
+
+/* ---- Settings: advanced disclosure + vault status ---- */
+.finance-tracker-advanced {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 0 12px;
+  margin: 12px 0 18px;
+}
+
+.finance-tracker-advanced > summary {
+  cursor: pointer;
+  padding: 10px 0;
+  color: var(--text-muted);
+  font-size: 0.9em;
+}
+
+.finance-tracker-advanced[open] > summary {
+  border-bottom: 1px solid var(--background-modifier-border);
+  margin-bottom: 4px;
+}
+
+.finance-tracker-advanced .setting-item:last-child {
+  border-bottom: none;
+}
+
+/* Says out loud what the plugin can actually see, so a wrong folder or heading
+   surfaces here instead of as a silently empty dashboard. */
+.finance-tracker-vault-status {
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin: 4px 0 14px;
+  font-size: 0.9em;
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  border-left: 3px solid var(--background-modifier-border);
+}
+
+.finance-tracker-vault-status.is-ok {
+  border-left-color: var(--color-green, #2f855a);
+}
+
+.finance-tracker-vault-status.is-warning {
+  border-left-color: var(--color-orange, #dd6b20);
+  color: var(--text-normal);
+}
+
+/* ---- Quick add: duplicate-of-today warning ---- */
+.finance-quick-add-duplicate {
+  margin: 0.4em 0 0;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border-left: 3px solid var(--color-orange, #dd6b20);
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  font-size: 0.85em;
+}
+
+.finance-quick-add-duplicate.is-hidden {
+  display: none;
 }

@@ -1,6 +1,6 @@
 {
   "name": "finance-tracker",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Obsidian plugin for capturing spending from Apple Shortcuts, updating daily note totals, and visualizing weekly finance data.",
   "license": "MIT",
   "author": "Antoine Haddad",
@@ -14,7 +14,9 @@
     "apple-shortcuts"
   ],
   "scripts": {
-    "test": "node --test tests/*.test.js",
-    "build": "node -e \"['main.js','manifest.json','styles.css'].forEach(f=>require('fs').accessSync(f))\" && echo 'No bundler: main.js is authored directly (see README#Development). Verified release files are present.'"
+    "mirror": "node scripts/mirror-core.js --write",
+    "check:mirror": "node scripts/mirror-core.js --check",
+    "test": "npm run check:mirror && node --test tests/*.test.js",
+    "build": "npm run check:mirror && node -e \"['main.js','manifest.json','styles.css'].forEach(f=>require('fs').accessSync(f))\" && echo 'No bundler: main.js is authored directly (see README#Development). Verified release files are present.'"
   }
 }

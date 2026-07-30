@@ -34,6 +34,19 @@ function normalizeCurrency(value, fallback = "AUD") {
   return aliases[cleaned] || cleaned || fallback;
 }
 
+// Codes quick-add will accept next to a number. Deliberately a closed list: any
+// three letters would make "table 58 oak" parse as 58 OAK.
+const CURRENCY_CODES = new Set([
+  "AED", "ARS", "AUD", "BRL", "CAD", "CHF", "CLP", "CNY", "COP", "CZK", "DKK",
+  "EUR", "GBP", "HKD", "HUF", "IDR", "ILS", "INR", "ISK", "JPY", "KRW", "MXN",
+  "MYR", "NOK", "NZD", "PEN", "PHP", "PLN", "RON", "SEK", "SGD", "THB", "TRY",
+  "TWD", "USD", "VND", "ZAR", "YEN",
+]);
+
+function isCurrencyCode(value) {
+  return CURRENCY_CODES.has(String(value || "").toUpperCase());
+}
+
 function parseNumber(value) {
   if (typeof value === "number") {
     return Number.isFinite(value) ? value : null;
@@ -703,9 +716,16 @@ function parseTransactionsFromNoteContent(content, filePath, options = {}) {
   return transactions;
 }
 
+// Sums the entry lines of a finance section for the running total on the root
+// line. Only tagged lines count: a merchant or note child line is still a
+// bullet, and extractVisibleAmount will happily read a number out of one
+// ("7-Eleven", "Shell Coorparoo 1234"), which used to inflate the written total
+// even though the dashboards — which parse through parseTransactionsFromNoteContent,
+// and have always required a tag — read the same note correctly.
 function calculateSpendingSectionTotal(sectionLines, noteDate, options = {}) {
   return Number(
     sectionLines
+      .filter((line) => /#log\//i.test(String(line || "")))
       .map((line) => parseTransactionLine(line, noteDate, "", options))
       .filter((entry) => entry && !entry.isIncome && !entry.isGoalContribution && entry.entryType !== "balance")
       .reduce((sum, entry) => sum + entry.amount, 0)
@@ -1307,8 +1327,12 @@ function buildInboxLine(expense) {
 // Parses a single free-text quick-add line into structured fields.
 // Grammar: first $?number = amount; a #tag or a/b path or a known category word
 // = category; @token = date; everything else = merchant.
-function parseQuickAddInput(text, knownCategories = []) {
+// Quick add's free-text grammar. `options.defaultCurrency` is the home currency
+// — anything tagged with a different code is treated as the original amount and
+// the remaining bare number as what it actually cost you.
+function parseQuickAddInput(text, knownCategories = [], options = {}) {
   let working = ` ${String(text || "").trim()} `;
+  const homeCurrency = normalizeCurrency(options.defaultCurrency || "AUD");
 
   let dateToken = "";
   working = working.replace(/(^|\s)@(\S+)/, (_match, pre, token) => {
@@ -1342,11 +1366,54 @@ function parseQuickAddInput(text, knownCategories = []) {
     }
   }
 
+  // A number sitting next to a currency code, in either order: "58usd",
+  // "USD 58", "$58 USD". The first such pair is the original amount; whatever
+  // bare number is left is what it cost in the home currency. Two explicit
+  // amounts means no stored rate is needed — you record what you were charged
+  // and what it landed as.
+  let originalAmount = null;
+  let originalCurrency = "";
+  const NUM = "-?\\d[\\d,]*(?:\\.\\d+)?";
+  const fxPatterns = [
+    new RegExp(`(^|\\s)\\$?\\s?(${NUM})\\s*([A-Za-z]{3})(?=\\s|$|[:=])`),
+    new RegExp(`(^|\\s)([A-Za-z]{3})\\s*\\$?\\s?(${NUM})(?=\\s|$|[:=])`),
+  ];
+  for (let index = 0; index < fxPatterns.length; index += 1) {
+    const match = working.match(fxPatterns[index]);
+    if (!match) continue;
+    const code = index === 0 ? match[3] : match[2];
+    const value = index === 0 ? match[2] : match[3];
+    if (!isCurrencyCode(code)) continue;
+    originalAmount = Number(String(value).replace(/,/g, ""));
+    originalCurrency = normalizeCurrency(code);
+    working = working.replace(match[0], match[1] || " ");
+    break;
+  }
+
   let amount = null;
   const amountMatch = working.match(/-?\$?\s?(-?\d[\d,]*(?:\.\d+)?)/);
   if (amountMatch) {
     amount = Number(amountMatch[1].replace(/,/g, ""));
     working = working.replace(amountMatch[0], " ");
+  }
+
+  // A trailing home-currency code on the converted amount ("… : $83.64 AUD")
+  // is confirmation, not data — drop it so it never lands in the merchant.
+  working = working.replace(new RegExp(`(^|\\s)${homeCurrency}(?=\\s|$)`, "i"), "$1");
+  // And the separator people naturally write between the two amounts.
+  working = working.replace(/(^|\s)(?::|=|->|→)(?=\s|$)/g, "$1");
+
+  // Only one amount given, and it was the foreign one: that is the amount. The
+  // caller cannot convert it, and guessing a rate would be worse than not.
+  if (!Number.isFinite(amount) && Number.isFinite(originalAmount) && originalCurrency === homeCurrency) {
+    amount = originalAmount;
+    originalAmount = null;
+    originalCurrency = "";
+  }
+  // Same currency as home on both sides is not a conversion at all.
+  if (originalCurrency && originalCurrency === homeCurrency && Number.isFinite(amount)) {
+    originalAmount = null;
+    originalCurrency = "";
   }
 
   if (!category && knownCategories.length) {
@@ -1371,11 +1438,21 @@ function parseQuickAddInput(text, knownCategories = []) {
     ? extractCategoryFromLogSpendingTag(`#${String(category).replace(/^#/, "")}`)
     : normalizeCategoryPath(category);
 
+  const hasFx = Number.isFinite(originalAmount) && Boolean(originalCurrency);
   return {
     amount: Number.isFinite(amount) ? Number(amount.toFixed(2)) : null,
     category: normalizedCategory,
     dateToken,
     merchant: normalizeWhitespace(working),
+    originalAmount: hasFx ? Number(originalAmount.toFixed(2)) : null,
+    originalCurrency: hasFx ? originalCurrency : "",
+    // 1 unit of the original currency in home currency, for display only —
+    // nothing stores it.
+    impliedRate: hasFx && Number.isFinite(amount) && originalAmount !== 0
+      ? Number((amount / originalAmount).toFixed(4))
+      : null,
+    // The user said what they paid abroad but not what it cost at home.
+    needsConvertedAmount: hasFx && !Number.isFinite(amount),
     owedTokens,
     splitCount,
   };
@@ -1833,85 +1910,172 @@ function detectRecurringPayments(entries, options = {}) {
   };
 }
 
-// Sinking-fund maths for recurring bills: how much of each bill has "accrued"
-// since it was last paid (money that should already be set aside), what is due
-// within the next 30 days, and the steady per-week/per-month/per-quarter
-// set-aside that keeps every cadence covered — both combined, and broken down
-// per cadence (e.g. "monthly bills need $X/week and $Y/month set aside",
-// separately from "weekly bills need $Z/week").
-function computeRecurringReserve(recurring, referenceDate) {
+// --- Money in integer cents -----------------------------------------------------
+// Most of this file rounds after each step with roundCurrencyAmount, which is
+// fine for one or two operations. The runway and forecast maths are several
+// float operations deep before anything is rounded (a per-year figure built
+// from 52/12, then divided by 52, 12 and 4 again), so those work in integer
+// cents and convert back once at the boundary.
+
+function toCents(value) {
+  return Math.round(Number(value || 0) * 100);
+}
+
+function fromCents(cents) {
+  return Number((Math.round(Number(cents) || 0) / 100).toFixed(2));
+}
+
+// Walks each active bill's schedule forward and sums every occurrence landing
+// on or before `end`. This is what makes the runway target react to the
+// calendar rather than to an average: a yearly insurance renewal is worth
+// nothing to the target until it enters the window, then worth all of it.
+// Returns integer cents plus the individual occurrences, newest last.
+function sumRecurringDueWithin(recurring, referenceDate, end) {
   const today = parseIsoDate(referenceDate) || todayIsoLocal();
-  const horizon = addDays(today, 30);
-  const rows = [];
-  const perYearByCadence = new Map();
-  let accruedTotal = 0;
-  let perYearTotal = 0;
-  let dueSoonTotal = 0;
+  const horizon = parseIsoDate(end);
+  const occurrences = [];
+  let totalCents = 0;
+  if (!horizon || horizon < today) return { totalCents, occurrences };
 
   for (const item of recurring?.items || []) {
-    const spec = RECURRING_CADENCES[item.cadence];
-    if (!spec || !item.lastDate || !(item.lastAmount > 0) || item.active === false) continue;
-    const cycleDays = spec.days || Math.round(30.44 * spec.months);
-    const perYear = item.lastAmount * spec.perMonth * 12;
-    const daysSinceLast = Math.max(0, daysBetweenInclusive(item.lastDate, today) - 1);
-    const accrued = roundCurrencyAmount(Math.min(daysSinceLast / cycleDays, 1) * item.lastAmount);
-
-    let dueSoon = 0;
+    if (!RECURRING_CADENCES[item.cadence] || !(item.lastAmount > 0) || item.active === false) continue;
+    const amountCents = toCents(item.lastAmount);
     let due = item.nextDue;
-    for (let guard = 0; due && due <= horizon && guard < 32; guard += 1) {
-      dueSoon += item.lastAmount;
+    // The guard stops a corrupt cadence from looping forever; 400 covers a
+    // weekly bill across a 6-year window, far beyond any sane runway.
+    for (let guard = 0; due && due <= horizon && guard < 400; guard += 1) {
+      totalCents += amountCents;
+      occurrences.push({ date: due, amount: item.lastAmount, label: item.label, name: item.name, cadence: item.cadence });
       due = nextRecurringDate(due, item.cadence);
     }
-    dueSoon = roundCurrencyAmount(dueSoon);
-
-    accruedTotal += accrued;
-    perYearTotal += perYear;
-    dueSoonTotal += dueSoon;
-    perYearByCadence.set(item.cadence, (perYearByCadence.get(item.cadence) || 0) + perYear);
-    rows.push({
-      accrued,
-      cadence: item.cadence,
-      dueSoon,
-      label: item.label,
-      name: item.name,
-      perWeek: roundCurrencyAmount(perYear / 52),
-    });
   }
 
-  rows.sort((left, right) => right.accrued - left.accrued);
+  occurrences.sort((left, right) => String(left.date).localeCompare(String(right.date)));
+  return { totalCents, occurrences };
+}
 
-  const byCadence = Object.keys(RECURRING_CADENCES)
-    .filter((cadence) => perYearByCadence.has(cadence))
-    .map((cadence) => {
-      const perYear = perYearByCadence.get(cadence);
-      return {
-        cadence,
-        label: RECURRING_CADENCES[cadence].label,
-        perWeek: roundCurrencyAmount(perYear / 52),
-        perMonth: roundCurrencyAmount(perYear / 12),
-        perQuarter: roundCurrencyAmount(perYear / 4),
-        perYear: roundCurrencyAmount(perYear),
-      };
-    });
+// Runway is a read-only figure, not something you fund — see computeRunway. But
+// 0.6 shipped a "bill reserve" you could contribute to, and an early 0.7 build
+// briefly made runway a goal note. Bullets under either key still exist in real
+// vaults, and they are transfers rather than income, so they stay excluded from
+// income totals and from the goal lists.
+const RUNWAY_LEGACY_KEYS = new Set(["runway", "billreserve"]);
+
+function normalizeRunwayMode(value) {
+  const raw = String(value || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
+  return raw === "bills" || raw === "bills-only" ? "bills" : "spending";
+}
+
+const RUNWAY_UNITS = {
+  day: { days: 1 },
+  week: { days: 7 },
+  fortnight: { days: 14 },
+  month: { months: 1 },
+  quarter: { months: 3 },
+  year: { months: 12 },
+};
+
+// Parses "1 month", "2 weeks", "6 months", "3mo", "1w" into a normalized
+// { count, unit, label }. Anything unrecognised falls back to one month.
+//
+// Idempotent on purpose: it accepts its own output, so a caller that has already
+// parsed a period can pass the object straight through. Without this, stringifying
+// a parsed object yielded "[object Object]" and silently fell back to one month —
+// which is exactly how a 3-month target ended up measuring a 1-month window.
+function parseRunwayPeriod(value) {
+  if (value && typeof value === "object" && value.unit in RUNWAY_UNITS) {
+    const count = Math.max(1, Number(value.count) || 1);
+    return { count, unit: value.unit, label: `${count} ${value.unit}${count === 1 ? "" : "s"}` };
+  }
+  const raw = normalizeWhitespace(String(value || "")).toLowerCase();
+  const match = raw.match(/^(\d+)?\s*([a-z]+)$/);
+  const aliases = {
+    d: "day", day: "day", days: "day",
+    w: "week", wk: "week", week: "week", weeks: "week",
+    fortnight: "fortnight", fortnights: "fortnight", biweekly: "fortnight",
+    m: "month", mo: "month", month: "month", months: "month",
+    q: "quarter", quarter: "quarter", quarters: "quarter",
+    y: "year", yr: "year", year: "year", years: "year",
+  };
+  const unit = aliases[match?.[2]] || "month";
+  const count = Math.max(1, Number(match?.[1]) || 1);
+  return { count, unit, label: `${count} ${unit}${count === 1 ? "" : "s"}` };
+}
+
+// The last day covered by a runway period starting at `referenceDate`.
+function runwayWindowEnd(referenceDate, period) {
+  const today = parseIsoDate(referenceDate) || todayIsoLocal();
+  const { count, unit } = parseRunwayPeriod(period);
+  const spec = RUNWAY_UNITS[unit] || RUNWAY_UNITS.month;
+  const end = spec.days ? addDays(today, spec.days * count) : addMonths(today, spec.months * count);
+  // Exclusive end: a 1-month window starting today covers up to the day before
+  // the same date next month, so two consecutive windows never double-count a
+  // bill that falls on the boundary.
+  return addDays(end, -1);
+}
+
+// What you need to have available to be safe for a chosen period.
+//
+// This is a read-only figure, deliberately: there is nothing to fund, no balance
+// to keep, and no bookkeeping. It answers one question — "how much do I need in
+// the account for the next N?" — by walking each bill's schedule forward and
+// summing what actually lands, optionally plus your usual discretionary spend.
+//
+// `mode` decides what counts:
+//   "bills"     - recurring bills falling inside the window
+//   "spending"  - those bills plus your trailing-average discretionary spend
+function computeRunway(recurring, options = {}) {
+  const referenceDate = parseIsoDate(options.referenceDate) || todayIsoLocal();
+  const period = parseRunwayPeriod(options.period);
+  const mode = normalizeRunwayMode(options.mode);
+  const windowEnd = runwayWindowEnd(referenceDate, period);
+  const windowDays = Math.max(1, daysBetweenInclusive(referenceDate, windowEnd));
+
+  const { totalCents: billsCents, occurrences } = sumRecurringDueWithin(recurring, referenceDate, windowEnd);
+  const dailyDiscretionaryCents = Math.round(toCents(options.monthlyDiscretionary || 0) / 30.44);
+  const discretionaryCents = mode === "spending" ? dailyDiscretionaryCents * windowDays : 0;
+  const targetCents = billsCents + discretionaryCents;
 
   return {
-    rows,
-    byCadence,
-    totals: {
-      accrued: roundCurrencyAmount(accruedTotal),
-      dueNext30Days: roundCurrencyAmount(dueSoonTotal),
-      perWeek: roundCurrencyAmount(perYearTotal / 52),
-      perMonth: roundCurrencyAmount(perYearTotal / 12),
-      perQuarter: roundCurrencyAmount(perYearTotal / 4),
-    },
+    mode,
+    period: period.label,
+    periodCount: period.count,
+    periodUnit: period.unit,
+    windowStart: referenceDate,
+    windowEnd,
+    windowDays,
+    bills: fromCents(billsCents),
+    discretionary: fromCents(discretionaryCents),
+    target: fromCents(targetCents),
+    perWeek: fromCents(Math.round((targetCents / windowDays) * 7)),
+    perDay: fromCents(Math.round(targetCents / windowDays)),
+    occurrences,
   };
 }
 
+
+const RECURRING_REGISTRY_COLUMNS = [
+  { header: "Item", align: "---" },
+  { header: "Cadence", align: "---" },
+  { header: "Amount", align: "---:" },
+  { header: "Active", align: "---" },
+  { header: "Auto-log", align: "---" },
+  { header: "Variable", align: "---" },
+  { header: "Next Amount", align: "---:" },
+  { header: "Change Date", align: "---" },
+  { header: "Next Due", align: "---" },
+  { header: "End Date", align: "---" },
+  { header: "Payments Left", align: "---:" },
+];
+
+const RECURRING_REGISTRY_HEADER_ROW = `| ${RECURRING_REGISTRY_COLUMNS.map((column) => column.header).join(" | ")} |`;
+const RECURRING_REGISTRY_SEPARATOR_ROW = `| ${RECURRING_REGISTRY_COLUMNS.map((column) => column.align).join(" | ")} |`;
+
 // The recurring registry is a hand-editable markdown table (in the recurring
 // payments note) that holds per-item state the tags cannot: whether a bill is
-// still current (Active), whether it may be auto-logged (Auto-log), and an
-// optional amount override. Blank cells keep the defaults, so an absent table
-// changes nothing.
+// still current (Active), whether it may be auto-logged (Auto-log), an optional
+// amount override, and when the bill stops (End Date / Payments Left). Blank
+// cells keep the defaults, so an absent table changes nothing.
 function parseRecurringRegistry(content) {
   const registry = new Map();
   for (const rows of parseMarkdownTable(content)) {
@@ -1925,6 +2089,8 @@ function parseRecurringRegistry(content) {
       const nextAmount = parseNumber(row["next amount"] ?? row.nextamount);
       const changeDate = parseIsoDate(row["change date"] ?? row.changedate ?? "");
       const nextDue = parseIsoDate(row["next due"] ?? row.nextdue ?? "");
+      const endDate = parseIsoDate(row["end date"] ?? row.enddate ?? row.until ?? "");
+      const paymentsLeft = parseNumber(row["payments left"] ?? row.paymentsleft ?? row.occurrences ?? "");
       registry.set(name, {
         active: activeRaw ? !/^(?:no|false|0|inactive|paused)$/i.test(activeRaw) : true,
         autoLog: autoRaw ? /^(?:yes|true|1|on)$/i.test(autoRaw) : null,
@@ -1933,6 +2099,8 @@ function parseRecurringRegistry(content) {
         nextAmount: Number.isFinite(nextAmount) && nextAmount > 0 ? roundCurrencyAmount(nextAmount) : null,
         changeDate: changeDate || null,
         nextDue: nextDue || null,
+        endDate: endDate || null,
+        paymentsLeft: Number.isFinite(paymentsLeft) && paymentsLeft >= 0 ? Math.floor(paymentsLeft) : null,
         cadence: normalizeCadence(row.cadence || ""),
       });
     }
@@ -1948,10 +2116,15 @@ function parseRecurringRegistry(content) {
 // cadence even when a bill is logged late (or early) — without it, logging a
 // bill's real payment date would silently push every future due date out by
 // however many days late it was.
+//
+// A bill that has run its course — past its End Date, or with no Payments Left
+// — becomes inactive with `finished` set. Reusing `active` means every existing
+// consumer (totals, auto-logging, the reserve maths, the due-bills card) drops
+// it without changes; `finishedReason` is only there so the UI can say "ended"
+// rather than "paused".
 function applyRecurringRegistry(recurring, registry, referenceDate = todayIsoLocal()) {
   const items = (recurring?.items || []).map((item) => {
     const entry = registry?.get(item.name) || registry?.get(item.name.split("/").pop());
-    const active = entry ? entry.active !== false : true;
     const autoLog = entry && entry.autoLog !== null && entry.autoLog !== undefined ? entry.autoLog : true;
     const variable = Boolean(entry?.variable);
     // A manual Amount override always wins. Otherwise a variable bill (a
@@ -1964,13 +2137,26 @@ function applyRecurringRegistry(recurring, registry, referenceDate = todayIsoLoc
     const lastAmount = changeApplied ? entry.nextAmount : baseAmount;
     const spec = RECURRING_CADENCES[item.cadence];
     const nextDue = entry?.nextDue || item.nextDue;
-    const status = !nextDue
-      ? "unknown"
-      : nextDue < referenceDate
-        ? "overdue"
-        : nextDue === referenceDate
-          ? "due"
-          : "upcoming";
+
+    const endDate = entry?.endDate || null;
+    const paymentsLeft = Number.isFinite(entry?.paymentsLeft) ? entry.paymentsLeft : null;
+    const outOfPayments = paymentsLeft !== null && paymentsLeft <= 0;
+    // Past the end date once there is no due date left inside it — a bill due
+    // on the end date itself is still owed.
+    const pastEndDate = Boolean(endDate && (!nextDue || nextDue > endDate));
+    const finishedReason = outOfPayments ? "payments" : pastEndDate ? "end-date" : "";
+    const finished = Boolean(finishedReason);
+    const active = (entry ? entry.active !== false : true) && !finished;
+
+    const status = finished
+      ? "finished"
+      : !nextDue
+        ? "unknown"
+        : nextDue < referenceDate
+          ? "overdue"
+          : nextDue === referenceDate
+            ? "due"
+            : "upcoming";
     const daysUntilDue = nextDue
       ? nextDue >= referenceDate
         ? daysBetweenInclusive(referenceDate, nextDue) - 1
@@ -1985,6 +2171,10 @@ function applyRecurringRegistry(recurring, registry, referenceDate = todayIsoLoc
       nextAmount: changePending ? entry.nextAmount : null,
       changeDate: changePending ? entry.changeDate : null,
       nextDue,
+      endDate,
+      paymentsLeft,
+      finished,
+      finishedReason,
       status,
       daysUntilDue,
       monthlyCost: spec ? roundCurrencyAmount(lastAmount * spec.perMonth) : item.monthlyCost,
@@ -2023,7 +2213,13 @@ function parseGoalDefinition(frontmatter, options = {}) {
 
   const isTrip = Boolean(tripTag);
   const archivedDate = parseIsoDate(fm.archived || "");
+  // Notes left over from the build where runway was briefly a goal note. They
+  // are not goals — runway is computed from your bills, never funded — so they
+  // are flagged here and filtered out of every goal list.
+  const isLegacyRunwayNote =
+    RUNWAY_LEGACY_KEYS.has(goalKey) || String(fm.goal_type || "").trim().toLowerCase() === "runway";
   return {
+    isLegacyRunwayNote,
     active: !archivedDate && /^(?:true|yes|1)$/i.test(String(fm.active ?? fm.active_savings_goal ?? "false")),
     archivedDate: archivedDate || "",
     carryMissedSavings: /^(?:true|yes|1)$/i.test(String(fm.carry_missed_savings || "false")),
@@ -2278,19 +2474,22 @@ function computeForecastInputs(entries, recurring, options = {}) {
 function buildForecastProjection(input = {}) {
   const referenceDate = parseIsoDate(input.referenceDate) || todayIsoLocal();
   const months = Math.max(1, Math.min(Number(input.months) || 6, 60));
-  const startBalance = roundCurrencyAmount(input.startBalance || 0);
-  const monthlyNet = roundCurrencyAmount(
-    Number(input.monthlyIncome || 0) -
-    Number(input.monthlyBills || 0) -
-    Number(input.monthlyDiscretionary || 0) -
-    Number(input.monthlyGoalSetAside || 0)
-  );
+  // Integer cents: this multiplies the monthly net by up to 60 and adds it to a
+  // starting balance, so float error would accumulate visibly along the line.
+  const startCents = toCents(input.startBalance || 0);
+  const monthlyNetCents =
+    toCents(input.monthlyIncome || 0) -
+    toCents(input.monthlyBills || 0) -
+    toCents(input.monthlyDiscretionary || 0) -
+    toCents(input.monthlyGoalSetAside || 0);
+  const startBalance = fromCents(startCents);
+  const monthlyNet = fromCents(monthlyNetCents);
 
   const points = [{ date: referenceDate, balance: startBalance }];
   for (let index = 1; index <= months; index += 1) {
     points.push({
       date: addMonths(referenceDate, index),
-      balance: roundCurrencyAmount(startBalance + monthlyNet * index),
+      balance: fromCents(startCents + monthlyNetCents * index),
     });
   }
 
@@ -2410,11 +2609,11 @@ function buildPeriodReviewLines(entries, options = {}) {
   const settleUps = incomeEntries.filter(
     (entry) => !goalKeys.has(entry.goalKey) && normalizeCategoryPath(entry.category || "").startsWith("settleup/")
   );
-  const billReserveContributions = incomeEntries.filter(
-    (entry) => !goalKeys.has(entry.goalKey) && normalizeCategoryPath(entry.category || "") === "billreserve"
+  const runwayContributions = incomeEntries.filter(
+    (entry) => !goalKeys.has(entry.goalKey) && RUNWAY_LEGACY_KEYS.has(normalizeCategoryPath(entry.category || ""))
   );
   const regularIncome = incomeEntries.filter(
-    (entry) => !goalKeys.has(entry.goalKey) && !settleUps.includes(entry) && !billReserveContributions.includes(entry)
+    (entry) => !goalKeys.has(entry.goalKey) && !settleUps.includes(entry) && !runwayContributions.includes(entry)
   );
   const withdrawals = inRange.filter((entry) => entry.entryType === "goal-withdrawal");
 
@@ -2422,7 +2621,7 @@ function buildPeriodReviewLines(entries, options = {}) {
   const contributedTotal = roundCurrencyAmount(contributions.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
   const withdrawnTotal = roundCurrencyAmount(withdrawals.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
   const settledTotal = roundCurrencyAmount(settleUps.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
-  const billReserveTotal = roundCurrencyAmount(billReserveContributions.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
+  const runwayTotal = roundCurrencyAmount(runwayContributions.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
 
   const months = buildMonthlyIncomeExpense(inRange, { goalKeys: Array.from(goalKeys) }).filter((month) => month.expense > 0);
   const bestMonth = months.length ? months.reduce((min, month) => (month.expense < min.expense ? month : min)) : null;
@@ -2469,7 +2668,7 @@ function buildPeriodReviewLines(entries, options = {}) {
   lines.push(`- Savings contributions: ${formatCurrency(contributedTotal, currency)} (${contributions.length})`);
   lines.push(`- Savings withdrawals: ${formatCurrency(withdrawnTotal, currency)} (${withdrawals.length})`);
   lines.push(`- Settled repayments received: ${formatCurrency(settledTotal, currency)} (${settleUps.length})`);
-  lines.push(`- Bill reserve contributions: ${formatCurrency(billReserveTotal, currency)} (${billReserveContributions.length})`);
+  lines.push(`- Runway contributions: ${formatCurrency(runwayTotal, currency)} (${runwayContributions.length})`);
 
   return lines;
 }
@@ -2510,33 +2709,53 @@ function categoryBaseColor(rank) {
 // spender, since children are ranked largest-first) gets the lightest shade,
 // the last sibling gets the darkest, so shade reads directly as rank.
 function categoryShadeColor(base, childIndex, siblingCount = 1) {
-  const maxLightness = Math.min(74, base.lightness + 22);
-  const minLightness = Math.max(22, base.lightness - 22);
+  const maxLightness = Math.min(80, base.lightness + 30);
+  const minLightness = Math.max(16, base.lightness - 30);
   if (siblingCount <= 1) return `hsl(${base.hue}, ${base.saturation}%, ${maxLightness}%)`;
   const ratio = childIndex / (siblingCount - 1);
   const lightness = Math.round(maxLightness - ratio * (maxLightness - minLightness));
   return `hsl(${base.hue}, ${base.saturation}%, ${lightness}%)`;
 }
 
-// Groups entries into ranked major groups with nested subgroups, assigning the
-// hue-family colours. Majors are ranked by group total; subgroups sit beneath
-// their parent, largest first. `slices` is the flattened leaf list for pies.
+// Groups entries into ranked major groups, each with nested subcategory
+// groups, each in turn with nested leaf groups — a real 3-level hierarchy in
+// "full" mode (major -> subcategory -> leaf), so a chart can give every
+// subcategory its own colour section (major's hue, one shade) and then split
+// each section further into its own leaf items (further shades within that
+// same section), instead of flattening subcategory+leaf into a single ring.
+// A category that's only two segments deep (e.g. shopping/amazon) has no
+// leaf level to split into, so its one leaf just passes through as the
+// subcategory itself — the outer ring reads as a single uninterrupted block
+// there rather than an artificial extra split. In "primary" mode (used by
+// the sidebar's mini chart and holiday breakdowns) everything collapses back
+// to one level, unchanged from before. `slices` is the flattened leaf list,
+// used for pies with no group/subgroup ring to draw and for full-path colour
+// lookups elsewhere.
 function buildHierarchicalCategoryGroups(entries, groupBy = "primary") {
   const useFull = String(groupBy || "primary").toLowerCase() === "full";
   const majors = new Map();
 
   for (const entry of entries || []) {
     const full = normalizeCategoryPath(entry.category || "uncategorized") || "uncategorized";
-    const major = full.split("/")[0];
+    const parts = full.split("/").filter(Boolean);
+    const major = parts[0] || "uncategorized";
     const amount = entrySpendAmount(entry);
-    const majorGroup = majors.get(major) || { key: major, label: titleCaseSegment(major), total: 0, count: 0, children: new Map() };
+
+    const majorGroup = majors.get(major) || { key: major, label: titleCaseSegment(major), total: 0, count: 0, subgroups: new Map() };
     majorGroup.total = roundCurrencyAmount(majorGroup.total + amount);
     majorGroup.count += 1;
-    const childKey = useFull ? full : major;
-    const child = majorGroup.children.get(childKey) || { key: childKey, label: displayCategoryPath(childKey), total: 0, count: 0 };
-    child.total = roundCurrencyAmount(child.total + amount);
-    child.count += 1;
-    majorGroup.children.set(childKey, child);
+
+    const subKey = useFull && parts.length >= 2 ? `${parts[0]}/${parts[1]}` : major;
+    const subgroup = majorGroup.subgroups.get(subKey) || { key: subKey, label: displayCategoryPath(subKey), total: 0, count: 0, leaves: new Map() };
+    subgroup.total = roundCurrencyAmount(subgroup.total + amount);
+    subgroup.count += 1;
+
+    const leafKey = useFull && parts.length >= 3 ? full : subKey;
+    const leaf = subgroup.leaves.get(leafKey) || { key: leafKey, label: displayCategoryPath(leafKey), total: 0, count: 0 };
+    leaf.total = roundCurrencyAmount(leaf.total + amount);
+    leaf.count += 1;
+    subgroup.leaves.set(leafKey, leaf);
+    majorGroup.subgroups.set(subKey, subgroup);
     majors.set(major, majorGroup);
   }
 
@@ -2545,14 +2764,25 @@ function buildHierarchicalCategoryGroups(entries, groupBy = "primary") {
   const groups = ranked.map((major, majorIndex) => {
     const base = categoryBaseColor(majorIndex);
     const color = categoryShadeColor(base, 0);
-    const sortedChildren = Array.from(major.children.values()).sort((left, right) => right.total - left.total);
-    const children = sortedChildren.map((child, childIndex) => ({
-      ...child,
-      color: categoryShadeColor(base, childIndex, sortedChildren.length),
-      parent: major.key,
-    }));
-    for (const child of children) slices.push(child);
-    return { ...major, children, color };
+    const { subgroups, ...majorRest } = major;
+    const sortedSubgroups = Array.from(subgroups.values()).sort((left, right) => right.total - left.total);
+    const children = sortedSubgroups.map((subgroup, subIndex) => {
+      const { leaves, ...subgroupRest } = subgroup;
+      const sortedLeaves = Array.from(leaves.values()).sort((left, right) => right.total - left.total);
+      const leafList = sortedLeaves.map((leaf, leafIndex) => ({
+        ...leaf,
+        color: categoryShadeColor(base, leafIndex, sortedLeaves.length),
+        parent: subgroup.key,
+      }));
+      for (const leaf of leafList) slices.push(leaf);
+      return {
+        ...subgroupRest,
+        color: categoryShadeColor(base, subIndex, sortedSubgroups.length),
+        parent: major.key,
+        children: leafList,
+      };
+    });
+    return { ...majorRest, children, color };
   });
 
   return { groups, slices };
@@ -2771,10 +3001,21 @@ function buildGoalArchiveSummaryLines(goal, entries, referenceDate) {
 }
 
 module.exports = {
+  RECURRING_CADENCES,
+  RECURRING_REGISTRY_COLUMNS,
+  RECURRING_REGISTRY_HEADER_ROW,
+  RECURRING_REGISTRY_SEPARATOR_ROW,
   parseRecurringRegistry,
   applyRecurringRegistry,
   buildTripReflection,
-  computeRecurringReserve,
+  computeRunway,
+  normalizeRunwayMode,
+  RUNWAY_LEGACY_KEYS,
+  parseRunwayPeriod,
+  runwayWindowEnd,
+  sumRecurringDueWithin,
+  toCents,
+  fromCents,
   buildGoalArchiveSummaryLines,
   addMonths,
   normalizeCadence,
@@ -2812,6 +3053,7 @@ module.exports = {
   buildTransactionBlock,
   parseInboxLine,
   parseQuickAddInput,
+  isCurrencyCode,
   parseBankCsv,
   parseCsvRows,
   parseFlexibleDate,
@@ -2846,6 +3088,7 @@ module.exports = {
   parseCurrencyDescriptor,
   parseBudgets,
   parseHolidayTagContext,
+  parseMarkdownTable,
   parseIsoDate,
   parseNumber,
   parseTransactionsFromNoteContent,

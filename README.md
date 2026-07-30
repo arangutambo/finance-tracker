@@ -1,15 +1,51 @@
 # Finance Tracker
 
-An Obsidian plugin that logs spending as tagged bullets inside your daily notes,
-keeps a running total, and turns those notes into spending, budget, holiday and
-savings dashboards. Your markdown notes stay the source of truth — no database.
+**Log spending as tags in your daily notes. Get budgets, trips, savings goals
+and forecasts back.**
+
+Your markdown notes stay the source of truth. There is no database and no
+sync — uninstall the plugin tomorrow and you still have every transaction,
+in plain text, in notes you can grep, link and edit by hand.
+
+![The recurring payments block: cost per month and per year, upcoming bills with due dates, and one filled Log now on the bill that is actually due](docs/images/hero-recurring-payments.png)
+
+```md
+## Finance
+- [ ] #log/spending 16.20
+	- $12.00 #log/spending/food/restaurants
+		- Nobu
+	- $4.20 #log/spending/food/snacks
+```
+
+That is the whole data format. Everything below is built from it.
+
+- Runs on **desktop and mobile** (Obsidian 1.0+).
+- **No network requests**, no telemetry, no bank connections.
+- MIT licensed — see [LICENSE](LICENSE).
+- Recent changes: [CHANGELOG.md](CHANGELOG.md).
 
 Support the project: [Buy Me a Coffee](https://buymeacoffee.com/tonyhad)
+
+## Contents
+
+- [First-time setup](#first-time-setup-empty-vault) — the wizard, and what it creates
+- [How logging works](#how-logging-works) — the tag format, and five ways to capture
+- [Tag language](#tag-language) — spending, income, balances, trips, splits
+- [Budgets](#budgets) — pace-aware limits in a markdown table
+- [Dashboards](#dashboards) — the donut, trends and budget bars
+- [Goals (savings + trips)](#goals-savings--trips) — sinking funds and trip mode
+- [Recurring payments](#recurring-payments) — bills, cadences, and the lifecycle
+- [Runway](#runway) — how much of your outgoings you have covered
+- [Split expenses](#split-expenses) · [Forecast](#forecast) · [Net worth](#net-worth)
+- [Query block](#query-block) · [Year & quarter reviews](#year--quarter-reviews)
+- [Daily budget sidebar](#daily-budget-sidebar--status-bar) · [Merchant map](#merchant-map)
+- [Commands](#commands) · [Settings](#key-settings) · [Limitations](#limitations)
+- [Development](#development)
 
 ## First-time setup (empty vault)
 
 On a fresh install the **setup wizard** opens automatically (or run the
-**Run first-time setup** command / the button at the top of settings any time —
+**Set up finance notes** command / the button at the top of settings any time —
 it never overwrites existing notes). It asks where your daily notes live, where
 finance notes should be stored, your currency, and what to name the recurring
 payments note (changeable later in settings) — then creates the starter notes
@@ -33,7 +69,7 @@ The manual path, if you prefer:
      `Journal/Periodics/1. Daily`; the plugin routes captures to `<folder>/YYYY-MM-DD.md`
      (or `<folder>/YYYY/MM/YYYY-MM-DD.md` if you already use that structure).
 
-   ![Settings tab: Capture — daily notes folder, finance heading, currency, and capture toggles](docs/images/settings-capture.jpg)
+   ![Settings tab: Capture — a status line reading 'Reading 684 entries across 132 notes', the currency and capture toggles, and note-format fields folded into Advanced](docs/images/settings-capture.png)
 3. **Open the panel.** Click the **coin** ribbon icon (or run *Open daily budget*).
    This creates, on first run:
    - `Utility/Budgets/💸 Budgets.md` — a starter budget table you can edit.
@@ -147,7 +183,14 @@ an Apple Pay automation for a card that's covered by Wise sync (below) — that 
 **Shortcut C — "Log Spend (pick date)"** — same as Shortcut A plus an **Ask for Input → Date** step
 feeding `date=`, for backfilling a day you forgot.
 
-### Wise sync (covers all Wise spending, with real FX)
+<details>
+<summary><b>Bank-specific automated capture</b> — Wise API sync and ANZ Plus CSV reconcile (click to expand)</summary>
+
+These two are set up for the author's own accounts. The pattern generalises to
+any bank that exports a CSV or exposes an API, but nothing here is required —
+the URL shortcut and quick-add above cover everything.
+
+#### Wise sync (covers all Wise spending, with real FX)
 Wise personal API tokens support **balance statements**, so a scheduled Shortcut can pull every Wise
 transaction — card, online, transfers — including the real exchange rate for foreign spends. Keep
 the token in the Shortcut, never in the vault (generate it in Wise → Settings → API tokens; rotate
@@ -158,10 +201,12 @@ or revoke it there if needed).
 4. For each activity newer than the last sync, **Save File** one inbox file: `amount=<spend> | merchant=<details> | date=<YYYY-MM-DD> | cur=AUD | source=wise | id=<referenceNumber>` (add `origamt=`/`origcur=` for foreign spends).
 5. Store `lastSync` and schedule the Shortcut nightly. The `id=` field means re-runs never double-log.
 
-### ANZ Plus reconcile (catch what Apple Pay missed)
+#### ANZ Plus reconcile (catch what Apple Pay missed)
 The Apple Pay automation only sees in-person taps — not online, direct debits, or BPAY. Monthly,
-export the bank CSV and run **Reconcile bank/Wise CSV against logged spending**; unmatched charges
+export the bank CSV and run **Reconcile a bank CSV**; unmatched charges
 can be sent to the capture inbox. Matching is by date+amount, so already-logged taps aren't duplicated.
+
+</details>
 
 ### Deferred categorisation
 Capture is instant and dumb; categorisation is a quick daily review. Anything logged as
@@ -182,6 +227,33 @@ First number = amount · a `cat/sub`, `#tag` or known category word = category �
 the rest = merchant.
 
 ![Quick add transaction modal with a split entry and a backdated entry](docs/images/quick-add-modal.jpg)
+
+**Foreign currency, without storing a rate.** Put a currency code next to the
+amount you were charged, then the amount it actually cost in your home currency.
+Both are recorded; only the home amount counts toward budgets and totals.
+
+```
+58 USD : 83.64 obsidian sync #subscriptions/yearly/obsidian-sync
+```
+
+writes:
+
+```md
+- $58.00 USD : $83.64 AUD #log/spending/subscriptions/yearly/obsidian-sync
+	- obsidian sync
+```
+
+The code can go on either side of the number and the separator is optional, so
+`58usd 83.64`, `USD58 83.64` and `$58 USD = $83.64 AUD` all parse the same. The
+preview shows the implied rate (`@ 1.4421`) so you can see you typed it right —
+nothing stores it, and nothing converts anything for you. If you give only the
+foreign amount, quick add says so rather than guessing a rate.
+
+Only real currency codes count, so `58 oak table` is still $58 at "oak table".
+
+**Duplicate guard.** If the same amount and merchant is already logged on that
+date, the modal says so before you add a second one — a double-tapped Shortcut
+is far more common than genuinely buying the same thing twice in a day.
 
 **Autocomplete** — as you type, suggestions appear for **categories**,
 **merchants**, and **people** (`owed=…`), all derived from what you have
@@ -265,14 +337,19 @@ title: June Spending
 ````
 
 Shows summary cards (total, avg/day, vs previous period, top category), a
-**two-ring category donut** — inner ring is the major categories, outer ring is
-every subcategory as a shade of its parent's hue, with a nested legend — a
-daily-spend sparkline with your budget line, pace-aware budget bars, and
-savings activity. Export CSV from the header. (The sidebar's mini pie stays at
-major categories; the donut falls back to a flat pie when nothing has
-subcategories.) Subcategory shades are ranked by spend — the biggest subcategory
-in a group gets the lightest shade of that hue, the smallest the darkest — and
-hovering any slice shows its name, amount, and share of the total.
+**three-ring category donut** — inner ring is the major categories, middle
+ring is each subcategory as its own colour section (a shade of its parent's
+hue), and the outer ring splits each subcategory further into its own leaf
+items — with a nested legend — a daily-spend sparkline with your budget line,
+pace-aware budget bars, and savings activity. Export CSV from the header.
+(The sidebar's mini pie stays at major categories; the donut falls back to a
+flat pie when nothing has subcategories.) A category that's only two levels
+deep (e.g. `shopping/amazon`, nothing beneath it) has no leaf level to split
+into, so its outer-ring band just continues as one uninterrupted block in the
+same colour rather than an arbitrary extra seam. Shades within a ring are
+ranked by spend — the biggest item gets the lightest shade of that hue, the
+smallest the darkest — and hovering any slice (at any of the three levels)
+shows its name, amount, and share of the total.
 
 ![Finance dashboard donut chart with a hover tooltip on a subcategory slice](docs/images/dashboard-donut-tooltip.jpg)
 
@@ -296,10 +373,10 @@ Every chart shares one **hue-family colour system**: each major category gets a
 base hue, its subcategories render as lighter/darker shades of that hue, and
 pies and legends rank by major-group total with subgroups nested beneath.
 
-These defaults — grouping, the pie label threshold, week start, and the budget
-check period — live in Settings → Dashboard:
+These defaults — grouping, week start, and the budget check period — live in
+Settings → Dashboard:
 
-![Settings tab: Dashboard defaults — grouping, pie label threshold, week start, budget check period](docs/images/settings-dashboard.jpg)
+![Settings tab: Dashboard defaults — grouping, week start and budget check period, with file locations and the merchant map behind Advanced disclosures](docs/images/settings-dashboard.png)
 
 ## Goals (savings + trips)
 
@@ -350,7 +427,7 @@ Contributions are `- $500 #log/income/roadbike` bullets; withdrawals are
 
 ### Contributing to goals
 
-Command: **Contribute to savings goal** (also the Contribute buttons in the
+Command: **Contribute to a goal** (also the Contribute buttons in the
 goals block below)
 
 Logs a contribution bullet — `- $150.00 #log/income/roadbike` — into the chosen
@@ -360,7 +437,7 @@ goal lives inside one lump-sum savings account.
 
 ### Goals overview block
 
-Command: **Insert goals block**
+Command: **Insert a finance block** → Goals
 
 ````md
 ```finance-goals
@@ -374,9 +451,9 @@ sum of your goal envelopes against that account's latest `#log/balance/…`
 snapshot and shows the **unallocated** remainder — the piece of the lump sum
 not yet promised to any goal (or a warning when you've over-allocated).
 
-### Multiple holidays & archiving
+### Multiple trips & archiving
 
-Commands: **Archive finished holidays** · **Archive completed savings goals**
+Commands: **Archive finished trips** · **Archive completed goals**
 (or the per-note toggles and Archive buttons in Settings → Holiday budgets)
 
 You can save for **several holidays at once** — every goal note with
@@ -413,7 +490,7 @@ active set: no more capture routing, sidebar cards, or forecast set-asides.
 
 ## Recurring payments
 
-Command: **Log due recurring payments** · **Insert recurring payments block**
+Command: **Log due recurring payments** · **Insert a finance block** → Recurring payments
 
 Tag a bill once with a cadence subtag under the recurring prefix (default
 `subscriptions`; configurable in settings) and it becomes a tracked recurring
@@ -438,12 +515,14 @@ Then drop this block into any note:
 ````
 
 It shows upcoming bills, overdue items with a one-tap **Log now**, the total
-due in the next 30 days, and the cost per month and per year. An optional
+due in the next 30 days, and the cost per month and per year. Each row's
+actions are weighted: **Log now** is filled when the bill is actually due, and
+everything else (Push a week, Skip cycle, Edit, Pause) stays
+as a quiet outline, so the eye lands on the action worth taking without
+reading every label. An optional
 setting (**Auto-log recurring payments**) logs each item automatically on its
 due day. Anything due or overdue also stays pinned in the **Daily Budget**
 sidebar until you log it — see [below](#daily-budget-sidebar--status-bar).
-
-![Recurring payments block: summary cards and the upcoming-bills list](docs/images/recurring-payments-block.jpg)
 
 **Log now logs today, not the due date** — click it (from the sidebar, the
 block, or manage mode) and the bullet is dated on the real day you actually
@@ -451,91 +530,89 @@ paid it, even if that's a few days after it was due. The cadence schedule
 itself doesn't drift because of this: it keeps advancing from the due date
 that was just fulfilled, not from today, so a late payment never pushes every
 future due date out by the same number of days. **Skip cycle** works the same
-way (logs a $0 entry, the schedule moves on, the price is remembered).
+way (logs a $0 entry, the schedule moves on, the price is remembered), and
+**Push a week** moves only the next due date — for the month the rent lands
+late, without touching the cadence.
+**Sort order** — the Settings tab has a **Sort bills by**
+dropdown (due date, cost per month, or name) that reorders the
+Upcoming bills list, the sidebar's due-bills card, and the settings list
+below all at once.
 
 **Managing bills** — command **Open recurring payments note** creates a
 management page (a normal note with a `manage: true` block). In manage mode
-every item gets **Log now**, **Skip cycle**, **Pause**, **Auto-log**, and
-**Edit**. The block also has a **Bill reserve** section: the sinking fund
-for bills. It shows how much should already be set aside (each bill accrues
-day by day since it was last paid — half a year after an annual bill, half its
-cost should be reserved) and the steady per-week / per-month / per-quarter
-set-aside that keeps every cadence covered — both combined, and broken down
-per cadence, since weekly bills only need a per-week figure but monthly (and
-longer) cadences need both a per-week *and* a per-month number tracked
-separately. **Contribute** logs an actual set-aside contribution — one shared
-envelope for every bill, the same virtual-envelope idea as a savings goal —
-so **Saved so far** can be compared against what should already be set aside.
+every item gets **Log now**, **Push a week**, **Skip cycle**, **Pause**,
+**Auto-log**, and **Edit**. Only the bill that is actually due gets a filled
+**Log now** — everything else stays a quiet outline, so six controls on a card
+still read as one obvious action:
 
-![Bill reserve section: set-aside totals and the per-bill accrual list](docs/images/bill-reserve.jpg)
+![A manage-mode bill card: filled Log now on the due bill, with Push a week, Skip cycle, Edit, Pause and an Auto-log checkbox as quiet outlines](docs/images/manage-mode-row.png)
 
-**Variable bills** (utilities and the like) — mark a bill **Variable** (in
-**Edit**, or the registry table) and it projects off the average of its last
-six payments instead of just the last one, so a single unusually high or low
-bill doesn't skew the monthly/yearly totals or the bill reserve math. **Log
-now** on a variable bill also prompts for the actual amount (pre-filled with
-the recent average as a starting guess) rather than silently repeating a
-fixed number that was never going to be right for a fluctuating bill.
+Scheduling a price change, or giving a bill an end date or a payment count, is
+behind **Edit**:
 
-**Pausing, archiving, and removing a bill** — **Pause** moves a bill straight
-into a collapsed **Archived** section at the bottom of the block (click to open
-it) — it stops counting toward totals, the bill reserve, and auto-logging, but
-its history stays intact. From Archived you can **Resume** it, or **Remove
-completely**, which drops it from consideration for good — even if you log
-another entry with the same tag later, it won't resurface. Archived/removed
-bills never appear in Settings → Recurring payments; that list only shows
-current bills, as a scrollable checkbox table (Current / Auto-log columns,
-header pinned while you scroll).
+![Edit bill modal: amount, next due, and three collapsed options — variable amount, price changes on a future date, and this bill stops eventually](docs/images/edit-recurring-modal.png)
 
-**Editing a bill** — **Edit** (manage mode) lets you correct the amount
-directly, schedule a future price change with an exact date (e.g. "this
-subscription becomes $15.99 on the 1st") — the new amount applies itself
-automatically once that date arrives, and until then the block shows
-"changing to $X on `<date>`" next to the bill — mark it **Variable**, or
-correct the **Next due** date directly if the automatic schedule ever needs a
-manual nudge (logging or skipping a cycle normally keeps it on track by
-itself, so this is mostly an escape hatch).
+**Pausing, retiring and removing** — **Pause** moves a bill into a collapsed
+**Archived** section at the bottom of the block. A bill that reached its End Date
+or ran out of Payments Left lands there too, labelled *ended 2027-03-01* or *all
+payments made* rather than *paused*. From there, **Resume** (or **Restart**, which
+also clears the terms) brings it back, and **Remove completely** drops it for
+good — even if you later log another entry with the same tag, it will not
+resurface. Either way its history stays intact in your notes.
 
-Manage mode with a scheduled price change (Aussie Broadband Nbn, "changing to
-$66.50 on 2026-08-15") and the Archived section expanded, showing Resume and
-Remove completely:
+![The Archived section: a paused bill struck through, with Resume filled and Remove completely as a quiet outline](docs/images/recurring-archived-section.png)
 
-![Manage mode: Edit button, a scheduled price change, and the expanded Archived section](docs/images/recurring-archived-section.jpg)
+**In settings** — Settings → Recurring payments lists every current bill as a
+scrollable table with the header pinned, so **Active** and **Auto-log** can be
+toggled for all of them in one place. Paused, retired and removed bills are not
+listed here; that view is only for bills still running.
 
-Settings → Recurring payments — current bills only, as a scrollable checkbox
-table with the header pinned while you scroll:
+![Settings tab: Recurring payments — tag prefix, auto-log master switch, sort order, and a pinned Bill/Active/Auto-log table of every current bill](docs/images/settings-recurring-payments.png)
 
-![Settings tab: Recurring payments checkbox list with a pinned Bill/Current/Auto-log header](docs/images/settings-recurring-payments.jpg)
+## Runway
 
-**The registry** — per-bill state lives in a hand-editable table in the
-recurring payments note (the source of truth; the checkboxes in settings and
-the manage block just write to it):
+Command: **Insert a finance block** → Runway · Settings → **Runway**
 
-```md
-## Registry
+*How much do I need to keep available to be safe for the next month?*
 
-| Item    | Cadence | Amount | Active | Auto-log | Variable | Next Amount | Change Date | Next Due   |
-| ------- | ------- | -----: | ------ | -------- | -------- | -----------: | ----------- | ---------- |
-| spotify | monthly |  12.99 | yes    | yes      | no       |        15.99 | 2026-08-01  | 2026-07-23 |
-| power   | monthly |        | yes    | yes      | yes      |              |             |            |
-| gym     | weekly  |        | no     |          | no       |              |             |            |
-```
+Runway answers that and nothing else. It is a **read-only figure** — there is no
+envelope to fund, no balance, no contributions and no bookkeeping. Pick a period
+and what counts, and it reads the bills you have already logged:
 
-Set **Active** to `no` to pause a cancelled bill. **Auto-log** opts a bill in
-or out of the automatic due-day logging (the master switch is in settings). A
-filled **Amount** overrides the inferred price. **Variable** projects the
-average of recent payments instead of just the last one. **Next Amount** +
-**Change Date** schedule a future price change. **Next Due** overrides the
-computed due date directly. Blank cells keep the defaults; older notes with a
-narrower table are widened automatically the first time a bill is edited.
+![The Runway block: the figure to keep available, per-week and per-day breakdowns, and every bill making up the total](docs/images/runway-dashboard.png)
 
-**Where the note lives** — the recurring payments note's filename (inside your
-budgets folder) is a setting: asked once during first-time setup, changeable
-any time in Settings → Recurring payments → "Recurring payments note name".
+> **Keep $395.27 available for the next 1 month**
+> Recurring bills only, between today and 2026-08-29 · 11 bills due
+
+Two settings, both in Settings → **Runway**:
+
+| Setting | Options |
+| --- | --- |
+| **Runway period** | 1 week · 2 weeks · 1 month · 2 months · 3 months · 6 months |
+| **What counts** | Bills + usual spending (default), or recurring bills only |
+
+The settings page shows the resulting figure live, so choosing a period is not
+abstract.
+
+**The figure walks your actual schedule.** It is the sum of every bill occurrence
+that lands inside the window, not a monthly average scaled up. A $900 annual
+insurance renewal is worth nothing while it is eleven months away and worth all
+$900 the moment it enters the window — because that is the month you need the
+money. "Bills + usual spending" adds your average discretionary spend over the
+last 90 days, scaled to the window.
+
+Every bill making up the total is listed with its date, soonest first, so the
+number is never a black box. There is also a **per week** and **per day**
+breakdown. The same card also appears at the bottom of the recurring payments
+block, since that is where your bills live.
+
+If you tracked a **bill reserve** in 0.6, those `#log/income/billreserve` bullets
+are left alone. They no longer feed a balance, but they still count as transfers
+rather than income, so your reviews and forecasts are unaffected.
 
 ## Split expenses
 
-Command: **Settle up split expenses** · **Insert split expenses block**
+Command: **Settle up split expenses** · **Insert a finance block** → Split expenses
 
 Quick-add and `obsidian://finance-capture` accept `split=N` (even split — your
 share is amount ÷ N) and `owed=Name:$X` tokens:
@@ -573,7 +650,7 @@ for the days left.
 
 ## Forecast
 
-Command: **Insert forecast block**
+Command: **Insert a finance block** → Forecast
 
 ````md
 ```finance-forecast
@@ -588,7 +665,7 @@ input with `income:`, `bills:`, `discretionary:`, `setaside:`, or `start:`.
 
 ## Net worth
 
-Command: **Snapshot balances** · **Insert net worth block**
+Command: **Snapshot balances** · **Insert a finance block** → Net worth
 
 Snapshot balances logs one bullet per account into today's daily note (accounts
 you've snapshotted before are pre-filled):
@@ -611,7 +688,7 @@ The dashboard renders the balance trend from those bullets — no extra files:
 
 ## Query block
 
-Command: **Insert finance query block**
+Command: **Insert a finance block** → Query
 
 A read-only report over your entries — filter by category, tag, merchant, or
 date range; group by category, merchant, or month; sum or count:
@@ -634,16 +711,16 @@ bars), `cumulative` (cumulative balance line).
 
 ## Year & quarter reviews
 
-Commands: **Insert yearly review** · **Insert quarterly review**
+Command: **Insert a finance block** → Year in review / Quarter in review
 
-Unlike every other `Insert ___ block` command, these don't insert a live code
+Unlike the other entries in that list, these two don't insert a live code
 block — they compute the numbers once, right now, and insert the finished
 markdown at your cursor. Run one inside a "Yearly Review" or "Quarterly
 Review" note (or any note) to drop in a frozen snapshot for the current
 year/quarter: total spent and income, the best and worst month by spend, the
 top spending categories with their share of the total, and a transfers
 summary (savings contributions, savings withdrawals, settled split repayments
-received, and bill reserve contributions). Re-running the command later
+received, and runway contributions). Re-running the command later
 produces a fresh snapshot reflecting whatever you've logged since.
 
 ```md
@@ -667,17 +744,17 @@ produces a fresh snapshot reflecting whatever you've logged since.
 - Savings contributions: $3,000.00 (4)
 - Savings withdrawals: $250.00 (1)
 - Settled repayments received: $120.00 (2)
-- Bill reserve contributions: $400.00 (4)
+- Runway contributions: $400.00 (4)
 ```
 
-## Daily Budget sidebar & status bar
+## Daily budget sidebar & status bar
 
 The **Daily Budget** sidebar (ribbon coin icon) shows today + period spend, a
 Left/Day card, a mini pie, compact pace-aware budget rows (tap a row for the
 detail), savings goals, split balances, a **Recurring bills due** card, and a
 **Needs a Category** triage list.
 
-<img src="docs/images/daily-budget-sidebar.jpg" alt="Daily Budget sidebar: totals, mini pie, and pace-aware budget bars" width="320">
+<img src="docs/images/daily-budget-sidebar.png" alt="Daily budget sidebar: today and fortnight totals, a category pie, pace-aware budget rows, savings goals, and a recurring bill due with a filled Log now" width="380">
 
 **Recurring bills due** lists every overdue or due-today bill with a one-tap
 **Log now**, and stays put — it doesn't disappear until each bill is actually
@@ -710,45 +787,49 @@ needed.
 
 ## Reconciling against the bank
 
-Command **Reconcile bank/Wise CSV against logged spending**: paste an ANZ or Wise
+Command **Reconcile a bank CSV**: paste an ANZ or Wise
 export. Rows are matched by date+amount (so merchant-name differences don't cause
 duplicates); unmatched charges can be sent to the capture inbox to log and triage.
 
 ## Commands
 
-Run any of these from the command palette (`Cmd/Ctrl+P`).
+Run any of these from the command palette (`Cmd/Ctrl+P`). Obsidian prefixes each
+with **Finance Tracker:**.
 
 | Command | What it does |
 | --- | --- |
 | **Quick add transaction** | Opens the quick-add modal — one field, natural language, live preview. |
-| **Drain capture inbox now** | Processes every file waiting in the capture inbox folder immediately, instead of waiting for the next automatic drain. |
-| **Reconcile bank/Wise CSV against logged spending** | Opens the bank-reconcile modal — paste a CSV export, matches rows by date+amount, and can send unmatched charges to the capture inbox. |
-| **Open daily budget** | Opens the Daily Budget sidebar (same as clicking the ribbon coin icon). |
-| **Open finance budgets note** | Opens (creating if needed) the default `💸 Budgets.md` note. |
-| **Add holiday exchange rate** | Opens a modal to add or update an `exchange_rates` entry on the active trip goal note. |
-| **Create savings goal** | Opens a modal to create a new savings-goal note from the shared goal/trip frontmatter schema. |
-| **Run first-time setup** | Opens the guided setup wizard — picks folders and currency, then creates any missing starter notes (never overwrites existing ones). |
-| **Log due recurring payments** | Logs every recurring bill whose next-due date has arrived (loops to catch up several missed cycles), same as clicking **Log all due** in the block. |
+| **Open daily budget** | Opens the Daily budget sidebar (same as clicking the ribbon coin icon). |
+| **Log due recurring payments** | Logs every recurring bill whose next-due date has arrived (loops to catch up several missed cycles), same as **Log all due** in the block. |
+| **Contribute to a goal** | Log a contribution to a chosen goal and date. |
+| **Settle up split expenses** | Outstanding split balances per person, with one-tap settle (logs the repayment as income). |
+| **Snapshot balances** | Log one balance bullet per account into today's note, pre-filled with each account's last snapshotted value. |
+| **Insert a finance block** | Pick a block from a list — dashboard, recurring payments, goals, splits, forecast, net worth, query, or a frozen year/quarter review — and insert it at the cursor. Replaces the eight separate `Insert … block` commands. |
+| **Start trip** / **End trip** | Switches quick-add and URL capture to a trip's tag and currency, and back. |
+| **Add trip exchange rate** | Add or update an `exchange_rates` entry on the active trip note. |
+| **Create savings goal** | Create a savings-goal note from the shared goal/trip frontmatter schema. |
+| **Archive finished trips** | Archives every trip past its `end_date` — writes a frozen summary and moves the note to the archive folder. |
+| **Archive completed goals** | The same, for every savings goal that has reached its target. |
+| **Process capture inbox** | Processes every file waiting in the capture inbox folder immediately, instead of waiting for the next automatic drain. |
+| **Reconcile a bank CSV** | Paste a bank or Wise CSV export; matches rows by date+amount and can send unmatched charges to the capture inbox. |
+| **Repair daily note totals** | Recomputes the `#log/spending` running total on every daily note in one pass. Individual notes heal when opened; this fixes a whole backlog at once. |
+| **Export transactions to CSV** | Exports every transaction ever logged (all time, all categories) to a CSV file. |
+| **Open budgets note** | Opens (creating if needed) the default `💸 Budgets.md` note. |
 | **Open recurring payments note** | Opens (creating if needed) the recurring payments management note. |
-| **Insert recurring payments block** | Inserts a ` ```finance-recurring``` ` block at the cursor. |
-| **Contribute to savings goal** | Opens a modal to log a contribution bullet to a chosen goal and date. |
-| **Contribute to bill reserve** | Opens a modal to log a set-aside contribution to the shared bill-reserve envelope. |
-| **Insert goals block** | Inserts a ` ```finance-goals``` ` block at the cursor. |
-| **Archive completed savings goals** | Archives every savings goal that has reached its target amount — writes a frozen summary, marks it archived, and moves the note to the archive folder. |
-| **Settle up split expenses** | Opens a modal showing outstanding split balances per person, with one-tap settle (logs the repayment as income). |
-| **Insert split expenses block** | Inserts a ` ```finance-splits``` ` block at the cursor. |
-| **Start trip** | Picks a trip goal note and switches quick-add/URL capture to default to that trip's tag (and currency, if set) until you end the trip. |
-| **End trip** | Turns off trip mode, returning captures to normal home-currency logging. |
-| **Archive finished holidays** | Archives every holiday budget past its `end_date` that isn't already archived — same frozen-summary treatment as savings goals. |
-| **Snapshot balances** | Opens a modal to log one balance bullet per account into today's note (pre-filled with each account's last snapshotted value). |
-| **Insert net worth block** | Inserts a ` ```networth-dashboard``` ` block at the cursor. |
-| **Insert forecast block** | Inserts a ` ```finance-forecast``` ` block (default `months: 6`) at the cursor. |
-| **Insert finance query block** | Inserts a ` ```finance-query``` ` block pre-filled with a monthly category-table template at the cursor. |
-| **Insert yearly review** | Computes the current year's totals, best/worst month, top categories, and transfers summary, and inserts the finished markdown at the cursor (a frozen snapshot, not a live block). |
-| **Insert quarterly review** | Same as above, scoped to the current quarter. |
-| **Export finance transactions to CSV** | Exports every transaction ever logged (all time, all categories) to a CSV file. |
+| **Set up finance notes** | Opens the guided setup wizard — picks folders and currency, then creates any missing starter notes (never overwrites existing ones). |
 
 ## Key settings
+
+Settings are grouped into **Capture**, **Dashboard**, **Trips**, **Savings
+goals**, **Recurring payments** and **Setup**. Anything that first-time setup
+sets for you — folder paths, the finance heading, the spending root tag, note
+filenames, the merchant map — lives behind an **Advanced** disclosure in its
+section rather than in the default view.
+
+The Capture section opens with a live status line (`Reading 412 entries across
+89 notes — 2024-01-03 to 2026-07-29`). If the daily-notes folder or finance
+heading is wrong, that line says so instead of leaving you with a silently empty
+dashboard.
 
 `dailyNotesFolder`, `spendingHeading` (`## Finance`), `defaultCurrency`,
 `budgetsFolderPath` / `defaultBudgetNoteName`, `captureInboxFolder`,
@@ -756,18 +837,54 @@ Run any of these from the command palette (`Cmd/Ctrl+P`).
 `budgetCheckPeriod`, `weekStartsOn`, `activeHolidayBudgetPath`,
 `recurringTagPrefix` (`subscriptions`), `recurringNoteName`
 (`🔁 Recurring Payments.md`), `excludedRecurringItems`, `autoLogRecurring`,
-`quickAddUseNoteDate`, `tripModeActive` / `activeTripGoalPath`.
+`quickAddUseNoteDate`, `tripModeActive` / `activeTripGoalPath`,
+`schemaVersion` (settings migrations run once, then never again).
 
 The daily-note folder and date format are auto-detected from the **Journals**
 community plugin or the core **Daily notes** plugin when present; the manual
 setting is the fallback.
 
+## Limitations
+
+Worth knowing before you install:
+
+- **You have to tag things.** There is no bank connection and no receipt OCR.
+  Capture is fast (a Shortcut on an Apple Pay tap, or one line in quick add) but
+  a transaction only exists once something writes the bullet.
+- **No bank sync.** The CSV reconcile tells you what you *missed*; it does not
+  import. Deliberate — a bank connection would mean credentials and a network.
+- **Mobile capture needs a Shortcut** (or the quick-add modal). The
+  `obsidian://` URL works with any sync; the file-based capture inbox needs a
+  vault your Files app can write to.
+- **Multi-currency is trip-shaped.** One home currency plus date-ranged rates
+  per trip. If you hold two currencies permanently, this is not the model.
+- **Amounts are per-note, not double-entry.** There are no accounts and no
+  balancing — a bullet is a bullet. Balance snapshots cover net worth instead.
+- **No credit-card statement tracking** (limits, utilisation, closing dates).
+
 ## Development
 
 ```bash
-npm test   # node --test, runs tests/*.test.js
+npm test     # checks the core mirror, then runs node --test over tests/*.test.js
+npm run mirror   # regenerate main.js's core IIFE from finance-core.js
 ```
 
-Shared logic lives in `finance-core.js` (unit-tested) and is mirrored into a `core`
-IIFE inside `main.js`, which Obsidian loads directly (no build step). A change to a
-core function must be made in **both** places.
+Shared logic lives in **`finance-core.js`** — the single source of truth, and the
+only file the tests import. Obsidian loads `main.js` directly (no bundler), so
+that same logic also has to exist inside `main.js` as the `core` IIFE.
+
+**Do not edit the IIFE by hand.** Edit `finance-core.js`, then run
+`npm run mirror`. `scripts/mirror-core.js` derives the IIFE by a deterministic
+transform (drop `"use strict"`, indent by two, turn `module.exports = {` into
+`return {`), and `npm test` fails if the two have diverged. This used to be a
+convention maintained by hand, and by 0.6.0 it had quietly drifted in four
+places — including a default that differed between the tested code and the
+shipped code.
+
+Tests are in two files:
+
+- `tests/finance-core.test.js` — unit tests for individual core functions.
+- `tests/integrity.test.js` — invariants across the whole write→read cycle:
+  everything written parses back unchanged, and the running total on a note's
+  root line always equals the entries beneath it. These guard the paths where a
+  bug silently corrupts a user's notes rather than just showing a wrong number.

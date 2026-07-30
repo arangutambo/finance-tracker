@@ -1,8 +1,9 @@
-node_modules/
-dist/
-.DS_Store
-*.log
-coverage/
 
 # Per-vault user settings — must not ship with the plugin
+*.log
+.DS_Store
+.Rhistory
+coverage/
 data.json
+dist/
+node_modules/

@@ -1,9 +1,11 @@
 "use strict";
 
 const { ItemView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, normalizePath } = require("obsidian");
-const PERIOD_ORDER = ["day", "week", "fortnight", "month", "bimonth", "quarter", "year"];
 
 const core = (() => {
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const PERIOD_ORDER = ["day", "week", "fortnight", "month", "bimonth", "quarter", "year"];
+
   function splitLines(text) {
     return String(text || "").replace(/\r\n/g, "\n").split("\n");
   }
@@ -33,6 +35,19 @@ const core = (() => {
       YEN: "JPY",
     };
     return aliases[cleaned] || cleaned || fallback;
+  }
+
+  // Codes quick-add will accept next to a number. Deliberately a closed list: any
+  // three letters would make "table 58 oak" parse as 58 OAK.
+  const CURRENCY_CODES = new Set([
+    "AED", "ARS", "AUD", "BRL", "CAD", "CHF", "CLP", "CNY", "COP", "CZK", "DKK",
+    "EUR", "GBP", "HKD", "HUF", "IDR", "ILS", "INR", "ISK", "JPY", "KRW", "MXN",
+    "MYR", "NOK", "NZD", "PEN", "PHP", "PLN", "RON", "SEK", "SGD", "THB", "TRY",
+    "TWD", "USD", "VND", "ZAR", "YEN",
+  ]);
+
+  function isCurrencyCode(value) {
+    return CURRENCY_CODES.has(String(value || "").toUpperCase());
   }
 
   function parseNumber(value) {
@@ -293,9 +308,9 @@ const core = (() => {
 
   function buildCategoryTag(categoryPath, holidayKey = "") {
     const normalizedCategory = normalizeCategoryPath(categoryPath) || "uncategorized";
-    const normalizedHolidayKey = normalizeHolidayKey(holidayKey);
-    return normalizedHolidayKey
-      ? `#log/spending/${normalizedHolidayKey}/${normalizedCategory}`
+    const normalizedHoliday = normalizeHolidayKey(holidayKey);
+    return normalizedHoliday
+      ? `#log/spending/${normalizedHoliday}/${normalizedCategory}`
       : `#log/spending/${normalizedCategory}`;
   }
 
@@ -335,6 +350,11 @@ const core = (() => {
     return "";
   }
 
+  // Single source of truth for legacy holiday-tag orderings. Rewrites the older
+  // `#log/<year>/<key>/spending[/planned]/<cat>` and `#log/<year>/<key>/planned/<cat>`
+  // forms to the canonical `#log/spending/<year>/<key>[/planned]/<cat>`. Returns the
+  // canonical path (no leading #) when a rewrite applies, else null (already
+  // canonical, or not a holiday tag). Used by both the parser and the migrator.
   function canonicalizeFinanceTag(tag) {
     const normalized = normalizeCategoryPath(String(tag || "").replace(/^#/, ""));
     const parts = normalized.split("/").filter(Boolean);
@@ -479,20 +499,69 @@ const core = (() => {
     return null;
   }
 
-  function extractChildLines(lines, startIndex) {
-    const parentIndent = (String(lines[startIndex] || "").match(/^\s*/) || [""])[0].length;
-    const childLines = [];
-    for (let index = startIndex + 1; index < lines.length; index += 1) {
-      const line = String(lines[index] || "");
-      if (!line.trim()) continue;
-      const childIndent = (line.match(/^\s*/) || [""])[0].length;
-      if (/^\s*-\s/.test(line) && childIndent > parentIndent) {
-        childLines.push(line.replace(/^\s*-\s*/, "").trim());
+  function extractPlannedLogMetadata(childLines = []) {
+    let startDate = "";
+    let endDate = "";
+    const detailLinks = [];
+    const detailLines = [];
+
+    for (const rawLine of childLines) {
+      const line = String(rawLine || "").trim();
+      if (!line) continue;
+      detailLines.push(line);
+
+      const links = Array.from(line.matchAll(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g)).map((match) => ({
+        path: String(match[1] || "").trim(),
+        label: String(match[2] || match[1] || "").trim(),
+        raw: match[0],
+      })).filter((link) => link.path);
+      detailLinks.push(...links);
+
+      const dates = Array.from(line.matchAll(/\b\d{4}-\d{2}-\d{2}\b/g)).map((match) => parseIsoDate(match[0])).filter(Boolean);
+      if (!dates.length) continue;
+
+      const lower = line.toLowerCase();
+      if (dates.length >= 2) {
+        startDate = startDate || dates[0];
+        endDate = endDate || dates[1];
         continue;
       }
-      break;
+
+      if (!startDate && (/\b(start|check[- ]?in|arrival|from)\b/.test(lower) || !endDate)) {
+        startDate = dates[0];
+        continue;
+      }
+
+      if (!endDate && /\b(end|check[- ]?out|departure|until|to)\b/.test(lower)) {
+        endDate = dates[0];
+        continue;
+      }
+
+      if (!endDate) {
+        endDate = dates[0];
+      }
     }
-    return childLines;
+
+    if (startDate && !endDate) endDate = startDate;
+    if (endDate && !startDate) startDate = endDate;
+
+    return {
+      detailLines,
+      detailLinks,
+      endDate,
+      startDate,
+    };
+  }
+
+  function extractPlannedLineDates(line = "") {
+    const dates = Array.from(String(line || "").matchAll(/\b\d{4}-\d{2}-\d{2}\b/g))
+      .map((match) => parseIsoDate(match[0]))
+      .filter(Boolean);
+    if (!dates.length) return { startDate: "", endDate: "" };
+    return {
+      endDate: dates[1] || dates[0],
+      startDate: dates[0],
+    };
   }
 
   function parseTransactionLine(line, noteDate, filePath, options = {}, childLines = []) {
@@ -536,6 +605,7 @@ const core = (() => {
     return {
       accountKey: financeContext.accountKey || "",
       amount: roundedAmount,
+      card: "",
       category,
       categoryDisplay: displayCategoryPath(category),
       categoryPrimary: primaryCategory(category),
@@ -551,23 +621,22 @@ const core = (() => {
       isIncome: Boolean(financeContext.isIncome),
       isPlannedExpense: Boolean(holidayContext.isPlannedExpense),
       plannedCategory: financeContext.plannedCategory || holidayContext.plannedCategory || "",
-      holidayYear: holidayContext.holidayYear,
-      merchant,
-      name: merchant,
-      note,
       plannedDetailLines: plannedLogMeta.detailLines,
       plannedDetailLinks: plannedLogMeta.detailLinks,
       plannedEndDate: plannedLogMeta.endDate || plannedLineDates.endDate,
       plannedStartDate: plannedLogMeta.startDate || plannedLineDates.startDate,
+      holidayYear: holidayContext.holidayYear,
+      merchant,
+      name: merchant,
       myShare: roundCurrencyAmount(Math.max(roundedAmount - owedTotal, 0)),
       originalAmount: Number.isFinite(originalAmount) ? Number(Number(originalAmount).toFixed(2)) : null,
       originalCurrency: originalSide ? originalDescriptor.currency : "",
       originalRateKey: originalSide ? originalDescriptor.rateKey : "",
       owed,
       owedTotal,
+      note,
       rawLine: text,
       source: "",
-      card: "",
       transaction: "",
     };
   }
@@ -628,7 +697,20 @@ const core = (() => {
       if (!inFinanceSection) continue;
       if ((/^\t- /.test(line) || /^\s{2,}- /.test(line)) && !/#log\//i.test(line)) continue;
 
-      const parsed = parseTransactionLine(line, noteDate, filePath, options, extractChildLines(lines, index));
+      const parentIndent = (line.match(/^\s*/) || [""])[0].length;
+      const childLines = [];
+      for (let childIndex = index + 1; childIndex < lines.length; childIndex += 1) {
+        const childLine = lines[childIndex];
+        if (!childLine.trim()) continue;
+        const childIndent = (childLine.match(/^\s*/) || [""])[0].length;
+        if (/^\s*-\s/.test(childLine) && childIndent > parentIndent) {
+          childLines.push(childLine.replace(/^\s*-\s*/, "").trim());
+          continue;
+        }
+        break;
+      }
+
+      const parsed = parseTransactionLine(line, noteDate, filePath, options, childLines);
       if (parsed) {
         transactions.push(parsed);
       }
@@ -637,9 +719,16 @@ const core = (() => {
     return transactions;
   }
 
+  // Sums the entry lines of a finance section for the running total on the root
+  // line. Only tagged lines count: a merchant or note child line is still a
+  // bullet, and extractVisibleAmount will happily read a number out of one
+  // ("7-Eleven", "Shell Coorparoo 1234"), which used to inflate the written total
+  // even though the dashboards — which parse through parseTransactionsFromNoteContent,
+  // and have always required a tag — read the same note correctly.
   function calculateSpendingSectionTotal(sectionLines, noteDate, options = {}) {
     return Number(
       sectionLines
+        .filter((line) => /#log\//i.test(String(line || "")))
         .map((line) => parseTransactionLine(line, noteDate, "", options))
         .filter((entry) => entry && !entry.isIncome && !entry.isGoalContribution && entry.entryType !== "balance")
         .reduce((sum, entry) => sum + entry.amount, 0)
@@ -830,7 +919,7 @@ const core = (() => {
     const startDate = isoToDate(start);
     const endDate = isoToDate(end);
     if (!startDate || !endDate) return 1;
-    const diff = Math.round((endDate.getTime() - startDate.getTime()) / (24 * 60 * 60 * 1000));
+    const diff = Math.round((endDate.getTime() - startDate.getTime()) / DAY_MS);
     return Math.max(1, diff + 1);
   }
 
@@ -947,7 +1036,7 @@ const core = (() => {
     const goalKey = normalizeCategoryPath(definition?.goalKey || definition?.savingsGoalKey || "");
     const activeSavingsGoal = Boolean(definition?.activeSavingsGoal);
     const carryMissedSavings = Boolean(definition?.carryMissedSavings);
-    const savingsDisplayMode = String(definition?.savingsDisplayMode || "standard").toLowerCase();
+    const savingsDisplayMode = String(definition?.savingsDisplayMode || "dual-phase").toLowerCase();
     const savingsProgressMode = String(definition?.savingsProgressMode || "account-only").toLowerCase();
     const holidayStartDate = parseIsoDate(definition?.startDate || "");
     const totalBudget = roundCurrencyAmount(definition?.totalBudget || 0);
@@ -981,7 +1070,9 @@ const core = (() => {
     const period = String(options.period || "week").toLowerCase();
     const range = toPeriodRange({ period, referenceDate, weekStartsOn: options.weekStartsOn || "monday" });
     const currentPeriodContribution = roundCurrencyAmount(
-      contributions.filter((entry) => isDateInRange(entry.date, range)).reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
+      contributions
+        .filter((entry) => isDateInRange(entry.date, range))
+        .reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
     );
 
     let requiredPerPeriod = 0;
@@ -1155,6 +1246,12 @@ const core = (() => {
     return out;
   }
 
+  // Parses a single capture-inbox payload (one transaction) into the loose params
+  // object that the plugin's capture handler consumes. Accepts three shapes:
+  //   1. "amount=12 | cat=food/restaurants | merchant=Nobu | date=2026-06-08"
+  //   2. "obsidian://finance-capture?amount=12&category=food/groceries&merchant=Coles"
+  //   3. a daily-note bullet "- $12 #log/spending/food/restaurants Nobu"
+  //   4. positional "12 food/snacks Coffee"
   function parseInboxLine(raw) {
     const text = String(raw || "").replace(/^﻿/, "").trim();
     if (!text || /^(#|\/\/)/.test(text)) return null;
@@ -1210,6 +1307,7 @@ const core = (() => {
     return normalizeInboxParams({ amount, category, merchant: rest.join(" ") });
   }
 
+  // Inverse of parseInboxLine: renders a canonical one-line capture payload.
   function buildInboxLine(expense) {
     const entry = expense || {};
     const parts = [`amount=${formatPlainNumber(entry.amount || 0)}`];
@@ -1229,8 +1327,15 @@ const core = (() => {
     return parts.join(" | ");
   }
 
-  function parseQuickAddInput(text, knownCategories = []) {
+  // Parses a single free-text quick-add line into structured fields.
+  // Grammar: first $?number = amount; a #tag or a/b path or a known category word
+  // = category; @token = date; everything else = merchant.
+  // Quick add's free-text grammar. `options.defaultCurrency` is the home currency
+  // — anything tagged with a different code is treated as the original amount and
+  // the remaining bare number as what it actually cost you.
+  function parseQuickAddInput(text, knownCategories = [], options = {}) {
     let working = ` ${String(text || "").trim()} `;
+    const homeCurrency = normalizeCurrency(options.defaultCurrency || "AUD");
 
     let dateToken = "";
     working = working.replace(/(^|\s)@(\S+)/, (_match, pre, token) => {
@@ -1264,11 +1369,54 @@ const core = (() => {
       }
     }
 
+    // A number sitting next to a currency code, in either order: "58usd",
+    // "USD 58", "$58 USD". The first such pair is the original amount; whatever
+    // bare number is left is what it cost in the home currency. Two explicit
+    // amounts means no stored rate is needed — you record what you were charged
+    // and what it landed as.
+    let originalAmount = null;
+    let originalCurrency = "";
+    const NUM = "-?\\d[\\d,]*(?:\\.\\d+)?";
+    const fxPatterns = [
+      new RegExp(`(^|\\s)\\$?\\s?(${NUM})\\s*([A-Za-z]{3})(?=\\s|$|[:=])`),
+      new RegExp(`(^|\\s)([A-Za-z]{3})\\s*\\$?\\s?(${NUM})(?=\\s|$|[:=])`),
+    ];
+    for (let index = 0; index < fxPatterns.length; index += 1) {
+      const match = working.match(fxPatterns[index]);
+      if (!match) continue;
+      const code = index === 0 ? match[3] : match[2];
+      const value = index === 0 ? match[2] : match[3];
+      if (!isCurrencyCode(code)) continue;
+      originalAmount = Number(String(value).replace(/,/g, ""));
+      originalCurrency = normalizeCurrency(code);
+      working = working.replace(match[0], match[1] || " ");
+      break;
+    }
+
     let amount = null;
     const amountMatch = working.match(/-?\$?\s?(-?\d[\d,]*(?:\.\d+)?)/);
     if (amountMatch) {
       amount = Number(amountMatch[1].replace(/,/g, ""));
       working = working.replace(amountMatch[0], " ");
+    }
+
+    // A trailing home-currency code on the converted amount ("… : $83.64 AUD")
+    // is confirmation, not data — drop it so it never lands in the merchant.
+    working = working.replace(new RegExp(`(^|\\s)${homeCurrency}(?=\\s|$)`, "i"), "$1");
+    // And the separator people naturally write between the two amounts.
+    working = working.replace(/(^|\s)(?::|=|->|→)(?=\s|$)/g, "$1");
+
+    // Only one amount given, and it was the foreign one: that is the amount. The
+    // caller cannot convert it, and guessing a rate would be worse than not.
+    if (!Number.isFinite(amount) && Number.isFinite(originalAmount) && originalCurrency === homeCurrency) {
+      amount = originalAmount;
+      originalAmount = null;
+      originalCurrency = "";
+    }
+    // Same currency as home on both sides is not a conversion at all.
+    if (originalCurrency && originalCurrency === homeCurrency && Number.isFinite(amount)) {
+      originalAmount = null;
+      originalCurrency = "";
     }
 
     if (!category && knownCategories.length) {
@@ -1280,12 +1428,12 @@ const core = (() => {
         const leaf = full.split("/").pop();
         if (leaf && !map.has(leaf)) map.set(leaf, full);
       }
-      const remaining = working.split(/\s+/).filter(Boolean);
-      const index = remaining.findIndex((token) => map.has(normalizeCategoryPath(token)));
+      const tokens = working.split(/\s+/).filter(Boolean);
+      const index = tokens.findIndex((token) => map.has(normalizeCategoryPath(token)));
       if (index >= 0) {
-        category = map.get(normalizeCategoryPath(remaining[index]));
-        remaining.splice(index, 1);
-        working = ` ${remaining.join(" ")} `;
+        category = map.get(normalizeCategoryPath(tokens[index]));
+        tokens.splice(index, 1);
+        working = ` ${tokens.join(" ")} `;
       }
     }
 
@@ -1293,11 +1441,21 @@ const core = (() => {
       ? extractCategoryFromLogSpendingTag(`#${String(category).replace(/^#/, "")}`)
       : normalizeCategoryPath(category);
 
+    const hasFx = Number.isFinite(originalAmount) && Boolean(originalCurrency);
     return {
       amount: Number.isFinite(amount) ? Number(amount.toFixed(2)) : null,
       category: normalizedCategory,
       dateToken,
       merchant: normalizeWhitespace(working),
+      originalAmount: hasFx ? Number(originalAmount.toFixed(2)) : null,
+      originalCurrency: hasFx ? originalCurrency : "",
+      // 1 unit of the original currency in home currency, for display only —
+      // nothing stores it.
+      impliedRate: hasFx && Number.isFinite(amount) && originalAmount !== 0
+        ? Number((amount / originalAmount).toFixed(4))
+        : null,
+      // The user said what they paid abroad but not what it cost at home.
+      needsConvertedAmount: hasFx && !Number.isFinite(amount),
       owedTokens,
       splitCount,
     };
@@ -1307,6 +1465,8 @@ const core = (() => {
     return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
   }
 
+  // Stable key for de-duplicating the same purchase arriving from different
+  // sources (Apple Pay automation, Wise API, bank CSV): date + amount + merchant.
   function transactionFingerprint(entry) {
     const data = entry || {};
     const date = parseIsoDate(data.date) || "";
@@ -1314,6 +1474,8 @@ const core = (() => {
     return `${date}|${amount}|${normalizeMerchant(data.merchant || data.name || "")}`;
   }
 
+  // Minimal RFC-4180-ish CSV reader: handles quoted fields, escaped quotes,
+  // embedded commas and newlines. Returns an array of cell arrays.
   function parseCsvRows(text) {
     const source = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
     const rows = [];
@@ -1381,6 +1543,9 @@ const core = (() => {
     return `${year}-${pad(month)}-${pad(day)}`;
   }
 
+  // Parses a bank/Wise statement CSV into spending rows. Auto-detects columns by
+  // header name, supports either a single signed amount column or separate
+  // debit/credit columns, and returns positive spend amounts in ISO dates.
   function parseBankCsv(content, options = {}) {
     const rows = parseCsvRows(content);
     if (rows.length < 2) return [];
@@ -1451,6 +1616,10 @@ const core = (() => {
     return result;
   }
 
+  // Recomputes the running total on the "#log/spending <total>" root line from the
+  // actual entries beneath it, so hand-edits to amounts no longer leave a stale
+  // total. Returns the original string unchanged when the total is already correct,
+  // preserving the checkbox state and indentation of the root line.
   function recomputeSpendingTotals(content, settings = {}) {
     const lines = splitLines(content);
     const noteDate = extractNoteDate(content, "");
@@ -1493,6 +1662,9 @@ const core = (() => {
     return lines.join("\n");
   }
 
+  // Time-aware budget pace. Given a limit, what is spent, the period bounds and
+  // today, returns how far through the period we are, the on-pace spend line, the
+  // projected end-of-period spend, and a safe per-day amount for the rest of it.
   function computeBudgetPace(input = {}) {
     const limit = Number(input.limit || 0);
     const spent = Number(input.spent || 0);
@@ -1547,6 +1719,9 @@ const core = (() => {
     };
   }
 
+  // Replaces a single logged transaction (its entry line plus any merchant/note
+  // child lines) with a freshly built block from `newExpense`, then recomputes the
+  // section total. Returns null if the original line is not found.
   function replaceTransactionBlock(content, oldRawLine, newExpense, settings = {}) {
     const lines = splitLines(content);
     const target = String(oldRawLine);
@@ -1572,6 +1747,8 @@ const core = (() => {
     return recomputeSpendingTotals(lines.join("\n"), settings);
   }
 
+  // Removes a logged transaction (entry line + child lines) and recomputes the
+  // section total. Returns null if the original line is not found.
   function removeTransactionBlock(content, oldRawLine, settings = {}) {
     const lines = splitLines(content);
     const target = String(oldRawLine);
@@ -1736,85 +1913,172 @@ const core = (() => {
     };
   }
 
-  // Sinking-fund maths for recurring bills: how much of each bill has "accrued"
-  // since it was last paid (money that should already be set aside), what is due
-  // within the next 30 days, and the steady per-week/per-month/per-quarter
-  // set-aside that keeps every cadence covered — both combined, and broken down
-  // per cadence (e.g. "monthly bills need $X/week and $Y/month set aside",
-  // separately from "weekly bills need $Z/week").
-  function computeRecurringReserve(recurring, referenceDate) {
+  // --- Money in integer cents -----------------------------------------------------
+  // Most of this file rounds after each step with roundCurrencyAmount, which is
+  // fine for one or two operations. The runway and forecast maths are several
+  // float operations deep before anything is rounded (a per-year figure built
+  // from 52/12, then divided by 52, 12 and 4 again), so those work in integer
+  // cents and convert back once at the boundary.
+
+  function toCents(value) {
+    return Math.round(Number(value || 0) * 100);
+  }
+
+  function fromCents(cents) {
+    return Number((Math.round(Number(cents) || 0) / 100).toFixed(2));
+  }
+
+  // Walks each active bill's schedule forward and sums every occurrence landing
+  // on or before `end`. This is what makes the runway target react to the
+  // calendar rather than to an average: a yearly insurance renewal is worth
+  // nothing to the target until it enters the window, then worth all of it.
+  // Returns integer cents plus the individual occurrences, newest last.
+  function sumRecurringDueWithin(recurring, referenceDate, end) {
     const today = parseIsoDate(referenceDate) || todayIsoLocal();
-    const horizon = addDays(today, 30);
-    const rows = [];
-    const perYearByCadence = new Map();
-    let accruedTotal = 0;
-    let perYearTotal = 0;
-    let dueSoonTotal = 0;
+    const horizon = parseIsoDate(end);
+    const occurrences = [];
+    let totalCents = 0;
+    if (!horizon || horizon < today) return { totalCents, occurrences };
 
     for (const item of recurring?.items || []) {
-      const spec = RECURRING_CADENCES[item.cadence];
-      if (!spec || !item.lastDate || !(item.lastAmount > 0) || item.active === false) continue;
-      const cycleDays = spec.days || Math.round(30.44 * spec.months);
-      const perYear = item.lastAmount * spec.perMonth * 12;
-      const daysSinceLast = Math.max(0, daysBetweenInclusive(item.lastDate, today) - 1);
-      const accrued = roundCurrencyAmount(Math.min(daysSinceLast / cycleDays, 1) * item.lastAmount);
-
-      let dueSoon = 0;
+      if (!RECURRING_CADENCES[item.cadence] || !(item.lastAmount > 0) || item.active === false) continue;
+      const amountCents = toCents(item.lastAmount);
       let due = item.nextDue;
-      for (let guard = 0; due && due <= horizon && guard < 32; guard += 1) {
-        dueSoon += item.lastAmount;
+      // The guard stops a corrupt cadence from looping forever; 400 covers a
+      // weekly bill across a 6-year window, far beyond any sane runway.
+      for (let guard = 0; due && due <= horizon && guard < 400; guard += 1) {
+        totalCents += amountCents;
+        occurrences.push({ date: due, amount: item.lastAmount, label: item.label, name: item.name, cadence: item.cadence });
         due = nextRecurringDate(due, item.cadence);
       }
-      dueSoon = roundCurrencyAmount(dueSoon);
-
-      accruedTotal += accrued;
-      perYearTotal += perYear;
-      dueSoonTotal += dueSoon;
-      perYearByCadence.set(item.cadence, (perYearByCadence.get(item.cadence) || 0) + perYear);
-      rows.push({
-        accrued,
-        cadence: item.cadence,
-        dueSoon,
-        label: item.label,
-        name: item.name,
-        perWeek: roundCurrencyAmount(perYear / 52),
-      });
     }
 
-    rows.sort((left, right) => right.accrued - left.accrued);
+    occurrences.sort((left, right) => String(left.date).localeCompare(String(right.date)));
+    return { totalCents, occurrences };
+  }
 
-    const byCadence = Object.keys(RECURRING_CADENCES)
-      .filter((cadence) => perYearByCadence.has(cadence))
-      .map((cadence) => {
-        const perYear = perYearByCadence.get(cadence);
-        return {
-          cadence,
-          label: RECURRING_CADENCES[cadence].label,
-          perWeek: roundCurrencyAmount(perYear / 52),
-          perMonth: roundCurrencyAmount(perYear / 12),
-          perQuarter: roundCurrencyAmount(perYear / 4),
-          perYear: roundCurrencyAmount(perYear),
-        };
-      });
+  // Runway is a read-only figure, not something you fund — see computeRunway. But
+  // 0.6 shipped a "bill reserve" you could contribute to, and an early 0.7 build
+  // briefly made runway a goal note. Bullets under either key still exist in real
+  // vaults, and they are transfers rather than income, so they stay excluded from
+  // income totals and from the goal lists.
+  const RUNWAY_LEGACY_KEYS = new Set(["runway", "billreserve"]);
+
+  function normalizeRunwayMode(value) {
+    const raw = String(value || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
+    return raw === "bills" || raw === "bills-only" ? "bills" : "spending";
+  }
+
+  const RUNWAY_UNITS = {
+    day: { days: 1 },
+    week: { days: 7 },
+    fortnight: { days: 14 },
+    month: { months: 1 },
+    quarter: { months: 3 },
+    year: { months: 12 },
+  };
+
+  // Parses "1 month", "2 weeks", "6 months", "3mo", "1w" into a normalized
+  // { count, unit, label }. Anything unrecognised falls back to one month.
+  //
+  // Idempotent on purpose: it accepts its own output, so a caller that has already
+  // parsed a period can pass the object straight through. Without this, stringifying
+  // a parsed object yielded "[object Object]" and silently fell back to one month —
+  // which is exactly how a 3-month target ended up measuring a 1-month window.
+  function parseRunwayPeriod(value) {
+    if (value && typeof value === "object" && value.unit in RUNWAY_UNITS) {
+      const count = Math.max(1, Number(value.count) || 1);
+      return { count, unit: value.unit, label: `${count} ${value.unit}${count === 1 ? "" : "s"}` };
+    }
+    const raw = normalizeWhitespace(String(value || "")).toLowerCase();
+    const match = raw.match(/^(\d+)?\s*([a-z]+)$/);
+    const aliases = {
+      d: "day", day: "day", days: "day",
+      w: "week", wk: "week", week: "week", weeks: "week",
+      fortnight: "fortnight", fortnights: "fortnight", biweekly: "fortnight",
+      m: "month", mo: "month", month: "month", months: "month",
+      q: "quarter", quarter: "quarter", quarters: "quarter",
+      y: "year", yr: "year", year: "year", years: "year",
+    };
+    const unit = aliases[match?.[2]] || "month";
+    const count = Math.max(1, Number(match?.[1]) || 1);
+    return { count, unit, label: `${count} ${unit}${count === 1 ? "" : "s"}` };
+  }
+
+  // The last day covered by a runway period starting at `referenceDate`.
+  function runwayWindowEnd(referenceDate, period) {
+    const today = parseIsoDate(referenceDate) || todayIsoLocal();
+    const { count, unit } = parseRunwayPeriod(period);
+    const spec = RUNWAY_UNITS[unit] || RUNWAY_UNITS.month;
+    const end = spec.days ? addDays(today, spec.days * count) : addMonths(today, spec.months * count);
+    // Exclusive end: a 1-month window starting today covers up to the day before
+    // the same date next month, so two consecutive windows never double-count a
+    // bill that falls on the boundary.
+    return addDays(end, -1);
+  }
+
+  // What you need to have available to be safe for a chosen period.
+  //
+  // This is a read-only figure, deliberately: there is nothing to fund, no balance
+  // to keep, and no bookkeeping. It answers one question — "how much do I need in
+  // the account for the next N?" — by walking each bill's schedule forward and
+  // summing what actually lands, optionally plus your usual discretionary spend.
+  //
+  // `mode` decides what counts:
+  //   "bills"     - recurring bills falling inside the window
+  //   "spending"  - those bills plus your trailing-average discretionary spend
+  function computeRunway(recurring, options = {}) {
+    const referenceDate = parseIsoDate(options.referenceDate) || todayIsoLocal();
+    const period = parseRunwayPeriod(options.period);
+    const mode = normalizeRunwayMode(options.mode);
+    const windowEnd = runwayWindowEnd(referenceDate, period);
+    const windowDays = Math.max(1, daysBetweenInclusive(referenceDate, windowEnd));
+
+    const { totalCents: billsCents, occurrences } = sumRecurringDueWithin(recurring, referenceDate, windowEnd);
+    const dailyDiscretionaryCents = Math.round(toCents(options.monthlyDiscretionary || 0) / 30.44);
+    const discretionaryCents = mode === "spending" ? dailyDiscretionaryCents * windowDays : 0;
+    const targetCents = billsCents + discretionaryCents;
 
     return {
-      rows,
-      byCadence,
-      totals: {
-        accrued: roundCurrencyAmount(accruedTotal),
-        dueNext30Days: roundCurrencyAmount(dueSoonTotal),
-        perWeek: roundCurrencyAmount(perYearTotal / 52),
-        perMonth: roundCurrencyAmount(perYearTotal / 12),
-        perQuarter: roundCurrencyAmount(perYearTotal / 4),
-      },
+      mode,
+      period: period.label,
+      periodCount: period.count,
+      periodUnit: period.unit,
+      windowStart: referenceDate,
+      windowEnd,
+      windowDays,
+      bills: fromCents(billsCents),
+      discretionary: fromCents(discretionaryCents),
+      target: fromCents(targetCents),
+      perWeek: fromCents(Math.round((targetCents / windowDays) * 7)),
+      perDay: fromCents(Math.round(targetCents / windowDays)),
+      occurrences,
     };
   }
 
+
+  const RECURRING_REGISTRY_COLUMNS = [
+    { header: "Item", align: "---" },
+    { header: "Cadence", align: "---" },
+    { header: "Amount", align: "---:" },
+    { header: "Active", align: "---" },
+    { header: "Auto-log", align: "---" },
+    { header: "Variable", align: "---" },
+    { header: "Next Amount", align: "---:" },
+    { header: "Change Date", align: "---" },
+    { header: "Next Due", align: "---" },
+    { header: "End Date", align: "---" },
+    { header: "Payments Left", align: "---:" },
+  ];
+
+  const RECURRING_REGISTRY_HEADER_ROW = `| ${RECURRING_REGISTRY_COLUMNS.map((column) => column.header).join(" | ")} |`;
+  const RECURRING_REGISTRY_SEPARATOR_ROW = `| ${RECURRING_REGISTRY_COLUMNS.map((column) => column.align).join(" | ")} |`;
+
   // The recurring registry is a hand-editable markdown table (in the recurring
   // payments note) that holds per-item state the tags cannot: whether a bill is
-  // still current (Active), whether it may be auto-logged (Auto-log), and an
-  // optional amount override. Blank cells keep the defaults, so an absent table
-  // changes nothing.
+  // still current (Active), whether it may be auto-logged (Auto-log), an optional
+  // amount override, and when the bill stops (End Date / Payments Left). Blank
+  // cells keep the defaults, so an absent table changes nothing.
   function parseRecurringRegistry(content) {
     const registry = new Map();
     for (const rows of parseMarkdownTable(content)) {
@@ -1828,6 +2092,8 @@ const core = (() => {
         const nextAmount = parseNumber(row["next amount"] ?? row.nextamount);
         const changeDate = parseIsoDate(row["change date"] ?? row.changedate ?? "");
         const nextDue = parseIsoDate(row["next due"] ?? row.nextdue ?? "");
+        const endDate = parseIsoDate(row["end date"] ?? row.enddate ?? row.until ?? "");
+        const paymentsLeft = parseNumber(row["payments left"] ?? row.paymentsleft ?? row.occurrences ?? "");
         registry.set(name, {
           active: activeRaw ? !/^(?:no|false|0|inactive|paused)$/i.test(activeRaw) : true,
           autoLog: autoRaw ? /^(?:yes|true|1|on)$/i.test(autoRaw) : null,
@@ -1836,6 +2102,8 @@ const core = (() => {
           nextAmount: Number.isFinite(nextAmount) && nextAmount > 0 ? roundCurrencyAmount(nextAmount) : null,
           changeDate: changeDate || null,
           nextDue: nextDue || null,
+          endDate: endDate || null,
+          paymentsLeft: Number.isFinite(paymentsLeft) && paymentsLeft >= 0 ? Math.floor(paymentsLeft) : null,
           cadence: normalizeCadence(row.cadence || ""),
         });
       }
@@ -1851,10 +2119,15 @@ const core = (() => {
   // cadence even when a bill is logged late (or early) — without it, logging a
   // bill's real payment date would silently push every future due date out by
   // however many days late it was.
+  //
+  // A bill that has run its course — past its End Date, or with no Payments Left
+  // — becomes inactive with `finished` set. Reusing `active` means every existing
+  // consumer (totals, auto-logging, the reserve maths, the due-bills card) drops
+  // it without changes; `finishedReason` is only there so the UI can say "ended"
+  // rather than "paused".
   function applyRecurringRegistry(recurring, registry, referenceDate = todayIsoLocal()) {
     const items = (recurring?.items || []).map((item) => {
       const entry = registry?.get(item.name) || registry?.get(item.name.split("/").pop());
-      const active = entry ? entry.active !== false : true;
       const autoLog = entry && entry.autoLog !== null && entry.autoLog !== undefined ? entry.autoLog : true;
       const variable = Boolean(entry?.variable);
       // A manual Amount override always wins. Otherwise a variable bill (a
@@ -1867,13 +2140,26 @@ const core = (() => {
       const lastAmount = changeApplied ? entry.nextAmount : baseAmount;
       const spec = RECURRING_CADENCES[item.cadence];
       const nextDue = entry?.nextDue || item.nextDue;
-      const status = !nextDue
-        ? "unknown"
-        : nextDue < referenceDate
-          ? "overdue"
-          : nextDue === referenceDate
-            ? "due"
-            : "upcoming";
+
+      const endDate = entry?.endDate || null;
+      const paymentsLeft = Number.isFinite(entry?.paymentsLeft) ? entry.paymentsLeft : null;
+      const outOfPayments = paymentsLeft !== null && paymentsLeft <= 0;
+      // Past the end date once there is no due date left inside it — a bill due
+      // on the end date itself is still owed.
+      const pastEndDate = Boolean(endDate && (!nextDue || nextDue > endDate));
+      const finishedReason = outOfPayments ? "payments" : pastEndDate ? "end-date" : "";
+      const finished = Boolean(finishedReason);
+      const active = (entry ? entry.active !== false : true) && !finished;
+
+      const status = finished
+        ? "finished"
+        : !nextDue
+          ? "unknown"
+          : nextDue < referenceDate
+            ? "overdue"
+            : nextDue === referenceDate
+              ? "due"
+              : "upcoming";
       const daysUntilDue = nextDue
         ? nextDue >= referenceDate
           ? daysBetweenInclusive(referenceDate, nextDue) - 1
@@ -1888,6 +2174,10 @@ const core = (() => {
         nextAmount: changePending ? entry.nextAmount : null,
         changeDate: changePending ? entry.changeDate : null,
         nextDue,
+        endDate,
+        paymentsLeft,
+        finished,
+        finishedReason,
         status,
         daysUntilDue,
         monthlyCost: spec ? roundCurrencyAmount(lastAmount * spec.perMonth) : item.monthlyCost,
@@ -1926,7 +2216,13 @@ const core = (() => {
 
     const isTrip = Boolean(tripTag);
     const archivedDate = parseIsoDate(fm.archived || "");
+    // Notes left over from the build where runway was briefly a goal note. They
+    // are not goals — runway is computed from your bills, never funded — so they
+    // are flagged here and filtered out of every goal list.
+    const isLegacyRunwayNote =
+      RUNWAY_LEGACY_KEYS.has(goalKey) || String(fm.goal_type || "").trim().toLowerCase() === "runway";
     return {
+      isLegacyRunwayNote,
       active: !archivedDate && /^(?:true|yes|1)$/i.test(String(fm.active ?? fm.active_savings_goal ?? "false")),
       archivedDate: archivedDate || "",
       carryMissedSavings: /^(?:true|yes|1)$/i.test(String(fm.carry_missed_savings || "false")),
@@ -2181,19 +2477,22 @@ const core = (() => {
   function buildForecastProjection(input = {}) {
     const referenceDate = parseIsoDate(input.referenceDate) || todayIsoLocal();
     const months = Math.max(1, Math.min(Number(input.months) || 6, 60));
-    const startBalance = roundCurrencyAmount(input.startBalance || 0);
-    const monthlyNet = roundCurrencyAmount(
-      Number(input.monthlyIncome || 0) -
-      Number(input.monthlyBills || 0) -
-      Number(input.monthlyDiscretionary || 0) -
-      Number(input.monthlyGoalSetAside || 0)
-    );
+    // Integer cents: this multiplies the monthly net by up to 60 and adds it to a
+    // starting balance, so float error would accumulate visibly along the line.
+    const startCents = toCents(input.startBalance || 0);
+    const monthlyNetCents =
+      toCents(input.monthlyIncome || 0) -
+      toCents(input.monthlyBills || 0) -
+      toCents(input.monthlyDiscretionary || 0) -
+      toCents(input.monthlyGoalSetAside || 0);
+    const startBalance = fromCents(startCents);
+    const monthlyNet = fromCents(monthlyNetCents);
 
     const points = [{ date: referenceDate, balance: startBalance }];
     for (let index = 1; index <= months; index += 1) {
       points.push({
         date: addMonths(referenceDate, index),
-        balance: roundCurrencyAmount(startBalance + monthlyNet * index),
+        balance: fromCents(startCents + monthlyNetCents * index),
       });
     }
 
@@ -2313,11 +2612,11 @@ const core = (() => {
     const settleUps = incomeEntries.filter(
       (entry) => !goalKeys.has(entry.goalKey) && normalizeCategoryPath(entry.category || "").startsWith("settleup/")
     );
-    const billReserveContributions = incomeEntries.filter(
-      (entry) => !goalKeys.has(entry.goalKey) && normalizeCategoryPath(entry.category || "") === "billreserve"
+    const runwayContributions = incomeEntries.filter(
+      (entry) => !goalKeys.has(entry.goalKey) && RUNWAY_LEGACY_KEYS.has(normalizeCategoryPath(entry.category || ""))
     );
     const regularIncome = incomeEntries.filter(
-      (entry) => !goalKeys.has(entry.goalKey) && !settleUps.includes(entry) && !billReserveContributions.includes(entry)
+      (entry) => !goalKeys.has(entry.goalKey) && !settleUps.includes(entry) && !runwayContributions.includes(entry)
     );
     const withdrawals = inRange.filter((entry) => entry.entryType === "goal-withdrawal");
 
@@ -2325,7 +2624,7 @@ const core = (() => {
     const contributedTotal = roundCurrencyAmount(contributions.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
     const withdrawnTotal = roundCurrencyAmount(withdrawals.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
     const settledTotal = roundCurrencyAmount(settleUps.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
-    const billReserveTotal = roundCurrencyAmount(billReserveContributions.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
+    const runwayTotal = roundCurrencyAmount(runwayContributions.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
 
     const months = buildMonthlyIncomeExpense(inRange, { goalKeys: Array.from(goalKeys) }).filter((month) => month.expense > 0);
     const bestMonth = months.length ? months.reduce((min, month) => (month.expense < min.expense ? month : min)) : null;
@@ -2372,7 +2671,7 @@ const core = (() => {
     lines.push(`- Savings contributions: ${formatCurrency(contributedTotal, currency)} (${contributions.length})`);
     lines.push(`- Savings withdrawals: ${formatCurrency(withdrawnTotal, currency)} (${withdrawals.length})`);
     lines.push(`- Settled repayments received: ${formatCurrency(settledTotal, currency)} (${settleUps.length})`);
-    lines.push(`- Bill reserve contributions: ${formatCurrency(billReserveTotal, currency)} (${billReserveContributions.length})`);
+    lines.push(`- Runway contributions: ${formatCurrency(runwayTotal, currency)} (${runwayContributions.length})`);
 
     return lines;
   }
@@ -2413,33 +2712,53 @@ const core = (() => {
   // spender, since children are ranked largest-first) gets the lightest shade,
   // the last sibling gets the darkest, so shade reads directly as rank.
   function categoryShadeColor(base, childIndex, siblingCount = 1) {
-    const maxLightness = Math.min(74, base.lightness + 22);
-    const minLightness = Math.max(22, base.lightness - 22);
+    const maxLightness = Math.min(80, base.lightness + 30);
+    const minLightness = Math.max(16, base.lightness - 30);
     if (siblingCount <= 1) return `hsl(${base.hue}, ${base.saturation}%, ${maxLightness}%)`;
     const ratio = childIndex / (siblingCount - 1);
     const lightness = Math.round(maxLightness - ratio * (maxLightness - minLightness));
     return `hsl(${base.hue}, ${base.saturation}%, ${lightness}%)`;
   }
 
-  // Groups entries into ranked major groups with nested subgroups, assigning the
-  // hue-family colours. Majors are ranked by group total; subgroups sit beneath
-  // their parent, largest first. `slices` is the flattened leaf list for pies.
+  // Groups entries into ranked major groups, each with nested subcategory
+  // groups, each in turn with nested leaf groups — a real 3-level hierarchy in
+  // "full" mode (major -> subcategory -> leaf), so a chart can give every
+  // subcategory its own colour section (major's hue, one shade) and then split
+  // each section further into its own leaf items (further shades within that
+  // same section), instead of flattening subcategory+leaf into a single ring.
+  // A category that's only two segments deep (e.g. shopping/amazon) has no
+  // leaf level to split into, so its one leaf just passes through as the
+  // subcategory itself — the outer ring reads as a single uninterrupted block
+  // there rather than an artificial extra split. In "primary" mode (used by
+  // the sidebar's mini chart and holiday breakdowns) everything collapses back
+  // to one level, unchanged from before. `slices` is the flattened leaf list,
+  // used for pies with no group/subgroup ring to draw and for full-path colour
+  // lookups elsewhere.
   function buildHierarchicalCategoryGroups(entries, groupBy = "primary") {
     const useFull = String(groupBy || "primary").toLowerCase() === "full";
     const majors = new Map();
 
     for (const entry of entries || []) {
       const full = normalizeCategoryPath(entry.category || "uncategorized") || "uncategorized";
-      const major = full.split("/")[0];
+      const parts = full.split("/").filter(Boolean);
+      const major = parts[0] || "uncategorized";
       const amount = entrySpendAmount(entry);
-      const majorGroup = majors.get(major) || { key: major, label: titleCaseSegment(major), total: 0, count: 0, children: new Map() };
+
+      const majorGroup = majors.get(major) || { key: major, label: titleCaseSegment(major), total: 0, count: 0, subgroups: new Map() };
       majorGroup.total = roundCurrencyAmount(majorGroup.total + amount);
       majorGroup.count += 1;
-      const childKey = useFull ? full : major;
-      const child = majorGroup.children.get(childKey) || { key: childKey, label: displayCategoryPath(childKey), total: 0, count: 0 };
-      child.total = roundCurrencyAmount(child.total + amount);
-      child.count += 1;
-      majorGroup.children.set(childKey, child);
+
+      const subKey = useFull && parts.length >= 2 ? `${parts[0]}/${parts[1]}` : major;
+      const subgroup = majorGroup.subgroups.get(subKey) || { key: subKey, label: displayCategoryPath(subKey), total: 0, count: 0, leaves: new Map() };
+      subgroup.total = roundCurrencyAmount(subgroup.total + amount);
+      subgroup.count += 1;
+
+      const leafKey = useFull && parts.length >= 3 ? full : subKey;
+      const leaf = subgroup.leaves.get(leafKey) || { key: leafKey, label: displayCategoryPath(leafKey), total: 0, count: 0 };
+      leaf.total = roundCurrencyAmount(leaf.total + amount);
+      leaf.count += 1;
+      subgroup.leaves.set(leafKey, leaf);
+      majorGroup.subgroups.set(subKey, subgroup);
       majors.set(major, majorGroup);
     }
 
@@ -2448,14 +2767,25 @@ const core = (() => {
     const groups = ranked.map((major, majorIndex) => {
       const base = categoryBaseColor(majorIndex);
       const color = categoryShadeColor(base, 0);
-      const sortedChildren = Array.from(major.children.values()).sort((left, right) => right.total - left.total);
-      const children = sortedChildren.map((child, childIndex) => ({
-        ...child,
-        color: categoryShadeColor(base, childIndex, sortedChildren.length),
-        parent: major.key,
-      }));
-      for (const child of children) slices.push(child);
-      return { ...major, children, color };
+      const { subgroups, ...majorRest } = major;
+      const sortedSubgroups = Array.from(subgroups.values()).sort((left, right) => right.total - left.total);
+      const children = sortedSubgroups.map((subgroup, subIndex) => {
+        const { leaves, ...subgroupRest } = subgroup;
+        const sortedLeaves = Array.from(leaves.values()).sort((left, right) => right.total - left.total);
+        const leafList = sortedLeaves.map((leaf, leafIndex) => ({
+          ...leaf,
+          color: categoryShadeColor(base, leafIndex, sortedLeaves.length),
+          parent: subgroup.key,
+        }));
+        for (const leaf of leafList) slices.push(leaf);
+        return {
+          ...subgroupRest,
+          color: categoryShadeColor(base, subIndex, sortedSubgroups.length),
+          parent: major.key,
+          children: leafList,
+        };
+      });
+      return { ...majorRest, children, color };
     });
 
     return { groups, slices };
@@ -2672,13 +3002,25 @@ const core = (() => {
 
     return lines;
   }
+
   return {
-    addMonths,
+    RECURRING_CADENCES,
+    RECURRING_REGISTRY_COLUMNS,
+    RECURRING_REGISTRY_HEADER_ROW,
+    RECURRING_REGISTRY_SEPARATOR_ROW,
     parseRecurringRegistry,
     applyRecurringRegistry,
     buildTripReflection,
-    computeRecurringReserve,
+    computeRunway,
+    normalizeRunwayMode,
+    RUNWAY_LEGACY_KEYS,
+    parseRunwayPeriod,
+    runwayWindowEnd,
+    sumRecurringDueWithin,
+    toCents,
+    fromCents,
     buildGoalArchiveSummaryLines,
+    addMonths,
     normalizeCadence,
     nextRecurringDate,
     detectRecurringPayments,
@@ -2703,26 +3045,30 @@ const core = (() => {
     categoryShadeColor,
     formatDailyNoteName,
     parseDailyNoteName,
+
     addDays,
-    recomputeSpendingTotals,
-    computeBudgetPace,
-    replaceTransactionBlock,
-    removeTransactionBlock,
-    canonicalizeFinanceTag,
     buildCategoryTag,
-    buildAllocatedExpenseSummary,
     buildCsv,
+    buildAllocatedExpenseSummary,
+    buildPlannedExpenseSummary,
     buildIncomeTag,
     buildInboxLine,
+    buildTransactionBlock,
     parseInboxLine,
     parseQuickAddInput,
+    isCurrencyCode,
     parseBankCsv,
     parseCsvRows,
     parseFlexibleDate,
     normalizeMerchant,
     transactionFingerprint,
-    canRollBudgetPeriodIntoSection,
+    recomputeSpendingTotals,
+    computeBudgetPace,
+    replaceTransactionBlock,
+    removeTransactionBlock,
+    canonicalizeFinanceTag,
     calculateSpendingSectionTotal,
+    canRollBudgetPeriodIntoSection,
     daysBetweenInclusive,
     displayCategoryPath,
     extractCategoryFromLogSpendingTag,
@@ -2733,12 +3079,11 @@ const core = (() => {
     formatOriginalCurrencyLabel,
     formatPlainNumber,
     groupTransactionsByCategory,
-    buildPlannedExpenseSummary,
-    getRemainingTripDaysInclusive,
-    getDailyBudgetSectionPeriods,
     insertTransactionIntoDailyNote,
     isDateInRange,
     isPlannedExpenseEntry,
+    getRemainingTripDaysInclusive,
+    getDailyBudgetSectionPeriods,
     normalizeCategoryPath,
     normalizeBudgetPeriod,
     normalizeCurrency,
@@ -2750,15 +3095,15 @@ const core = (() => {
     parseIsoDate,
     parseNumber,
     parseTransactionsFromNoteContent,
-    periodLengthDays,
     primaryCategory,
     roundCurrencyAmount,
     scaleBudgetLimit,
     splitHolidayEntries,
     summarizeGoalProgress,
-    toPeriodRange,
-    todayIsoLocal,
     titleCaseSegment,
+    toPeriodRange,
+    periodLengthDays,
+    todayIsoLocal,
   };
 })();
 
@@ -2791,17 +3136,6 @@ const DEFAULT_SETTINGS = {
   budgetArchiveFolderPath: "Utility/Budgets/Archive",
   defaultBudgetNoteName: "💸 Budgets.md",
   activeHolidayBudgetPath: "",
-  categoryOptions: [
-    "food/groceries",
-    "food/restaurants",
-    "food/snacks",
-    "transport",
-    "subscription",
-    "medical",
-    "clothes",
-    "kitesurf",
-    "uncategorized",
-  ],
   openDailyNoteAfterCapture: false,
   dashboardDefaultGroupBy: "primary",
   dashboardSliceLabelThreshold: 0.08,
@@ -2814,12 +3148,50 @@ const DEFAULT_SETTINGS = {
   processedExternalIds: [],
   recurringTagPrefix: "subscriptions",
   recurringNoteName: "🔁 Recurring Payments.md",
+  recurringSortOrder: "dueDate",
+  runwayPeriod: "1 month",
+  runwayMode: "spending",
   excludedRecurringItems: [],
   autoLogRecurring: false,
   quickAddUseNoteDate: false,
   tripModeActive: false,
   activeTripGoalPath: "",
+  schemaVersion: 1,
 };
+
+// Settings migrations run once and then never again, gated on the stored
+// `schemaVersion`. Before this existed every heal below re-ran on every single
+// load — cheap individually, but nothing recorded when one had done its job, so
+// none could ever safely be deleted. Add a step by appending an entry and
+// bumping DEFAULT_SETTINGS.schemaVersion; a migration whose `to` is older than
+// every install you care about can then just be dropped.
+const SETTINGS_MIGRATIONS = [
+  {
+    to: 1,
+    describe: "0.1–0.6 settings cleanup",
+    run(settings) {
+      // The finance section was called "## Spending" before 0.2.0.
+      if (!settings.spendingHeading || settings.spendingHeading === "## Spending") {
+        settings.spendingHeading = DEFAULT_SETTINGS.spendingHeading;
+      }
+      // 0.2.0 could persist a Journals folder template verbatim
+      // (e.g. "Journal/Daily/{{date:YYYY}}/{{date:MM}}").
+      if (String(settings.dailyNotesFolder || "").includes("{{")) {
+        settings.dailyNotesFolder = stripFolderTemplate(settings.dailyNotesFolder) || DEFAULT_SETTINGS.dailyNotesFolder;
+      }
+      if (settings.defaultBudgetNoteName === "Budget.md") {
+        settings.defaultBudgetNoteName = DEFAULT_SETTINGS.defaultBudgetNoteName;
+      }
+      // Drop keys from schemas this plugin no longer has: the pre-0.1.0
+      // csvExportFolder/categoryTagRoot/sourceTagRoot/budgetNotePath/
+      // shortcutGuidePath, and categoryOptions (suggestions come from history
+      // via collectKnownSuggestions, so the hand-maintained list did nothing).
+      for (const key of Object.keys(settings)) {
+        if (!(key in DEFAULT_SETTINGS)) delete settings[key];
+      }
+    },
+  },
+];
 
 const FINANCE_CAPTURE_ACTION = "finance-capture";
 const DASHBOARD_BLOCK = "finance-dashboard";
@@ -2831,26 +3203,39 @@ const FORECAST_BLOCK = "finance-forecast";
 const NETWORTH_BLOCK = "networth-dashboard";
 const QUERY_BLOCK = "finance-query";
 const GOALS_BLOCK = "finance-goals";
+const RUNWAY_BLOCK = "finance-runway";
 const DAILY_BUDGET_VIEW = "finance-tracker-daily";
-const RECURRING_CADENCE_LABELS = {
-  weekly: "Weekly",
-  fortnightly: "Fortnightly",
-  monthly: "Monthly",
-  quarterly: "Quarterly",
-  yearly: "Yearly",
-};
-
-// Reserved category key for bill-reserve contributions (`#log/income/billreserve`)
-// — a single shared envelope you top up like a savings goal, compared against
-// the accrued "should be set aside now" figure in the Bill reserve section.
-const BILL_RESERVE_KEY = "billreserve";
-
-function escapeHtml(value) {
-  return String(value || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+// Cadence display names live in core.RECURRING_CADENCES alongside the maths;
+// this reads them from there rather than keeping a second copy in sync.
+function cadenceLabel(cadence) {
+  return core.RECURRING_CADENCES[cadence]?.label || core.titleCaseSegment(cadence);
 }
+
+// The registry table's prose, written into the recurring payments note both
+// when the note is first created and when an older note is missing its table.
+// One copy, because two had already drifted apart.
+const RECURRING_REGISTRY_HELP = [
+  "Hand-editable per-bill state (the checkboxes in settings and the manage block",
+  "write to this table):",
+  "",
+  "- **Active** `no` pauses a bill; it moves to the Archived section, ready to resume.",
+  "- **Auto-log** `yes` logs it automatically on its due day.",
+  "- **Amount** overrides the inferred price.",
+  "- **Variable** `yes` suits a fluctuating bill like a utility: it projects off the",
+  "  average of recent payments rather than just the last one, and **Log now** prompts",
+  "  for the real amount each time.",
+  "- **Next Amount** + **Change Date** schedule a future price change, applied",
+  "  automatically once the date arrives.",
+  "- **Next Due** corrects the due-date schedule directly.",
+  "- **End Date** retires the bill once nothing is due on or before it — for a",
+  "  fixed-term contract.",
+  "- **Payments Left** retires it after that many more payments, counting down each",
+  "  time one is logged — for an instalment plan.",
+];
+
+// Runway is a computed display, not something you fund. Its only configuration
+// is a period and a mode, both plugin settings — there is no note, no balance and
+// no contribution.
 
 function sanitizeFilePart(value) {
   return String(value || "")
@@ -2888,7 +3273,7 @@ function parseFrontmatter(content) {
 
 function toTitleFromHolidayKey(holidayKey) {
   const normalized = core.normalizeHolidayKey(holidayKey);
-  if (!normalized) return "Holiday";
+  if (!normalized) return "Trip";
   const [year, name] = normalized.split("/");
   return `${String(name || "")
     .split(/[-_ ]+/)
@@ -3009,16 +3394,8 @@ function stripBudgetSuffix(value) {
 }
 
 function appendBudgetSuffix(value) {
-  const base = stripBudgetSuffix(value) || "Holiday";
+  const base = stripBudgetSuffix(value) || "Trip";
   return `${base} Budget`;
-}
-
-function parseTableDateValue(value) {
-  return core.parseIsoDate(value || "");
-}
-
-function parseTableLinkValue(value) {
-  return String(value || "").trim();
 }
 
 function parseWikiLinks(text) {
@@ -3030,77 +3407,81 @@ function parseWikiLinks(text) {
   })).filter((link) => link.path);
 }
 
-function extractPlannedLogMetadata(childLines = []) {
-  let startDate = "";
-  let endDate = "";
-  const detailLinks = [];
-  const detailLines = [];
-
-  for (const rawLine of childLines) {
-    const line = String(rawLine || "").trim();
-    if (!line) continue;
-    detailLines.push(line);
-
-    for (const link of parseWikiLinks(line)) {
-      detailLinks.push(link);
-    }
-
-    const dates = Array.from(line.matchAll(/\b\d{4}-\d{2}-\d{2}\b/g)).map((match) => core.parseIsoDate(match[0])).filter(Boolean);
-    if (!dates.length) continue;
-
-    const lower = line.toLowerCase();
-    if (dates.length >= 2) {
-      startDate = startDate || dates[0];
-      endDate = endDate || dates[1];
-      continue;
-    }
-
-    if (!startDate && (/\b(start|check[- ]?in|arrival|from)\b/.test(lower) || !endDate)) {
-      startDate = dates[0];
-      continue;
-    }
-
-    if (!endDate && /\b(end|check[- ]?out|departure|until|to)\b/.test(lower)) {
-      endDate = dates[0];
-      continue;
-    }
-
-    if (!endDate) {
-      endDate = dates[0];
-    }
-  }
-
-  if (startDate && !endDate) {
-    endDate = startDate;
-  }
-  if (endDate && !startDate) {
-    startDate = endDate;
-  }
-
-  return {
-    detailLines,
-    detailLinks,
-    endDate,
-    startDate,
-  };
-}
-
-function extractPlannedLineDates(line = "") {
-  const dates = Array.from(String(line || "").matchAll(/\b\d{4}-\d{2}-\d{2}\b/g))
-    .map((match) => core.parseIsoDate(match[0]))
-    .filter(Boolean);
-  if (!dates.length) {
-    return { startDate: "", endDate: "" };
-  }
-  return {
-    endDate: dates[1] || dates[0],
-    startDate: dates[0],
-  };
-}
-
 // Compact money label for tight layouts: whole dollars lose the ".00".
 function formatCurrencyShort(amount, currency) {
   return core.formatCurrency(amount, currency).replace(/\.00(?=\D|$)/, "");
+}
+
+// --- Shared card/row/button primitives ---------------------------------------
+// Every block used to hand-build these three shapes, which meant the type scale
+// and button weighting were re-decided (and re-diverged) at ~20 call sites.
+// They are decided once, here.
+
+// A strip of stat cards: small muted label above a large number, optionally a
+// third muted line for supporting detail that should not compete with it.
+function renderStatCards(host, cards) {
+  const grid = host.createDiv({ cls: "finance-tracker-summary" });
+  for (const card of (cards || []).filter(Boolean)) {
+    const element = grid.createDiv({ cls: `finance-tracker-summary-card${card.cls ? ` ${card.cls}` : ""}` });
+    element.createDiv({ cls: "finance-tracker-summary-label", text: card.label });
+    element.createDiv({ cls: "finance-tracker-summary-value", text: card.value });
+    if (card.hint) element.createDiv({ cls: "finance-tracker-summary-hint", text: card.hint });
+  }
+  return grid;
+}
+
+// A row's identity line: name left, money right and heavier — the way a receipt
+// reads. Call sites used to concatenate the two into one span at one weight,
+// which left the eye nothing to land on.
+function renderRowTitle(host, name, amount = "") {
+  const title = host.createDiv({ cls: "finance-tracker-budget-title ft-row-title" });
+  title.createSpan({ cls: "ft-row-name", text: name });
+  if (amount) title.createSpan({ cls: "ft-row-amount", text: amount });
+  return title;
+}
+
+// Buttons are quiet outlines by default; `primary` marks the single action a
+// row exists for. Also handles the disable-while-running / re-enable-on-failure
+// dance that all 50-odd call sites were repeating by hand.
+function addAction(host, label, onClick, options = {}) {
+  const button = host.createEl("button", { text: label });
+  if (options.primary) button.addClass("mod-cta");
+  if (options.warning) button.addClass("mod-warning");
+  if (options.tooltip) button.setAttribute("aria-label", options.tooltip);
+  button.addEventListener("click", async (event) => {
+    if (options.opensModal) {
+      onClick(event);
+      return;
+    }
+    button.disabled = true;
+    try {
+      await onClick(event);
+    } catch (error) {
+      new Notice(`${options.errorPrefix || label} failed: ${error.message}`);
+      button.disabled = false;
+    }
+  });
+  return button;
+}
+
+// A labelled checkbox for a genuine boolean. A button whose text reports its
+// own state ("Auto-log: on") is the weakest way to show one.
+function addToggleAction(host, label, checked, onChange) {
+  const wrapper = host.createEl("label", { cls: "ft-inline-toggle" });
+  const input = wrapper.createEl("input", { type: "checkbox" });
+  input.checked = Boolean(checked);
+  wrapper.createSpan({ text: label });
+  input.addEventListener("change", async () => {
+    input.disabled = true;
+    try {
+      await onChange(input.checked);
+    } catch (error) {
+      new Notice(`${label} failed: ${error.message}`);
+      input.checked = !input.checked;
+      input.disabled = false;
+    }
+  });
+  return wrapper;
 }
 
 // Reduces a possibly-templated folder path ("Journal/Daily/{{date:YYYY}}") to
@@ -3110,17 +3491,6 @@ function stripFolderTemplate(value) {
     .split("{{")[0]
     .replace(/\/+$/, "")
     .trim();
-}
-
-function normalizeCategoryOptions(value) {
-  const items = Array.isArray(value) ? value : String(value || "").split(/\r?\n|,/);
-  return Array.from(
-    new Set(
-      items
-        .map((item) => core.normalizeCategoryPath(item))
-        .filter(Boolean)
-    )
-  );
 }
 
 function polarToCartesian(centerX, centerY, radius, angleInDegrees) {
@@ -3185,7 +3555,7 @@ class FinanceTrackerPlugin extends Plugin {
 
     this.addCommand({
       id: "finance-tracker-export-csv",
-      name: "Export finance transactions to CSV",
+      name: "Export transactions to CSV",
       callback: async () => {
         const range = {
           period: "all",
@@ -3199,7 +3569,7 @@ class FinanceTrackerPlugin extends Plugin {
 
     this.addCommand({
       id: "finance-tracker-open-budgets",
-      name: "Open finance budgets note",
+      name: "Open budgets note",
       callback: async () => {
         await this.openBudgetNote();
       },
@@ -3207,7 +3577,7 @@ class FinanceTrackerPlugin extends Plugin {
 
     this.addCommand({
       id: "finance-tracker-add-exchange-rate",
-      name: "Add holiday exchange rate",
+      name: "Add trip exchange rate",
       callback: async () => {
         await this.openExchangeRateCommand();
       },
@@ -3265,6 +3635,10 @@ class FinanceTrackerPlugin extends Plugin {
       await this.renderGoalsBlock(source, el, ctx);
     });
 
+    this.registerMarkdownCodeBlockProcessor(RUNWAY_BLOCK, async (source, el, ctx) => {
+      await this.renderRunwayBlock(source, el, ctx);
+    });
+
     this.registerView(DAILY_BUDGET_VIEW, (leaf) => new DailyBudgetView(leaf, this));
 
     this.addRibbonIcon("coins", "Daily budget", () => this.activateDailyBudgetView());
@@ -3289,13 +3663,13 @@ class FinanceTrackerPlugin extends Plugin {
 
     this.addCommand({
       id: "finance-tracker-drain-inbox",
-      name: "Drain capture inbox now",
+      name: "Process capture inbox",
       callback: () => this.drainCaptureInbox({ notify: true }),
     });
 
     this.addCommand({
       id: "finance-tracker-reconcile-csv",
-      name: "Reconcile bank/Wise CSV against logged spending",
+      name: "Reconcile a bank CSV",
       callback: () => new BankReconcileModal(this.app, this).open(),
     });
 
@@ -3325,26 +3699,20 @@ class FinanceTrackerPlugin extends Plugin {
 
     this.addCommand({
       id: "finance-tracker-archive-finished-holidays",
-      name: "Archive finished holidays",
+      name: "Archive finished trips",
       callback: () => this.archiveFinishedHolidays({ notify: true }),
     });
 
     this.addCommand({
       id: "finance-tracker-archive-completed-goals",
-      name: "Archive completed savings goals",
+      name: "Archive completed goals",
       callback: () => this.archiveCompletedGoals({ notify: true }),
     });
 
     this.addCommand({
       id: "finance-tracker-contribute-goal",
-      name: "Contribute to savings goal",
+      name: "Contribute to a goal",
       callback: () => new ContributeGoalModal(this.app, this).open(),
-    });
-
-    this.addCommand({
-      id: "finance-tracker-contribute-bill-reserve",
-      name: "Contribute to bill reserve",
-      callback: () => new ContributeBillReserveModal(this.app, this).open(),
     });
 
     this.addCommand({
@@ -3355,8 +3723,14 @@ class FinanceTrackerPlugin extends Plugin {
 
     this.addCommand({
       id: "finance-tracker-setup",
-      name: "Run first-time setup",
+      name: "Set up finance notes",
       callback: () => new SetupWizardModal(this.app, this).open(),
+    });
+
+    this.addCommand({
+      id: "finance-tracker-repair-totals",
+      name: "Repair daily note totals",
+      callback: () => this.repairAllDailyNoteTotals(),
     });
 
     this.addCommand({
@@ -3365,40 +3739,15 @@ class FinanceTrackerPlugin extends Plugin {
       callback: () => new BalanceSnapshotModal(this.app, this).open(),
     });
 
-    const insertableBlocks = [
-      ["recurring", RECURRING_BLOCK, "Insert recurring payments block", ""],
-      ["splits", SPLITS_BLOCK, "Insert split expenses block", ""],
-      ["forecast", FORECAST_BLOCK, "Insert forecast block", "months: 6"],
-      ["networth", NETWORTH_BLOCK, "Insert net worth block", ""],
-      ["query", QUERY_BLOCK, "Insert finance query block", "period: month\ngroup: category\nview: table"],
-      ["goals", GOALS_BLOCK, "Insert goals block", ""],
-    ];
-    for (const [slug, block, name, body] of insertableBlocks) {
-      this.addCommand({
-        id: `finance-tracker-insert-${slug}`,
-        name,
-        editorCallback: (editor) => {
-          editor.replaceSelection(`\`\`\`${block}\n${body ? `${body}\n` : ""}\`\`\`\n`);
-        },
-      });
-    }
-
-    // Unlike the blocks above, these compute once and insert the finished
-    // numbers as plain text — a frozen snapshot for a year/quarter review
-    // note, not a live block that recomputes on every render.
-    for (const [period, name] of [
-      ["year", "Insert yearly review"],
-      ["quarter", "Insert quarterly review"],
-    ]) {
-      this.addCommand({
-        id: `finance-tracker-insert-${period}-review`,
-        name,
-        editorCallback: async (editor) => {
-          const lines = await this.buildPeriodReview(period);
-          editor.replaceSelection(`${lines.join("\n")}\n`);
-        },
-      });
-    }
+    // One palette entry instead of eight. Eight near-identical "Insert … block"
+    // rows made the command list harder to scan for the commands that actually
+    // do something, and picking a block is a choice better made in a list that
+    // can describe each one.
+    this.addCommand({
+      id: "finance-tracker-insert-block",
+      name: "Insert a finance block",
+      editorCallback: (editor) => new InsertBlockModal(this.app, this, editor).open(),
+    });
 
     this.app.workspace.onLayoutReady(() => {
       this.activateDailyBudgetView();
@@ -3416,11 +3765,6 @@ class FinanceTrackerPlugin extends Plugin {
         }, 3000);
       }
     });
-
-    // [hotfix 2026-06-12] DISABLED: journal-calendar spend-badge decoration caused an
-    // infinite MutationObserver <-> journals(Vue) re-render loop = 100% CPU freeze.
-    // Re-enable only after a source fix (disconnect observer during decoration + diff-before-mutate).
-    // this.setupJournalCalendarIntegration();
   }
 
   async setupCaptureInbox() {
@@ -3460,148 +3804,34 @@ class FinanceTrackerPlugin extends Plugin {
   }
 
   onunload() {
-    clearTimeout(this._calendarDecorationTimer);
     clearTimeout(this._inboxDrainTimer);
     clearTimeout(this._statusBarTimer);
-    if (this._journalCalendarObservers) {
-      for (const observer of this._journalCalendarObservers.values()) {
-        observer.disconnect();
-      }
-      this._journalCalendarObservers.clear();
-    }
-  }
-
-  setupJournalCalendarIntegration() {
-    this._journalCalendarObservers = new Map();
-    this._calendarDecorationTimer = null;
-
-    this.registerEvent(
-      this.app.workspace.on("layout-change", () => this._scheduleCalendarDecoration())
-    );
-    this.registerEvent(
-      this.app.vault.on("modify", (file) => {
-        const prefix = normalizePath(this.settings.dailyNotesFolder + "/");
-        if (file.path.startsWith(prefix)) {
-          this._scheduleCalendarDecoration();
-        }
-      })
-    );
-
-    this._scheduleCalendarDecoration();
-  }
-
-  _scheduleCalendarDecoration() {
-    clearTimeout(this._calendarDecorationTimer);
-    this._calendarDecorationTimer = setTimeout(() => this.decorateJournalCalendar(), 400);
-  }
-
-  async decorateJournalCalendar() {
-    this._decorating = true;
-    try {
-      const leaves = this.app.workspace.getLeavesOfType("journal-calendar");
-      for (const leaf of leaves) {
-        const containerEl = leaf.view?.containerEl;
-        if (!containerEl) continue;
-        await this.decorateJournalCalendarLeaf(containerEl);
-        this._watchJournalCalendarGrid(containerEl);
-      }
-    } finally {
-      setTimeout(() => { this._decorating = false; }, 50);
-    }
-  }
-
-  _watchJournalCalendarGrid(containerEl) {
-    if (!this._journalCalendarObservers || this._journalCalendarObservers.has(containerEl)) return;
-    const grid = containerEl.querySelector(".calendar-grid");
-    if (!grid) return;
-    const observer = new MutationObserver((mutations) => {
-      const hasExternalChange = mutations.some((m) =>
-        Array.from(m.addedNodes).some((n) => n.nodeType === 1 && !n.classList?.contains("finance-tracker-spend-badge")) ||
-        Array.from(m.removedNodes).some((n) => n.nodeType === 1 && !n.classList?.contains("finance-tracker-spend-badge"))
-      );
-      if (hasExternalChange && !this._decorating) this._scheduleCalendarDecoration();
-    });
-    observer.observe(grid, { childList: true, subtree: false });
-    this._journalCalendarObservers.set(containerEl, observer);
-  }
-
-  async decorateJournalCalendarLeaf(containerEl) {
-    const grid = containerEl.querySelector(".calendar-grid");
-    if (!grid) return;
-
-    const monthHeader = containerEl.querySelector(".month-header");
-    if (!monthHeader) return;
-
-    const headerButtons = Array.from(monthHeader.querySelectorAll("button.calendar-button"));
-    const monthText = headerButtons[0]?.textContent?.trim();
-    const yearText = headerButtons[1]?.textContent?.trim();
-    if (!monthText || !yearText) return;
-
-    const year = parseInt(yearText, 10);
-    const monthIndex = new Date(`${monthText} 1 2000`).getMonth();
-    if (isNaN(year) || isNaN(monthIndex)) return;
-
-    const month = monthIndex + 1;
-    const monthStr = String(month).padStart(2, "0");
-    const start = `${year}-${monthStr}-01`;
-    const end = `${year}-${monthStr}-31`;
-
-    const entries = await this.collectTransactionsForRange({ start, end });
-    const spendByDate = new Map();
-    for (const entry of entries) {
-      if (!core.isSpendingEntry(entry)) continue;
-      const iso = String(entry.date || "");
-      if (iso) spendByDate.set(iso, (spendByDate.get(iso) || 0) + core.entrySpendAmount(entry));
-    }
-
-    const dayCells = grid.querySelectorAll("button.calendar-button:not([data-outside]):not(.week-number)");
-    for (const cell of dayCells) {
-      cell.querySelector(".finance-tracker-spend-badge")?.remove();
-
-      let iso = null;
-      try {
-        const vueInstance = cell.__vueParentComponent?.parent;
-        const dateProp = vueInstance?.props?.date;
-        if (dateProp && /^\d{4}-\d{2}-\d{2}$/.test(dateProp)) iso = dateProp;
-      } catch (_) {}
-
-      if (!iso) {
-        const daySpan = cell.querySelector(".decoration-content span");
-        const day = parseInt((daySpan || cell).textContent?.trim(), 10);
-        if (!day || day > 31) continue;
-        iso = `${year}-${monthStr}-${String(day).padStart(2, "0")}`;
-      }
-
-      const totalSpend = spendByDate.get(iso);
-      if (!totalSpend) continue;
-
-      const dollars = Math.round(totalSpend);
-      const label = dollars >= 1000 ? `$${(dollars / 1000).toFixed(1)}k` : `$${dollars}`;
-      const decoration = cell.querySelector(".calendar-decoration");
-      const badge = document.createElement("span");
-      badge.className = "finance-tracker-spend-badge";
-      badge.textContent = label;
-      (decoration || cell).appendChild(badge);
-    }
   }
 
   async loadSettings() {
     const stored = await this.loadData();
     this._freshInstall = stored == null;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, stored);
-    if (!this.settings.spendingHeading || this.settings.spendingHeading === "## Spending") {
-      this.settings.spendingHeading = DEFAULT_SETTINGS.spendingHeading;
+
+    // A fresh install is born at the current schema; an existing one without a
+    // recorded version predates versioning and starts at 0.
+    const from = this._freshInstall ? DEFAULT_SETTINGS.schemaVersion : Number(stored?.schemaVersion) || 0;
+    const pending = SETTINGS_MIGRATIONS.filter((migration) => migration.to > from);
+    for (const migration of pending) {
+      migration.run(this.settings, this);
+      this.settings.schemaVersion = migration.to;
     }
-    this.settings.categoryOptions = normalizeCategoryOptions(this.settings.categoryOptions || DEFAULT_SETTINGS.categoryOptions);
+    this.settings.schemaVersion = DEFAULT_SETTINGS.schemaVersion;
+    this._settingsMigratedFrom = from;
+    if (pending.length) {
+      console.log(`[finance-tracker] migrated settings ${from} → ${this.settings.schemaVersion}`);
+      await this.saveSettings();
+    }
+
     // Auto-detect the daily-note folder and date format from the Journals
     // community plugin or the core Daily notes plugin, falling back to the
     // manual setting when neither is configured.
     this._dailyNoteFormat = "YYYY-MM-DD";
-    // Heal a templated folder that 0.2.0 could persist verbatim from the
-    // Journals config (e.g. "Journal/Daily/{{date:YYYY}}/{{date:MM}}").
-    if (String(this.settings.dailyNotesFolder || "").includes("{{")) {
-      this.settings.dailyNotesFolder = stripFolderTemplate(this.settings.dailyNotesFolder) || DEFAULT_SETTINGS.dailyNotesFolder;
-    }
     const journalsConfig = await this.readJournalsDailyConfig();
     const coreDailyNotesConfig = await this.readCoreDailyNotesConfig();
     const detected = journalsConfig || coreDailyNotesConfig;
@@ -3615,15 +3845,20 @@ class FinanceTrackerPlugin extends Plugin {
     if (detected?.format && core.formatDailyNoteName("2026-01-02", detected.format)) {
       this._dailyNoteFormat = detected.format;
     }
+    // The daily-note template (Journals or core Daily notes) so a brand-new
+    // daily note gets the user's real template pasted in — including running
+    // it through Templater when installed — instead of a bare-bones skeleton.
+    this._dailyNoteTemplatePath = String(detected?.template || "").trim();
     this.settings.budgetsFolderPath = this.settings.budgetsFolderPath || DEFAULT_SETTINGS.budgetsFolderPath;
     this.settings.budgetArchiveFolderPath = this.settings.budgetArchiveFolderPath || DEFAULT_SETTINGS.budgetArchiveFolderPath;
     this.settings.defaultBudgetNoteName = this.settings.defaultBudgetNoteName || DEFAULT_SETTINGS.defaultBudgetNoteName;
-    if (this.settings.defaultBudgetNoteName === "Budget.md") {
-      this.settings.defaultBudgetNoteName = DEFAULT_SETTINGS.defaultBudgetNoteName;
-    }
     this.settings.activeHolidayBudgetPath = this.settings.activeHolidayBudgetPath || "";
     this.settings.merchantMap = this.settings.merchantMap || {};
-    await this.migrateMerchantMapFile();
+    // Only pre-versioning installs can still have a markdown merchant map to
+    // fold in; skipping it otherwise saves a vault read on every single load.
+    if (this._settingsMigratedFrom < 1) {
+      await this.migrateMerchantMapFile();
+    }
   }
 
   async saveSettings() {
@@ -3653,7 +3888,11 @@ class FinanceTrackerPlugin extends Plugin {
         if (journal?.write?.type !== "day") continue;
         const folder = stripFolderTemplate(journal.folder);
         if (!folder) continue;
-        return { folder, format: String(journal.dateFormat || "YYYY-MM-DD").trim() };
+        return {
+          folder,
+          format: String(journal.dateFormat || "YYYY-MM-DD").trim(),
+          template: Array.isArray(journal.templates) ? journal.templates[0] : "",
+        };
       }
       return null;
     } catch (_error) {
@@ -3717,6 +3956,43 @@ class FinanceTrackerPlugin extends Plugin {
   buildMinimalDailyNote(date) {
     const iso = core.parseIsoDate(date) || core.todayIsoLocal();
     return `---\ndate: ${iso}\n---\n\n## Finance\n- [ ] #log/spending 0\n`;
+  }
+
+  // Creates a brand-new daily note the same way opening it from the calendar
+  // would: paste the user's real Journals/Daily-notes template — including
+  // running it through Templater when installed, since these templates are
+  // usually genuine Templater syntax (<% tp.file.title %> etc.), not the
+  // plain {{date}} tokens core Daily notes can substitute on its own — rather
+  // than silently replacing it with a bare-bones finance-only skeleton.
+  async createDailyNoteFromTemplate(path, date) {
+    const templatePath = String(this._dailyNoteTemplatePath || "").trim();
+    if (!templatePath) return this.upsertFile(path, this.buildMinimalDailyNote(date));
+
+    const templateFile =
+      this.app.vault.getAbstractFileByPath(normalizePath(templatePath)) ||
+      this.app.vault.getAbstractFileByPath(normalizePath(`${templatePath}.md`));
+    if (!(templateFile instanceof TFile)) return this.upsertFile(path, this.buildMinimalDailyNote(date));
+
+    await this.ensureFolder(normalizePath(path).split("/").slice(0, -1).join("/"));
+    const file = await _ftCreate(this.app, normalizePath(path), "");
+
+    const templater = this.app.plugins?.plugins?.["templater-obsidian"];
+    if (templater?.templater?.write_template_to_file) {
+      try {
+        await templater.templater.write_template_to_file(templateFile, file);
+        return file;
+      } catch (_error) {
+        // Fall through to a raw copy below — better a template with
+        // unrendered <% %> tags left in than no template at all.
+      }
+    }
+    try {
+      const raw = await this.app.vault.cachedRead(templateFile);
+      await _ftModify(this.app, file, raw);
+    } catch (_error) {
+      await _ftModify(this.app, file, this.buildMinimalDailyNote(date));
+    }
+    return file;
   }
 
   async upsertFile(path, content) {
@@ -3831,7 +4107,7 @@ class FinanceTrackerPlugin extends Plugin {
     const file =
       this.app.vault.getAbstractFileByPath(notePath) instanceof TFile
         ? this.app.vault.getAbstractFileByPath(notePath)
-        : await this.ensureTextFile(notePath, () => this.buildMinimalDailyNote(expense.date));
+        : await this.createDailyNoteFromTemplate(notePath, expense.date);
 
     const currentContent = await this.app.vault.cachedRead(file);
     const nextContent = core.insertTransactionIntoDailyNote(currentContent, expense, this.settings);
@@ -4332,6 +4608,45 @@ class FinanceTrackerPlugin extends Plugin {
     );
   }
 
+  // Recomputes the running total on every daily note in one pass. Individual
+  // notes already heal when opened, but that only reaches notes you happen to
+  // visit — this is for repairing a whole backlog at once (totals written
+  // before 0.7.0 could count digits inside a merchant or note line).
+  async repairAllDailyNoteTotals() {
+    const prefix = normalizePath(`${this.settings.dailyNotesFolder}/`);
+    const files = this.app.vault.getMarkdownFiles().filter((file) => file.path.startsWith(prefix));
+    if (!files.length) {
+      new Notice(`No daily notes found under ${this.settings.dailyNotesFolder}.`);
+      return 0;
+    }
+
+    const notice = new Notice(`Checking ${files.length} daily notes…`, 0);
+    let repaired = 0;
+    try {
+      for (const file of files) {
+        const content = await this.app.vault.cachedRead(file);
+        const next = core.recomputeSpendingTotals(content, this.settings);
+        if (next === content) continue;
+        await _ftModify(this.app, file, next);
+        this.invalidateIndexEntry(file.path);
+        repaired += 1;
+      }
+    } finally {
+      notice.hide();
+    }
+
+    new Notice(
+      repaired > 0
+        ? `Repaired the total on ${repaired} note${repaired === 1 ? "" : "s"}.`
+        : `All ${files.length} daily note totals were already correct.`
+    );
+    if (repaired > 0) {
+      this.refreshDailyBudgetView();
+      this._scheduleStatusBarUpdate();
+    }
+    return repaired;
+  }
+
   async reconcileDailyNoteTotal(target) {
     const file = target instanceof TFile ? target : this.app.vault.getAbstractFileByPath(target?.path || "");
     if (!(file instanceof TFile)) return;
@@ -4435,9 +4750,9 @@ class FinanceTrackerPlugin extends Plugin {
       for (const row of rows) {
         const item = String(row.item || row.name || row.expense || "").trim();
         const category = core.normalizeCategoryPath(row.category || row.group || "");
-        const startDate = parseTableDateValue(row.start || row.start_date || row["start date"] || "");
-        const endDate = parseTableDateValue(row.end || row.end_date || row["end date"] || "");
-        const link = parseTableLinkValue(row.link || row.note || row.location || "");
+        const startDate = core.parseIsoDate(row.start || row.start_date || row["start date"] || "");
+        const endDate = core.parseIsoDate(row.end || row.end_date || row["end date"] || "");
+        const link = String(row.link || row.note || row.location || "").trim();
         const allocated = core.parseNumber(row.allocated || row.allocation || row["allocated amount"]);
         const planned = core.parseNumber(row.planned || row.estimate || row.estimated);
         const booked = core.parseNumber(row.booked || row.committed || row.deposit);
@@ -4525,20 +4840,15 @@ class FinanceTrackerPlugin extends Plugin {
       fallbackName: String(filePath || "").split("/").pop()?.replace(/\.md$/i, "") || "Savings goal",
     });
     if (!goal) return null;
+    // Spread rather than enumerate. This used to list each field by hand, which
+    // silently dropped whatever parseGoalDefinition learned to return next — the
+    // reason runway goals were parsed correctly by core and then never activated.
     return {
+      ...goal,
       activeSavingsGoal: goal.active,
       archivedDate: goal.archivedDate || "",
-      carryMissedSavings: goal.carryMissedSavings,
-      currency: goal.currency,
-      dueDate: goal.dueDate,
       filePath,
       goalKey: goal.goalKey || buildGoalKeyFromName(goal.goalName || filePath),
-      goalName: goal.goalName,
-      goalType: goal.goalType,
-      savingsDisplayMode: goal.savingsDisplayMode,
-      savingsProgressMode: goal.savingsProgressMode,
-      startingBalance: goal.startingBalance,
-      targetAmount: goal.targetAmount,
     };
   }
 
@@ -4678,6 +4988,12 @@ class FinanceTrackerPlugin extends Plugin {
       return expense;
     }
 
+    // An entry that already carries both amounts was converted by hand — keep
+    // it exactly as typed rather than blanking the original or re-converting.
+    if (expense.fxProvided) {
+      return { ...expense, amount, currency: displayCurrency };
+    }
+
     if (!expense.currencyProvided || inputCurrency === displayCurrency) {
       return {
         ...expense,
@@ -4762,7 +5078,7 @@ class FinanceTrackerPlugin extends Plugin {
       "Set your whole-trip budget in the frontmatter above, then use the tables below to plan expected costs before you travel.",
       "Use `exchange_rates` for one flat rate across the whole trip, or `exchange_rate_periods` for date-specific overrides.",
       "",
-      "## Daily Holiday Dashboard",
+      "## Daily trip dashboard",
       "",
       "```holiday-dashboard",
       `holiday: ${normalizedHolidayKey}`,
@@ -4773,7 +5089,7 @@ class FinanceTrackerPlugin extends Plugin {
       "",
       "## Planned expenses",
       "",
-      "`Booked` means reserved or committed. If Booked is above 0 it overrides Planned for your remaining holiday budget.",
+      "`Booked` means reserved or committed. If Booked is above 0 it overrides Planned for your remaining trip budget.",
       "",
       "| Item | Category | Planned | Booked | Start | End | Link |",
       "| --- | --- | ---: | ---: | --- | --- | --- |",
@@ -4827,7 +5143,7 @@ class FinanceTrackerPlugin extends Plugin {
   }
 
   getHolidayBudgetNameFromPath(path) {
-    return stripBudgetSuffix(String(path || "").split("/").pop()?.replace(/\.md$/i, "")) || "Holiday";
+    return stripBudgetSuffix(String(path || "").split("/").pop()?.replace(/\.md$/i, "")) || "Trip";
   }
 
   getHolidayBudgetFiles() {
@@ -4864,7 +5180,7 @@ class FinanceTrackerPlugin extends Plugin {
       holidayName
         .replace(/[\\/:*?"<>|]/g, " ")
         .replace(/\s+/g, " ")
-        .trim() || "Holiday";
+        .trim() || "Trip";
     const holidayKey = core.normalizeHolidayKey(definition?.holidayKey || "") || guessHolidayTagFromName(holidayName);
     const fileName = appendBudgetSuffix(safeName);
     const budgetPath = normalizePath(`${this.settings.budgetsFolderPath}/${fileName}.md`);
@@ -4905,11 +5221,11 @@ class FinanceTrackerPlugin extends Plugin {
     if (!(activeFile instanceof TFile)) {
       this.settings.activeHolidayBudgetPath = "";
       await this.saveSettings();
-      new Notice("No active holiday budget to archive.");
+      new Notice("No active trip budget to archive.");
       return;
     }
     const archivePath = await this.archiveGoalNote(activeFile);
-    new Notice(`Archived holiday budget to ${archivePath}`);
+    new Notice(`Archived trip budget to ${archivePath}`);
   }
 
   // Archives one goal note: writes a frozen archive summary (savings steps and
@@ -4977,7 +5293,7 @@ class FinanceTrackerPlugin extends Plugin {
       new Notice(
         archivedNames.length
           ? `Archived ${archivedNames.length} finished holiday${archivedNames.length === 1 ? "" : "s"}: ${archivedNames.join(", ")}`
-          : "No finished holidays to archive."
+          : "No finished trips to archive."
       );
     }
     if (archivedNames.length) this.refreshDailyBudgetView();
@@ -5029,25 +5345,35 @@ class FinanceTrackerPlugin extends Plugin {
     return file;
   }
 
-  // The bill reserve is one shared envelope (not per-bill) you top up like a
-  // savings goal — "Saved so far" (the sum of these) is compared against
-  // "Should be set aside now" (the accrued figure computeRecurringReserve
-  // already calculates) so you can see whether you're ahead of or behind it.
-  async logBillReserveContribution(amount, date, note = "") {
-    const lines = [`- ${core.formatCurrency(amount, this.settings.defaultCurrency)} #log/income/${BILL_RESERVE_KEY}`];
-    lines.push(`\t- ${String(note || "").replace(/\s+/g, " ").trim() || "Bill reserve contribution"}`);
-    const file = await this.appendFinanceLines(date || core.todayIsoLocal(), lines);
-    this.refreshDailyBudgetView();
-    return file;
-  }
+  // --- Runway ---------------------------------------------------------------
+  // "Keep N of outgoings in the bank at all times." It is an ordinary goal note
+  // — contributions and withdrawals use the same tag grammar as every other
+  // goal — except its target is recomputed from the recurring schedule instead
+  // of being a number you typed. That is the only thing that makes it special,
+  // so everything else (the goals block, archiving, the settings list) gets it
+  // for free.
 
-  async getBillReserveSaved() {
-    const entries = await this.collectAllTransactions();
-    return core.roundCurrencyAmount(
-      entries
-        .filter((entry) => entry.entryType === "income" && core.normalizeCategoryPath(entry.category || "") === BILL_RESERVE_KEY)
-        .reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
-    );
+  // Runway: what you need available to be safe for the chosen period. Pure
+  // computation from the bills you have already logged, so there is nothing to
+  // set up and nothing to keep in sync.
+  async computeRunwayState(referenceDate, options = {}) {
+    const entries = options.entries || (await this.collectAllTransactions());
+    const recurring = options.recurring || (await this.detectRecurring(referenceDate));
+    const mode = core.normalizeRunwayMode(this.settings.runwayMode);
+    const recurringPrefix = this.settings.recurringTagPrefix || "subscriptions";
+    const forecast = mode === "spending"
+      ? core.computeForecastInputs(entries, recurring, {
+          referenceDate,
+          goalKeys: (await this.collectSavingsGoalDefinitions()).map((item) => item.goalKey),
+          recurringPrefix,
+        })
+      : null;
+    return core.computeRunway(recurring, {
+      referenceDate,
+      period: this.settings.runwayPeriod,
+      mode,
+      monthlyDiscretionary: forecast?.monthlyDiscretionary || 0,
+    });
   }
 
   buildRecurringNoteContent() {
@@ -5065,10 +5391,14 @@ class FinanceTrackerPlugin extends Plugin {
       "- A price change is just the next logged amount; the plugin always uses the latest —",
       "  or use **Edit** in manage mode to schedule a future change with an exact date, or",
       "  correct the next due date directly.",
+      "- **Push a week** moves just the next due date, leaving the cadence alone —",
+      "  for the month the rent lands late, not a permanent change.",
       "- Pausing a bill moves it into the **Archived** section below, collapsed until you open it;",
       "  from there you can **Resume** it or **Remove completely** so it's never tracked again.",
-      "- **Bill reserve** below is the sinking fund for bills: what should already be set",
-      "  aside so quarterly and yearly bills never surprise you, and the steady per-week amount that keeps it that way.",
+      "- A bill that stops on its own — a fixed-term contract, an instalment plan —",
+      "  gets an **End Date** or **Payments Left** in the registry and retires itself.",
+      "- **Runway** below is the savings side: how much of your outgoings you want covered",
+      "  at all times. Logging a bill draws it down automatically; top it up with Contribute.",
       "",
       "```finance-recurring",
       "manage: true",
@@ -5076,18 +5406,10 @@ class FinanceTrackerPlugin extends Plugin {
       "",
       "## Registry",
       "",
-      "Hand-editable per-bill state (the checkboxes in settings and the manage block",
-      "write to this table): set **Active** to `no` to pause a cancelled bill,",
-      "**Auto-log** to `yes` to log it automatically on its due day, fill",
-      "**Amount** to override the inferred price. Set **Variable** to `yes` for a",
-      "fluctuating bill like a utility — it projects off the average of its recent",
-      "payments instead of just the last one, and **Log now** prompts for the actual",
-      "amount each time rather than repeating a fixed one. Fill **Next Amount** +",
-      "**Change Date** to schedule a future price change — it's applied automatically",
-      "once the date arrives — and fill **Next Due** to correct the due-date schedule directly.",
+      ...RECURRING_REGISTRY_HELP,
       "",
-      "| Item | Cadence | Amount | Active | Auto-log | Variable | Next Amount | Change Date | Next Due |",
-      "| --- | --- | ---: | --- | --- | --- | ---: | --- | --- |",
+      core.RECURRING_REGISTRY_HEADER_ROW,
+      core.RECURRING_REGISTRY_SEPARATOR_ROW,
       "",
     ].join("\n");
   }
@@ -5150,7 +5472,7 @@ class FinanceTrackerPlugin extends Plugin {
       "**Contribute to savings goal** command (or a bullet like",
       "`- $150.00 #log/income/roadbike`) and nothing needs to move between real",
       "bank accounts. Create goals with **Create savings goal**; trips with",
-      "**Select or create holiday**.",
+      "**Select or create trip**.",
       "",
       "If several goals live inside one savings account, add",
       "`account: <your-account>` to the block below and take balance snapshots —",
@@ -5186,7 +5508,7 @@ class FinanceTrackerPlugin extends Plugin {
     if (!(budgetFile instanceof TFile)) return;
     const budgetMeta = await this.readHolidayBudgetFile(budgetFile);
     if (!budgetMeta) {
-      new Notice("Could not read that holiday budget note.");
+      new Notice("Could not read that trip budget note.");
       return;
     }
     await new Promise((resolve) => {
@@ -5372,7 +5694,9 @@ class FinanceTrackerPlugin extends Plugin {
         continue;
       }
       const generic = this.parseSavingsGoalContent(content, file.path);
-      if (generic?.goalKey) {
+      // A note left behind by the build where runway was briefly a goal would
+      // otherwise show up here as a savings goal with a $0 target.
+      if (generic?.goalKey && !generic.isLegacyRunwayNote) {
         goals.push({ ...generic, file });
       }
     }
@@ -5432,7 +5756,6 @@ class FinanceTrackerPlugin extends Plugin {
   }
 
   buildBudgetProgress(entries, budgets, range, groupBy, referenceDate, options = {}) {
-    const useFull = String(groupBy || "primary").toLowerCase() === "full";
     const realEntries = (entries || []).filter((entry) => core.isSpendingEntry(entry));
     const sectionPeriod = core.normalizeBudgetPeriod(options.sectionPeriod || range.period || "week");
     const includeRollup = Boolean(options.includeRollup);
@@ -5447,10 +5770,7 @@ class FinanceTrackerPlugin extends Plugin {
         const spent = realEntries
           .filter((entry) => {
             if (budget.category === "all") return true;
-            if (useFull) {
-              return entry.category === budget.category || String(entry.category || "").startsWith(`${budget.category}/`);
-            }
-            return core.primaryCategory(entry.category) === core.primaryCategory(budget.category);
+            return entry.category === budget.category || String(entry.category || "").startsWith(`${budget.category}/`);
           })
           .reduce((sum, entry) => sum + core.entrySpendAmount(entry), 0);
         const limit = core.scaleBudgetLimit(
@@ -5481,7 +5801,6 @@ class FinanceTrackerPlugin extends Plugin {
   }
 
   renderSummary(wrapper, entries, currency, range, options = {}) {
-    const cards = wrapper.createDiv({ cls: "finance-tracker-summary" });
     const total = entries.reduce((sum, entry) => sum + core.entrySpendAmount(entry), 0);
     const days = core.daysBetweenInclusive(range.start, range.end);
     const avgPerDay = days > 0 ? total / days : total;
@@ -5506,11 +5825,7 @@ class FinanceTrackerPlugin extends Plugin {
     }
     cardData.push({ label: "Top category", value: topCategory });
 
-    for (const card of cardData) {
-      const element = cards.createDiv({ cls: `finance-tracker-summary-card${card.cls ? ` ${card.cls}` : ""}` });
-      element.createDiv({ cls: "finance-tracker-summary-label", text: card.label });
-      element.createDiv({ cls: "finance-tracker-summary-value", text: card.value });
-    }
+    renderStatCards(wrapper, cardData);
   }
 
   renderSpendTrend(wrapper, entries, range, currency, options = {}) {
@@ -5612,6 +5927,15 @@ class FinanceTrackerPlugin extends Plugin {
   // Two-ring donut: the inner ring is the major categories, the outer ring is
   // every subcategory as a shade of its parent's hue. Falls back to a flat pie
   // when nothing has subcategories.
+  // Two bands, not three, and the outer band only exists where there is real
+  // detail to show.
+  //
+  // The previous version drew major / subcategory / leaf bands whenever *any*
+  // category had a subcategory, which meant a category with nothing beneath it
+  // got its wedge repeated three times in the same colour at the same angle —
+  // concentric duplicates separated by seams, which read as a broken chart. Now
+  // a category that does not split simply extends to the full radius, and the
+  // ring appears only over the categories that do.
   renderPieChart(wrapper, hierarchy, currency, threshold = 0.08) {
     const pieSection = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
     pieSection.createEl("h4", { text: "Category proportions" });
@@ -5622,14 +5946,24 @@ class FinanceTrackerPlugin extends Plugin {
       return;
     }
 
-    const hasSubcategories = hierarchy.groups.some((group) =>
-      group.children.some((child) => child.key !== group.key)
-    );
+    // The deepest genuine split under a major: its leaves where a subcategory
+    // splits further, else its subcategories, else nothing.
+    const splitOf = (group) => {
+      const parts = [];
+      for (const subgroup of group.children.filter((item) => item.total > 0)) {
+        const leaves = subgroup.children.filter((leaf) => leaf.total > 0 && leaf.key !== subgroup.key);
+        if (leaves.length > 1) parts.push(...leaves);
+        else parts.push(subgroup);
+      }
+      return parts.length > 1 || (parts.length === 1 && parts[0].key !== group.key) ? parts : [];
+    };
+
     const size = 460;
     const center = size / 2;
-    const outerRadius = 180;
-    const innerRadius = hasSubcategories ? 118 : outerRadius;
-    const ringInner = 126;
+    const outerRadius = 200;
+    const anySplit = hierarchy.groups.some((group) => splitOf(group).length);
+    const innerRadius = anySplit ? 128 : outerRadius;
+    const ringInner = 136;
 
     let angle = 0;
     const majorSlices = hierarchy.groups
@@ -5638,7 +5972,7 @@ class FinanceTrackerPlugin extends Plugin {
         const ratio = group.total / total;
         const startAngle = angle;
         angle += ratio * 360;
-        return { ...group, ratio, startAngle, endAngle: angle };
+        return { ...group, ratio, startAngle, endAngle: angle, split: splitOf(group) };
       });
 
     const chartLayout = pieSection.createDiv({ cls: "finance-tracker-pie-layout" });
@@ -5664,63 +5998,57 @@ class FinanceTrackerPlugin extends Plugin {
       el.addEventListener("pointerleave", () => tooltip.addClass("is-hidden"));
     };
 
+    const label = (text, x, y) =>
+      svg.createSvg("text", { cls: "finance-tracker-pie-label", text, attr: { x, y, "text-anchor": "middle" } });
+
     for (const slice of majorSlices) {
+      // A category with no further detail runs all the way out; one that splits
+      // stops at the inner radius and hands the outer band to its parts.
+      const radius = slice.split.length ? innerRadius : outerRadius;
       let majorEl;
       if (slice.ratio >= 0.999) {
         majorEl = svg.createSvg("circle", {
           cls: "finance-tracker-pie-slice",
-          attr: { cx: center, cy: center, r: innerRadius, fill: slice.color },
+          attr: { cx: center, cy: center, r: radius, fill: slice.color },
         });
       } else {
         majorEl = svg.createSvg("path", {
           cls: "finance-tracker-pie-slice",
-          attr: { d: describePieSlice(center, center, innerRadius, slice.startAngle, slice.endAngle), fill: slice.color },
+          attr: { d: describePieSlice(center, center, radius, slice.startAngle, slice.endAngle), fill: slice.color },
         });
       }
       attachTooltip(majorEl, slice.label, slice.total, slice.ratio);
+
       if (slice.ratio >= threshold) {
-        const labelPoint = centroidForSlice(center, center, innerRadius, slice.startAngle, slice.endAngle);
-        svg.createSvg("text", {
-          cls: "finance-tracker-pie-label",
-          text: slice.label,
-          attr: { x: labelPoint.x, y: labelPoint.y + (hasSubcategories ? 2 : -8), "text-anchor": "middle" },
-        });
-        if (!hasSubcategories) {
+        const point = centroidForSlice(center, center, radius, slice.startAngle, slice.endAngle);
+        label(slice.label, point.x, point.y + (slice.split.length ? 2 : -8));
+        if (!slice.split.length) {
           svg.createSvg("text", {
             cls: "finance-tracker-pie-value",
-            text: core.formatCurrency(slice.total, currency),
-            attr: { x: labelPoint.x, y: labelPoint.y + 12, "text-anchor": "middle" },
+            text: formatCurrencyShort(slice.total, currency),
+            attr: { x: point.x, y: point.y + 12, "text-anchor": "middle" },
           });
         }
       }
-    }
 
-    if (hasSubcategories) {
-      for (const slice of majorSlices) {
-        let childAngle = slice.startAngle;
-        for (const child of slice.children.filter((item) => item.total > 0)) {
-          const childRatio = child.total / total;
-          const childEnd = childAngle + childRatio * 360;
-          const childEl = svg.createSvg("path", {
-            cls: "finance-tracker-pie-slice",
-            attr: {
-              d: describeAnnularSlice(center, center, ringInner, outerRadius, childAngle, childEnd),
-              fill: child.color,
-            },
-          });
-          attachTooltip(childEl, child.label, child.total, childRatio);
-          if (childRatio >= threshold) {
-            const midAngle = childAngle + (childEnd - childAngle) / 2;
-            const labelPoint = polarToCartesian(center, center, (ringInner + outerRadius) / 2, midAngle);
-            const leaf = child.label.split(" / ").pop();
-            svg.createSvg("text", {
-              cls: "finance-tracker-pie-label",
-              text: leaf,
-              attr: { x: labelPoint.x, y: labelPoint.y + 4, "text-anchor": "middle" },
-            });
-          }
-          childAngle = childEnd;
+      let partAngle = slice.startAngle;
+      for (const part of slice.split) {
+        const partRatio = part.total / total;
+        const partEnd = partAngle + partRatio * 360;
+        const partEl = svg.createSvg("path", {
+          cls: "finance-tracker-pie-slice",
+          attr: {
+            d: describeAnnularSlice(center, center, ringInner, outerRadius, partAngle, partEnd),
+            fill: part.color,
+          },
+        });
+        attachTooltip(partEl, part.label, part.total, partRatio);
+        if (partRatio >= threshold) {
+          const mid = partAngle + (partEnd - partAngle) / 2;
+          const point = polarToCartesian(center, center, (ringInner + outerRadius) / 2, mid);
+          label(part.label.split(" / ").pop(), point.x, point.y + 4);
         }
+        partAngle = partEnd;
       }
     }
 
@@ -5836,10 +6164,11 @@ class FinanceTrackerPlugin extends Plugin {
       const pace = budget.pace;
       const status = this.budgetStatus(budget);
       item.addClass(status);
-      item.createDiv({
-        cls: "finance-tracker-budget-title",
-        text: `${budget.name} - ${core.formatCurrency(budget.spent, currency)} / ${core.formatCurrency(budget.effectiveLimit || budget.limit, currency)}`,
-      });
+      renderRowTitle(
+        item,
+        budget.name,
+        `${core.formatCurrency(budget.spent, currency)} / ${core.formatCurrency(budget.effectiveLimit || budget.limit, currency)}`
+      );
       const metaText =
         budget.remaining >= 0
           ? `${core.formatCurrency(budget.remaining, currency)} left`
@@ -5916,10 +6245,8 @@ class FinanceTrackerPlugin extends Plugin {
       const targetText = row.summary.currentPeriodContribution >= row.summary.requiredPerPeriod
         ? "On track for this period."
         : "Still below this period's target.";
-      item.createDiv({
-        cls: "finance-tracker-budget-title",
-        text: `${row.goal.goalName} - ${core.formatCurrency(row.contributedThisRange, row.currency)} contributed this ${range.period}`,
-      });
+      renderRowTitle(item, row.goal.goalName, core.formatCurrency(row.contributedThisRange, row.currency));
+      item.createDiv({ cls: "finance-tracker-budget-meta", text: `contributed this ${range.period}` });
       item.createDiv({
         cls: "finance-tracker-budget-meta",
         text: `${core.formatCurrency(row.summary.currentSaved, row.currency)} saved · ${core.formatCurrency(row.summary.amountRemaining, row.currency)} ${String(
@@ -5938,9 +6265,8 @@ class FinanceTrackerPlugin extends Plugin {
   }
 
   renderHolidaySummary(wrapper, metrics, currency) {
-    const cards = wrapper.createDiv({ cls: "finance-tracker-summary" });
     const cardData = [
-      { label: "Holiday budget", value: metrics.totalBudget > 0 ? core.formatCurrency(metrics.totalBudget, currency) : "Not set" },
+      { label: "Trip budget", value: metrics.totalBudget > 0 ? core.formatCurrency(metrics.totalBudget, currency) : "Not set" },
       { label: "Total spent", value: core.formatCurrency(metrics.totalSpent, currency) },
       { label: "Total spent %", value: metrics.totalBudget > 0 ? `${metrics.totalSpentPercent}%` : "Not set" },
       {
@@ -5958,11 +6284,7 @@ class FinanceTrackerPlugin extends Plugin {
       { label: "Avg food / day", value: core.formatCurrency(metrics.averageFoodPerDay, currency) },
     ];
 
-    for (const card of cardData) {
-      const element = cards.createDiv({ cls: "finance-tracker-summary-card" });
-      element.createDiv({ cls: "finance-tracker-summary-label", text: card.label });
-      element.createDiv({ cls: "finance-tracker-summary-value", text: card.value });
-    }
+    renderStatCards(wrapper, cardData);
   }
 
   renderPlannedExpenses(wrapper, plannedExpenses, currency) {
@@ -5972,7 +6294,7 @@ class FinanceTrackerPlugin extends Plugin {
     if (!plannedExpenses?.rows?.length) {
       section.createDiv({
         cls: "finance-tracker-empty",
-        text: "No planned trip costs found yet. Add rows to the Planned expenses table in the holiday budget note.",
+        text: "No planned trip costs found yet. Add rows to the Planned expenses table in the trip budget note.",
       });
       return;
     }
@@ -6023,7 +6345,7 @@ class FinanceTrackerPlugin extends Plugin {
     if (!allocatedExpenses?.rows?.length) {
       section.createDiv({
         cls: "finance-tracker-empty",
-        text: "No allocated in-trip costs found yet. Add rows to the Allocated expenses table in the holiday budget note.",
+        text: "No allocated in-trip costs found yet. Add rows to the Allocated expenses table in the trip budget note.",
       });
       return;
     }
@@ -6031,10 +6353,8 @@ class FinanceTrackerPlugin extends Plugin {
     const list = section.createDiv({ cls: "finance-tracker-budget-list" });
     for (const item of allocatedExpenses.rows) {
       const card = list.createDiv({ cls: "finance-tracker-budget-card" });
-      card.createDiv({
-        cls: "finance-tracker-budget-title",
-        text: `${item.item} - ${core.formatCurrency(item.allocated, currency)} · ${core.formatCurrency(item.allocatedPerDay, currency)}/day`,
-      });
+      renderRowTitle(card, item.item, core.formatCurrency(item.allocated, currency));
+      card.createDiv({ cls: "finance-tracker-budget-meta", text: `${core.formatCurrency(item.allocatedPerDay, currency)}/day` });
       if (item.link) {
         card.createDiv({
           cls: "finance-tracker-budget-meta",
@@ -6570,7 +6890,7 @@ class FinanceTrackerPlugin extends Plugin {
     if (!flatEntries.length && !periodEntries.length) {
       section.createDiv({
         cls: "finance-tracker-empty",
-        text: "No exchange rates configured yet. Add `exchange_rates` or `exchange_rate_periods` to the holiday budget frontmatter.",
+        text: "No exchange rates configured yet. Add `exchange_rates` or `exchange_rate_periods` to the trip budget frontmatter.",
       });
       return;
     }
@@ -6606,7 +6926,6 @@ class FinanceTrackerPlugin extends Plugin {
   renderSavingsSummary(wrapper, goal, summary, currency, extras = {}) {
     const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
     section.createEl("h4", { text: goal.goalName || "Savings goal" });
-    const cards = section.createDiv({ cls: "finance-tracker-summary" });
     const cardData = goal.goalType === "holiday"
       ? [
         { label: "Target", value: core.formatCurrency(summary.targetAmount, currency) },
@@ -6645,11 +6964,7 @@ class FinanceTrackerPlugin extends Plugin {
         cls: fund.status === "behind" || fund.status === "overdue" ? "is-over" : fund.status === "ahead" || fund.status === "complete" ? "is-down" : "",
       });
     }
-    for (const card of cardData) {
-      const element = cards.createDiv({ cls: `finance-tracker-summary-card${card.cls ? ` ${card.cls}` : ""}` });
-      element.createDiv({ cls: "finance-tracker-summary-label", text: card.label });
-      element.createDiv({ cls: "finance-tracker-summary-value", text: card.value });
-    }
+    renderStatCards(section, cardData);
   }
 
   async renderSavingsDashboard(source, el, ctx) {
@@ -6760,7 +7075,6 @@ class FinanceTrackerPlugin extends Plugin {
       return;
     }
 
-    const cards = wrapper.createDiv({ cls: "finance-tracker-summary" });
     const cardData = [
       { label: "Total spent", value: core.formatCurrency(reflection.totalSpent, currency) },
     ];
@@ -6797,11 +7111,7 @@ class FinanceTrackerPlugin extends Plugin {
         });
       }
     }
-    for (const card of cardData) {
-      const element = cards.createDiv({ cls: `finance-tracker-summary-card${card.cls ? ` ${card.cls}` : ""}` });
-      element.createDiv({ cls: "finance-tracker-summary-label", text: card.label });
-      element.createDiv({ cls: "finance-tracker-summary-value", text: card.value });
-    }
+    renderStatCards(wrapper, cardData);
 
     // Category breakdown: total, average per trip day, share, biggest single hit.
     if (reflection.categories.length) {
@@ -6895,7 +7205,7 @@ class FinanceTrackerPlugin extends Plugin {
       if (!holidayKey) {
         wrapper.createDiv({
           cls: "finance-tracker-empty",
-          text: "Set `holiday: 2026/japan` in this code block, or add a `holiday_tag` to the budget note frontmatter.",
+          text: "Set `trip: 2026/japan` in this code block, or add a `trip_tag` to the budget note frontmatter.",
         });
         return;
       }
@@ -6939,12 +7249,12 @@ class FinanceTrackerPlugin extends Plugin {
       });
 
       const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
-      const exportButton = headerActions.createEl("button", { text: "Export holiday CSV" });
+      const exportButton = headerActions.createEl("button", { text: "Export trip CSV" });
       exportButton.addEventListener("click", async () => {
         await this.exportEntriesToCsv(actualEntries, `holiday-${holidayKey.replace(/\//g, "-")}-${effectiveEnd || referenceDate}`);
       });
       if (budgetFile instanceof TFile) {
-        const budgetButton = headerActions.createEl("button", { text: "Open holiday budget" });
+        const budgetButton = headerActions.createEl("button", { text: "Open trip budget" });
         budgetButton.addEventListener("click", async () => {
           await this.app.workspace.getLeaf(true).openFile(budgetFile);
         });
@@ -6961,7 +7271,7 @@ class FinanceTrackerPlugin extends Plugin {
       const wrapper = el.createDiv({ cls: "finance-tracker-dashboard" });
       wrapper.createDiv({
         cls: "finance-tracker-empty",
-        text: `Holiday dashboard failed to render: ${error.message}`,
+        text: `Trip dashboard failed to render: ${error.message}`,
       });
       console.error("[finance-tracker] holiday dashboard render failed", error);
     }
@@ -6999,21 +7309,20 @@ class FinanceTrackerPlugin extends Plugin {
     const header = wrapper.createDiv({ cls: "finance-tracker-header" });
     header.createEl("h3", { text: "Daily budget" });
     const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
-    const budgetsButton = headerActions.createEl("button", { text: "Budgets" });
-    budgetsButton.addEventListener("click", async () => {
-      await this.openDefaultBudgetNote();
+    addAction(headerActions, "Add", () => new QuickAddTransactionModal(this.app, this).open(), {
+      primary: true,
+      opensModal: true,
+      tooltip: "Quick add a transaction",
     });
+    addAction(headerActions, "Budgets", () => this.openDefaultBudgetNote(), { errorPrefix: "Opening budgets note" });
 
-    // Summary cards: Today + This Period (+ holiday if active)
-    const summaryGrid = wrapper.createDiv({ cls: "finance-tracker-summary" });
-
-    const todayCard = summaryGrid.createDiv({ cls: "finance-tracker-summary-card" });
-    todayCard.createDiv({ cls: "finance-tracker-summary-label", text: "Today" });
-    todayCard.createDiv({ cls: "finance-tracker-summary-value", text: core.formatCurrency(core.roundCurrencyAmount(todayTotal), currency) });
-
-    const periodCard = summaryGrid.createDiv({ cls: "finance-tracker-summary-card" });
-    periodCard.createDiv({ cls: "finance-tracker-summary-label", text: core.titleCaseSegment(basePeriod) });
-    periodCard.createDiv({ cls: "finance-tracker-summary-value", text: core.formatCurrency(core.roundCurrencyAmount(periodTotal), currency) });
+    // Summary cards: Today + this period (+ trip cards when one is running).
+    // Collected first, rendered once, so the conditional cards join the same
+    // grid without each one re-deciding its own markup.
+    const summaryCards = [
+      { label: "Today", value: core.formatCurrency(core.roundCurrencyAmount(todayTotal), currency) },
+      { label: core.titleCaseSegment(basePeriod), value: core.formatCurrency(core.roundCurrencyAmount(periodTotal), currency) },
+    ];
 
     // Safe-to-spend per remaining day, derived from the "all" budget for this period.
     const allBudget = budgets.find(
@@ -7022,10 +7331,12 @@ class FinanceTrackerPlugin extends Plugin {
     if (allBudget) {
       const scaledLimit = core.scaleBudgetLimit(Number(allBudget.limit || 0), allBudget.period, periodRange, referenceDate, this.settings.weekStartsOn);
       const pace = core.computeBudgetPace({ limit: scaledLimit, spent: periodTotal, periodStart: periodRange.start, periodEnd: periodRange.end, referenceDate });
-      const leftCard = summaryGrid.createDiv({ cls: "finance-tracker-summary-card" });
-      if (pace.projected > scaledLimit) leftCard.addClass("is-over");
-      leftCard.createDiv({ cls: "finance-tracker-summary-label", text: "Left / day" });
-      leftCard.createDiv({ cls: "finance-tracker-summary-value", text: core.formatCurrency(pace.perDayRemaining, currency) });
+      summaryCards.push({
+        label: "Left / day",
+        value: core.formatCurrency(pace.perDayRemaining, currency),
+        cls: pace.projected > scaledLimit ? "is-over" : "",
+        hint: pace.remainingDays > 0 ? `${pace.remainingDays} day${pace.remainingDays === 1 ? "" : "s"} to go` : "",
+      });
     }
 
     let holidayContext = await this.findHolidayContextForDate(referenceDate);
@@ -7055,18 +7366,19 @@ class FinanceTrackerPlugin extends Plugin {
         .filter((entry) => entry.date === referenceDate)
         .reduce((sum, entry) => sum + core.entrySpendAmount(entry), 0);
 
-      const tripToday = summaryGrid.createDiv({ cls: "finance-tracker-summary-card is-trip" });
-      tripToday.createDiv({ cls: "finance-tracker-summary-label", text: `${tripName} today` });
-      tripToday.createDiv({ cls: "finance-tracker-summary-value", text: core.formatCurrency(core.roundCurrencyAmount(tripTodaySpend), tripCurrency) });
-
-      const tripRemaining = summaryGrid.createDiv({ cls: "finance-tracker-summary-card is-trip" });
-      tripRemaining.createDiv({ cls: "finance-tracker-summary-label", text: "Trip budget left" });
-      tripRemaining.createDiv({ cls: "finance-tracker-summary-value", text: core.formatCurrency(metrics.spendableRemaining, tripCurrency) });
-
-      const tripPerDay = summaryGrid.createDiv({ cls: "finance-tracker-summary-card is-trip" });
-      tripPerDay.createDiv({ cls: "finance-tracker-summary-label", text: "Safe / day" });
-      tripPerDay.createDiv({ cls: "finance-tracker-summary-value", text: core.formatCurrency(dailyCanSpend, tripCurrency) });
+      summaryCards.push(
+        { label: `${tripName} today`, value: core.formatCurrency(core.roundCurrencyAmount(tripTodaySpend), tripCurrency), cls: "is-trip" },
+        { label: "Trip budget left", value: core.formatCurrency(metrics.spendableRemaining, tripCurrency), cls: "is-trip" },
+        {
+          label: "Safe / day",
+          value: core.formatCurrency(dailyCanSpend, tripCurrency),
+          cls: "is-trip",
+          hint: metrics.remainingTripDays > 0 ? `${metrics.remainingTripDays} trip day${metrics.remainingTripDays === 1 ? "" : "s"} left` : "",
+        }
+      );
     }
+
+    renderStatCards(wrapper, summaryCards);
 
     // Mini pie chart (sidebar-friendly: SVG centred + compact legend below)
     const hierarchy = core.buildHierarchicalCategoryGroups(spendEntries, "primary");
@@ -7108,13 +7420,13 @@ class FinanceTrackerPlugin extends Plugin {
       goalsSection.createEl("h4", { text: "Savings goals" });
       for (const goal of savingsGoals) {
         const summary = await this.buildSavingsGoalSummary(goal, referenceDate);
-        const goalTotal = summary.currentSaved + summary.amountRemaining;
+        const goalTotal = summary.targetAmount > 0 ? summary.targetAmount : summary.currentSaved + summary.amountRemaining;
         const fillRatio = goalTotal > 0 ? summary.currentSaved / goalTotal : 0;
         const row = goalsSection.createDiv({ cls: "finance-tracker-budget-card" });
-        row.createDiv({ cls: "finance-tracker-budget-title", text: goal.goalName });
+        renderRowTitle(row, goal.goalName, core.formatCurrency(summary.currentSaved, goal.currency || currency));
         row.createDiv({
           cls: "finance-tracker-budget-meta",
-          text: `${core.formatCurrency(summary.currentSaved, goal.currency || currency)} of ${core.formatCurrency(goalTotal, goal.currency || currency)}`,
+          text: `of ${core.formatCurrency(goalTotal, goal.currency || currency)}`,
         });
         const bar = row.createDiv({ cls: "finance-tracker-budget-bar" });
         const fillEl = bar.createDiv({ cls: "finance-tracker-budget-fill is-good" });
@@ -7129,22 +7441,16 @@ class FinanceTrackerPlugin extends Plugin {
       splitsSection.createEl("h4", { text: `Owed to you (${core.formatCurrency(splitSummary.totalOutstanding, currency)})` });
       for (const person of splitSummary.people.filter((row) => row.outstanding > 0).slice(0, 6)) {
         const row = splitsSection.createDiv({ cls: "finance-tracker-budget-card" });
-        row.createDiv({
-          cls: "finance-tracker-budget-title",
-          text: `${person.displayName} — ${core.formatCurrency(person.outstanding, currency)}`,
-        });
-        const actions = row.createDiv({ cls: "finance-tracker-header-actions" });
-        const settleButton = actions.createEl("button", { text: "Settle up" });
-        settleButton.addEventListener("click", async () => {
-          settleButton.disabled = true;
-          try {
+        renderRowTitle(row, person.displayName, core.formatCurrency(person.outstanding, currency));
+        addAction(
+          row.createDiv({ cls: "finance-tracker-header-actions" }),
+          "Settle up",
+          async () => {
             await this.settleUpWithPerson(person.person, person.displayName, person.outstanding);
             this.refreshDailyBudgetView();
-          } catch (error) {
-            new Notice(`Settle up failed: ${error.message}`);
-            settleButton.disabled = false;
-          }
-        });
+          },
+          { primary: true, errorPrefix: "Settle up" }
+        );
       }
     }
 
@@ -7157,30 +7463,24 @@ class FinanceTrackerPlugin extends Plugin {
       recurringSection.createEl("h4", { text: `Recurring bills due (${dueRecurring.length})` });
       for (const item of dueRecurring.slice(0, 8)) {
         const row = recurringSection.createDiv({ cls: "finance-tracker-budget-card" });
-        row.createDiv({
-          cls: "finance-tracker-budget-title",
-          text: `${item.label} — ${core.formatCurrency(item.lastAmount, item.currency || currency)}`,
-        });
+        renderRowTitle(row, item.label, core.formatCurrency(item.lastAmount, item.currency || currency));
         row.createDiv({
           cls: "finance-tracker-budget-meta",
           text: item.status === "overdue" ? `overdue since ${item.nextDue}` : "due today",
         });
-        const actions = row.createDiv({ cls: "finance-tracker-header-actions" });
-        const logButton = actions.createEl("button", { text: "Log now" });
-        logButton.addEventListener("click", async () => {
-          if (item.variable) {
-            new LogVariableBillModal(this.app, this, item, () => this.refreshDailyBudgetView()).open();
-            return;
-          }
-          logButton.disabled = true;
-          try {
+        addAction(
+          row.createDiv({ cls: "finance-tracker-header-actions" }),
+          "Log now",
+          async () => {
+            if (item.variable) {
+              new LogVariableBillModal(this.app, this, item, () => this.refreshDailyBudgetView()).open();
+              return;
+            }
             await this.logRecurringNow(item);
             this.refreshDailyBudgetView();
-          } catch (error) {
-            new Notice(`Could not log ${item.label}: ${error.message}`);
-            logButton.disabled = false;
-          }
-        });
+          },
+          { primary: true, errorPrefix: `Logging ${item.label}`, opensModal: item.variable }
+        );
       }
     }
 
@@ -7191,9 +7491,7 @@ class FinanceTrackerPlugin extends Plugin {
       triage.createEl("h4", { text: `Needs a category (${needsCategory.length})` });
       for (const entry of needsCategory.slice(0, 12)) {
         const row = triage.createDiv({ cls: "finance-tracker-budget-card is-clickable is-uncategorized" });
-        const title = row.createDiv({ cls: "finance-tracker-budget-title" });
-        title.createSpan({ text: core.formatCurrency(entry.amount, currency) });
-        title.createSpan({ cls: "finance-tracker-budget-meta", text: ` · ${entry.merchant || entry.date}` });
+        renderRowTitle(row, entry.merchant || entry.date || "Untitled", core.formatCurrency(entry.amount, currency));
         row.addEventListener("click", () => new EditTransactionModal(this.app, this, entry).open());
       }
     }
@@ -7210,7 +7508,7 @@ class FinanceTrackerPlugin extends Plugin {
   async appendFinanceLines(date, newLines) {
     const notePath = this.getDailyNotePath(date);
     const existing = this.app.vault.getAbstractFileByPath(notePath);
-    const file = existing instanceof TFile ? existing : await this.ensureTextFile(notePath, () => this.buildMinimalDailyNote(date));
+    const file = existing instanceof TFile ? existing : await this.createDailyNoteFromTemplate(notePath, date);
     const content = await this.app.vault.cachedRead(file);
     const lines = String(content).replace(/\r\n/g, "\n").split("\n");
     const heading = (this.settings.spendingHeading || "## Finance").trim().toLowerCase();
@@ -7249,7 +7547,8 @@ class FinanceTrackerPlugin extends Plugin {
       referenceDate: today,
     });
     const applied = core.applyRecurringRegistry(detected, await this.loadRecurringRegistry(), today);
-    return this.excludeRemovedRecurringItems(applied);
+    const excluded = this.excludeRemovedRecurringItems(applied);
+    return { ...excluded, items: this.sortRecurringItems(excluded.items) };
   }
 
   // Bills the user chose to "remove completely" from the Archived section
@@ -7260,6 +7559,22 @@ class FinanceTrackerPlugin extends Plugin {
     const excluded = new Set(this.settings.excludedRecurringItems || []);
     if (!excluded.size) return applied;
     return { ...applied, items: applied.items.filter((item) => !excluded.has(item.name)) };
+  }
+
+  // "Due date" (the default) keeps finance-core's own ordering — overdue
+  // first, then due, then upcoming, each by next-due date ascending. The
+  // other orders are a flat re-sort layered on top, shared by every consumer
+  // (dashboard block, sidebar due-bills card, settings list) since they all
+  // go through detectRecurring.
+  sortRecurringItems(items) {
+    const order = this.settings.recurringSortOrder || "dueDate";
+    if (order === "dueDate") return items;
+    const sorted = [...items];
+    if (order === "amountDesc") sorted.sort((a, b) => (b.lastAmount || 0) - (a.lastAmount || 0));
+    else if (order === "amountAsc") sorted.sort((a, b) => (a.lastAmount || 0) - (b.lastAmount || 0));
+    else if (order === "nameAsc") sorted.sort((a, b) => String(a.label || "").localeCompare(String(b.label || "")));
+    else if (order === "monthlyCostDesc") sorted.sort((a, b) => (b.monthlyCost || 0) - (a.monthlyCost || 0));
+    return sorted;
   }
 
   async removeRecurringItemCompletely(item) {
@@ -7295,10 +7610,21 @@ class FinanceTrackerPlugin extends Plugin {
     const nextAmount = patch.nextAmount !== undefined ? patch.nextAmount : current.nextAmount;
     const changeDate = patch.changeDate !== undefined ? patch.changeDate : current.changeDate;
     const nextDue = patch.nextDue !== undefined ? patch.nextDue : current.nextDue;
-    const nextAmountCell = nextAmount > 0 ? core.formatPlainNumber(nextAmount) : "";
-    const changeDateCell = changeDate || "";
-    const nextDueCell = nextDue || "";
-    const row = `| ${item.name} | ${item.cadence} | ${amountCell} | ${active ? "yes" : "no"} | ${autoLog ? "yes" : "no"} | ${variable ? "yes" : "no"} | ${nextAmountCell} | ${changeDateCell} | ${nextDueCell} |`;
+    const endDate = patch.endDate !== undefined ? patch.endDate : current.endDate;
+    const paymentsLeft = patch.paymentsLeft !== undefined ? patch.paymentsLeft : current.paymentsLeft;
+    const row = `| ${[
+      item.name,
+      item.cadence,
+      amountCell,
+      active ? "yes" : "no",
+      autoLog ? "yes" : "no",
+      variable ? "yes" : "no",
+      nextAmount > 0 ? core.formatPlainNumber(nextAmount) : "",
+      changeDate || "",
+      nextDue || "",
+      endDate || "",
+      Number.isFinite(paymentsLeft) && paymentsLeft !== null ? String(paymentsLeft) : "",
+    ].join(" | ")} |`;
 
     const lines = String(content).replace(/\r\n/g, "\n").split("\n");
     const headerIndex = lines.findIndex(
@@ -7308,31 +7634,29 @@ class FinanceTrackerPlugin extends Plugin {
       if (lines.length && lines[lines.length - 1].trim()) lines.push("");
       lines.push("## Registry");
       lines.push("");
-      lines.push("Hand-editable per-bill state: Active no pauses a bill, Auto-log yes logs it on its due day, a filled Amount overrides the inferred price. Variable yes projects the average of recent payments instead of just the last one (for fluctuating bills like utilities) — Log now then prompts for the actual amount each time. Next Amount + Change Date schedule a future price change, applied automatically once the date arrives. Next Due overrides the computed due date — the schedule stays anchored to it even if a bill is logged late or early.");
+      lines.push(...RECURRING_REGISTRY_HELP);
       lines.push("");
-      lines.push("| Item | Cadence | Amount | Active | Auto-log | Variable | Next Amount | Change Date | Next Due |");
-      lines.push("| --- | --- | ---: | --- | --- | --- | ---: | --- | --- |");
+      lines.push(core.RECURRING_REGISTRY_HEADER_ROW);
+      lines.push(core.RECURRING_REGISTRY_SEPARATOR_ROW);
       lines.push(row);
       lines.push("");
     } else {
-      // Older notes have a narrower table (missing Next Amount/Change Date,
-      // Next Due, and/or Variable) — widen the header and every existing row
-      // in place so the table stays one consistent width and
-      // parseMarkdownTable keeps matching every row. Column counts seen in
-      // the wild: 5 (original), 7 (+ Next Amount/Change Date), 8 (+ Next Due).
-      // Variable slots in at position 5 (0-indexed), ahead of the columns
-      // added after it, so those need shifting rather than just padding.
-      const headerCellCount = lines[headerIndex].split("|").length - 2;
-      if (headerCellCount < 9) {
-        lines[headerIndex] = "| Item | Cadence | Amount | Active | Auto-log | Variable | Next Amount | Change Date | Next Due |";
-        lines[headerIndex + 1] = "| --- | --- | ---: | --- | --- | --- | ---: | --- | --- |";
+      // Older notes have a narrower table — widen the header and every existing
+      // row in place so the table stays one consistent width and
+      // parseMarkdownTable keeps matching every row. Column counts seen in the
+      // wild: 5 (original), 7 (+ Next Amount/Change Date), 8 (+ Next Due), 9
+      // (+ Variable), 11 (+ End Date/Payments Left). Variable slots in at
+      // position 5 (0-indexed), ahead of the columns added after it, so those
+      // need shifting rather than just padding.
+      const width = core.RECURRING_REGISTRY_COLUMNS.length;
+      if (lines[headerIndex].split("|").length - 2 < width) {
+        lines[headerIndex] = core.RECURRING_REGISTRY_HEADER_ROW;
+        lines[headerIndex + 1] = core.RECURRING_REGISTRY_SEPARATOR_ROW;
         for (let index = headerIndex + 2; index < lines.length && /^\s*\|/.test(lines[index]); index += 1) {
           const cells = lines[index].split("|").slice(1, -1).map((cell) => cell.trim());
-          // Insert a blank Variable cell at position 5 (0-indexed) if this row
-          // predates that column, i.e. it has 5, 7, or 8 cells rather than 9.
           if (cells.length === 5 || cells.length === 7 || cells.length === 8) cells.splice(5, 0, "");
-          while (cells.length < 9) cells.push("");
-          lines[index] = `| ${cells.slice(0, 9).join(" | ")} |`;
+          while (cells.length < width) cells.push("");
+          lines[index] = `| ${cells.slice(0, width).join(" | ")} |`;
         }
       }
 
@@ -7354,9 +7678,12 @@ class FinanceTrackerPlugin extends Plugin {
 
   async logRecurringItem(item, date, amountOverride) {
     const amount = Number.isFinite(amountOverride) && amountOverride > 0 ? amountOverride : item.lastAmount;
+    const logDate = date || core.todayIsoLocal();
     const bullet = [`\t- ${core.formatCurrency(amount, item.currency || this.settings.defaultCurrency)} ${item.tag}`];
     if (item.merchant) bullet.push(`\t\t- ${item.merchant}`);
-    return this.appendFinanceLines(date || core.todayIsoLocal(), bullet);
+    // No separate runway deduction is written: computeRunwayBalance derives the
+    // draw-down from this very bullet, so there is only ever one line per bill.
+    return this.appendFinanceLines(logDate, bullet);
   }
 
   // Shared "Log now" behavior for both the finance-recurring block and the
@@ -7368,10 +7695,23 @@ class FinanceTrackerPlugin extends Plugin {
   async logRecurringNow(item, amountOverride) {
     const logDate = core.todayIsoLocal();
     await this.logRecurringItem(item, logDate, amountOverride);
-    if (item.nextDue) {
-      await this.updateRecurringRegistryEntry(item, { nextDue: core.nextRecurringDate(item.nextDue, item.cadence) });
-    }
+    await this.advanceRecurringSchedule(item);
     return logDate;
+  }
+
+  // Moves a bill on by exactly one cycle after it has been logged: the next-due
+  // anchor steps forward, and a Payments Left countdown ticks down (reaching 0
+  // retires the bill in applyRecurringRegistry). Shared by Log now, Pay from
+  // reserve, Skip cycle, and the catch-up logger, so no path can advance one of
+  // the two and forget the other.
+  async advanceRecurringSchedule(item, patch = {}) {
+    const next = {};
+    if (item.nextDue) next.nextDue = core.nextRecurringDate(item.nextDue, item.cadence);
+    if (Number.isFinite(item.paymentsLeft) && item.paymentsLeft !== null) {
+      next.paymentsLeft = Math.max(0, item.paymentsLeft - 1);
+    }
+    if (!Object.keys(next).length && !Object.keys(patch).length) return;
+    await this.updateRecurringRegistryEntry(item, { ...next, ...patch });
   }
 
   // Logs every recurring item whose next-due date has arrived, dated on the due
@@ -7395,7 +7735,7 @@ class FinanceTrackerPlugin extends Plugin {
         // Keep any Next Due override advancing too — otherwise a stale
         // override would never move forward and the item would look
         // perpetually (re-)due on every future pass/check.
-        await this.updateRecurringRegistryEntry(item, { nextDue: core.nextRecurringDate(item.nextDue, item.cadence) });
+        await this.advanceRecurringSchedule(item);
         logged += 1;
       }
     }
@@ -7415,18 +7755,22 @@ class FinanceTrackerPlugin extends Plugin {
     const recurring = await this.detectRecurring(referenceDate, prefix);
 
     const manage = /^(?:true|yes|1)$/i.test(String(config.manage || ""));
-    const reserve = core.computeRecurringReserve(recurring, referenceDate);
+    const entries = await this.collectAllTransactions();
+    const runway = await this.computeRunwayState(referenceDate, { recurring, entries });
+    // "Due next 30 days" is the same forward walk the runway target uses, just
+    // over a fixed horizon, so it comes from the same helper.
+    const dueNext30Days = core.fromCents(
+      core.sumRecurringDueWithin(recurring, referenceDate, core.addDays(referenceDate, 30)).totalCents
+    );
 
     const wrapper = el.createDiv({ cls: "finance-tracker-dashboard" });
     const header = wrapper.createDiv({ cls: "finance-tracker-header" });
     header.createEl("h3", { text: config.title || "Recurring payments" });
     const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
-    const logDueButton = headerActions.createEl("button", { text: "Log all due" });
-    logDueButton.addEventListener("click", async () => {
-      logDueButton.disabled = true;
+    addAction(headerActions, "Log all due", async () => {
       await this.logDueRecurringPayments({ notify: true });
       await this.renderRecurringBlock(source, el, ctx);
-    });
+    }, { primary: true, errorPrefix: "Logging due payments" });
 
     if (!recurring.items.length) {
       wrapper.createDiv({
@@ -7436,198 +7780,221 @@ class FinanceTrackerPlugin extends Plugin {
       return;
     }
 
-    const cards = wrapper.createDiv({ cls: "finance-tracker-summary" });
-    const cardData = [
+    const activeCount = recurring.items.filter((item) => item.active !== false).length;
+    renderStatCards(wrapper, [
       { label: "Per month", value: core.formatCurrency(recurring.totals.monthly, currency) },
       { label: "Per year", value: core.formatCurrency(recurring.totals.yearly, currency) },
-      { label: "Due next 30 days", value: core.formatCurrency(reserve.totals.dueNext30Days, currency) },
-      { label: "Tracked items", value: String(recurring.items.length) },
-    ];
-    for (const card of cardData) {
-      const element = cards.createDiv({ cls: "finance-tracker-summary-card" });
-      element.createDiv({ cls: "finance-tracker-summary-label", text: card.label });
-      element.createDiv({ cls: "finance-tracker-summary-value", text: card.value });
-    }
+      { label: "Due next 30 days", value: core.formatCurrency(dueNext30Days, currency) },
+      { label: "Tracked bills", value: String(activeCount) },
+    ]);
+
+    const rerender = () => this.renderRecurringBlock(source, el, ctx);
 
     const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
     section.createEl("h4", { text: "Upcoming bills" });
-    const list = section.createDiv({ cls: "finance-tracker-budget-list" });
+    const list = section.createDiv({ cls: "finance-tracker-budget-list is-recurring-grid" });
     for (const item of recurring.items) {
-      // Paused bills live only in the Archived section below now, never inline.
+      // Paused and finished bills live only in the Archived section below.
       if (item.active === false) continue;
       const row = list.createDiv({ cls: "finance-tracker-budget-card finance-tracker-recurring-row" });
       if (item.status === "overdue") row.addClass("is-overdue");
-      const title = row.createDiv({ cls: "finance-tracker-budget-title" });
-      title.createSpan({ text: `${item.label} — ${core.formatCurrency(item.lastAmount, currency)}` });
+      renderRowTitle(row, item.label, core.formatCurrency(item.lastAmount, currency));
+
       const statusText =
         item.status === "overdue"
           ? `overdue since ${item.nextDue}`
           : item.status === "due"
             ? "due today"
             : `due ${item.nextDue}`;
-      const metaBits = [
-        RECURRING_CADENCE_LABELS[item.cadence] || core.titleCaseSegment(item.cadence),
-        statusText,
-        `${core.formatCurrency(item.monthlyCost, currency)}/month`,
-      ];
-      if (manage) metaBits.push(item.autoLog !== false ? "auto-log on" : "auto-log off");
+      const metaBits = [cadenceLabel(item.cadence), statusText, `${core.formatCurrency(item.monthlyCost, currency)}/month`];
       if (item.variable) metaBits.push("variable");
       if (item.nextAmount > 0 && item.changeDate) {
         metaBits.push(`changing to ${core.formatCurrency(item.nextAmount, currency)} on ${item.changeDate}`);
       }
-      row.createDiv({ cls: "finance-tracker-budget-meta", text: metaBits.join(" · ") });
-      if (manage) {
-        const stateActions = row.createDiv({ cls: "finance-tracker-header-actions" });
-        const pauseButton = stateActions.createEl("button", { text: "Pause" });
-        pauseButton.addEventListener("click", async () => {
-          pauseButton.disabled = true;
-          await this.updateRecurringRegistryEntry(item, { active: false });
-          await this.renderRecurringBlock(source, el, ctx);
-        });
-        const autoButton = stateActions.createEl("button", {
-          text: item.autoLog !== false ? "Auto-log: on" : "Auto-log: off",
-        });
-        autoButton.addEventListener("click", async () => {
-          autoButton.disabled = true;
-          await this.updateRecurringRegistryEntry(item, { autoLog: item.autoLog === false });
-          await this.renderRecurringBlock(source, el, ctx);
-        });
-        const editButton = stateActions.createEl("button", { text: "Edit" });
-        editButton.addEventListener("click", () => {
-          new EditRecurringItemModal(this.app, this, item, () => this.renderRecurringBlock(source, el, ctx)).open();
-        });
+      if (item.endDate) metaBits.push(`ends ${item.endDate}`);
+      if (Number.isFinite(item.paymentsLeft) && item.paymentsLeft !== null) {
+        metaBits.push(`${item.paymentsLeft} payment${item.paymentsLeft === 1 ? "" : "s"} left`);
       }
+      row.createDiv({ cls: "finance-tracker-budget-meta", text: metaBits.join(" \u00b7 ") });
+
       const isDue = item.status === "overdue" || item.status === "due";
       if (isDue || manage) {
+        // One primary action per row — the thing you came here to do — with
+        // everything else quiet beside it.
         const actions = row.createDiv({ cls: "finance-tracker-header-actions" });
-        const logButton = actions.createEl("button", { text: "Log now" });
-        logButton.addEventListener("click", async () => {
+        addAction(actions, "Log now", async () => {
           if (item.variable) {
-            new LogVariableBillModal(this.app, this, item, () => this.renderRecurringBlock(source, el, ctx)).open();
+            new LogVariableBillModal(this.app, this, item, rerender).open();
             return;
           }
-          logButton.disabled = true;
-          try {
-            const logDate = await this.logRecurringNow(item);
-            new Notice(`Logged ${item.label} for ${logDate}`);
-            await this.renderRecurringBlock(source, el, ctx);
-          } catch (error) {
-            new Notice(`Could not log ${item.label}: ${error.message}`);
-            logButton.disabled = false;
-          }
-        });
-        if (manage && item.nextDue) {
-          const skipButton = actions.createEl("button", { text: "Skip cycle" });
-          skipButton.addEventListener("click", async () => {
-            skipButton.disabled = true;
-            try {
-              await this.logRecurringSkip(item);
-              const nextDue = core.nextRecurringDate(item.nextDue, item.cadence);
-              await this.updateRecurringRegistryEntry(item, { nextDue });
-              new Notice(`Skipped ${item.label} — next due moves to ${nextDue}`);
-              await this.renderRecurringBlock(source, el, ctx);
-            } catch (error) {
-              new Notice(`Could not skip ${item.label}: ${error.message}`);
-              skipButton.disabled = false;
-            }
-          });
+          const logDate = await this.logRecurringNow(item);
+          new Notice(`Logged ${item.label} for ${logDate}`);
+          await rerender();
+        }, { primary: isDue, errorPrefix: `Logging ${item.label}`, opensModal: item.variable });
+
+        if (item.nextDue) {
+          // Moves only this occurrence; the cadence itself is untouched.
+          addAction(actions, "Push a week", async () => {
+            const nextDue = core.addDays(item.nextDue, 7);
+            await this.updateRecurringRegistryEntry(item, { nextDue });
+            new Notice(`${item.label} now due ${nextDue}`);
+            await rerender();
+          }, { errorPrefix: `Rescheduling ${item.label}`, tooltip: "Push just this occurrence back a week, keeping the cadence" });
         }
+
+        if (manage && item.nextDue) {
+          addAction(actions, "Skip cycle", async () => {
+            const nextDue = core.nextRecurringDate(item.nextDue, item.cadence);
+            await this.logRecurringSkip(item);
+            await this.advanceRecurringSchedule(item);
+            new Notice(`Skipped ${item.label} — next due moves to ${nextDue}`);
+            await rerender();
+          }, { errorPrefix: `Skipping ${item.label}`, tooltip: "Log a $0 entry and move on to the next cycle" });
+        }
+      }
+
+      if (manage) {
+        const stateActions = row.createDiv({ cls: "finance-tracker-header-actions is-secondary" });
+        addAction(stateActions, "Edit", () => {
+          new EditRecurringItemModal(this.app, this, item, rerender).open();
+        }, { opensModal: true });
+        addAction(stateActions, "Pause", async () => {
+          await this.updateRecurringRegistryEntry(item, { active: false });
+          await rerender();
+        }, { errorPrefix: `Pausing ${item.label}` });
+        addToggleAction(stateActions, "Auto-log", item.autoLog !== false, async (checked) => {
+          await this.updateRecurringRegistryEntry(item, { autoLog: checked });
+        });
       }
     }
 
-    // Archived (paused) bills: collapsed by default, out of the way of the
-    // active list, but still reachable to resume or drop for good.
+    // Archived bills: paused by hand, or retired by their own End Date /
+    // Payments Left. Collapsed by default, still reachable to resume or drop.
     const archivedItems = recurring.items.filter((item) => item.active === false);
     if (archivedItems.length) {
       const archiveDetails = wrapper.createEl("details", { cls: "finance-tracker-chart-card finance-tracker-archived" });
       archiveDetails.createEl("summary", { text: `Archived (${archivedItems.length})` });
-      const archiveList = archiveDetails.createDiv({ cls: "finance-tracker-budget-list" });
+      const archiveList = archiveDetails.createDiv({ cls: "finance-tracker-budget-list is-recurring-grid" });
       for (const item of archivedItems) {
         const row = archiveList.createDiv({ cls: "finance-tracker-budget-card finance-tracker-recurring-row is-paused" });
-        const title = row.createDiv({ cls: "finance-tracker-budget-title" });
-        title.createSpan({ text: `${item.label} — ${core.formatCurrency(item.lastAmount, currency)}` });
-        row.createDiv({
-          cls: "finance-tracker-budget-meta",
-          text: `${RECURRING_CADENCE_LABELS[item.cadence] || core.titleCaseSegment(item.cadence)} · paused`,
-        });
+        renderRowTitle(row, item.label, core.formatCurrency(item.lastAmount, currency));
+        const reason =
+          item.finishedReason === "end-date"
+            ? `ended ${item.endDate}`
+            : item.finishedReason === "payments"
+              ? "all payments made"
+              : "paused";
+        row.createDiv({ cls: "finance-tracker-budget-meta", text: `${cadenceLabel(item.cadence)} \u00b7 ${reason}` });
         const actions = row.createDiv({ cls: "finance-tracker-header-actions" });
-        const resumeButton = actions.createEl("button", { text: "Resume" });
-        resumeButton.addEventListener("click", async () => {
-          resumeButton.disabled = true;
-          await this.updateRecurringRegistryEntry(item, { active: true });
-          await this.renderRecurringBlock(source, el, ctx);
-        });
-        const removeButton = actions.createEl("button", { text: "Remove completely", cls: "mod-warning" });
-        removeButton.addEventListener("click", async () => {
-          removeButton.disabled = true;
+        // A finished bill needs its terms cleared before it can run again, so
+        // Resume is only the obvious next step for one that was merely paused.
+        addAction(actions, item.finished ? "Restart" : "Resume", async () => {
+          await this.updateRecurringRegistryEntry(item, {
+            active: true,
+            ...(item.finished ? { endDate: null, paymentsLeft: null } : {}),
+          });
+          await rerender();
+        }, { primary: !item.finished, errorPrefix: `Resuming ${item.label}` });
+        addAction(actions, "Remove completely", async () => {
           await this.removeRecurringItemCompletely(item);
           new Notice(`Removed ${item.label} — it won't be tracked as a recurring payment again.`);
-          await this.renderRecurringBlock(source, el, ctx);
-        });
+          await rerender();
+        }, { warning: true, errorPrefix: `Removing ${item.label}` });
       }
     }
 
-    // Bill reserve — the savings-goal side of recurring payments, in its own
-    // section: what should already be set aside so every cadence is covered
-    // when it lands, and the steady set-aside that keeps it that way.
-    if (reserve.rows.length) {
-      const reserveSection = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
-      const reserveHeader = reserveSection.createDiv({ cls: "finance-tracker-header" });
-      reserveHeader.createEl("h4", { text: "Bill reserve" });
-      const contributeButton = reserveHeader
-        .createDiv({ cls: "finance-tracker-header-actions" })
-        .createEl("button", { text: "Contribute" });
-      contributeButton.addEventListener("click", () => {
-        new ContributeBillReserveModal(this.app, this, () => this.renderRecurringBlock(source, el, ctx)).open();
-      });
-      reserveSection.createDiv({
+    this.renderRunwaySection(wrapper, runway, currency);
+  }
+
+
+  async renderRunwayBlock(source, el, ctx) {
+    el.empty();
+    const config = parseConfigBlock(source);
+    const referenceDate = this.getReferenceDateForSource(ctx.sourcePath);
+    const currency = core.normalizeCurrency(config.currency || this.settings.defaultCurrency);
+    const runway = await this.computeRunwayState(referenceDate);
+
+    const wrapper = el.createDiv({ cls: "finance-tracker-dashboard" });
+    const header = wrapper.createDiv({ cls: "finance-tracker-header" });
+    header.createEl("h3", { text: config.title || "Runway" });
+    addAction(
+      header.createDiv({ cls: "finance-tracker-header-actions" }),
+      "Bills",
+      () => this.openRecurringNote(),
+      { errorPrefix: "Opening recurring payments note" }
+    );
+    this.renderRunwaySection(wrapper, runway, currency, { standalone: true });
+  }
+
+  // Runway: how much you need available to be safe for the chosen period.
+  //
+  // Read-only by design. There is no balance to fund and no bookkeeping — it
+  // reads the bills you have already logged and tells you what the next window
+  // costs, so you know how much to leave in the account it comes out of.
+  renderRunwaySection(wrapper, runway, currency, options = {}) {
+    const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
+    if (!options.standalone) {
+      section.createEl("h4", { text: "Runway" });
+    }
+
+    if (!runway || runway.target <= 0) {
+      section.createDiv({
         cls: "finance-tracker-budget-meta",
-        text: "Money to keep set aside so bills never surprise you — accrued since each bill was last paid.",
+        text: `Nothing due between today and ${runway?.windowEnd || "the end of the window"}. Runway shows what your next ${
+          runway?.period || this.settings.runwayPeriod
+        } of outgoings costs once you have bills logged.`,
       });
-      const saved = await this.getBillReserveSaved();
-      const reserveCards = reserveSection.createDiv({ cls: "finance-tracker-summary" });
-      const reserveData = [
-        { label: "Should be set aside now", value: core.formatCurrency(reserve.totals.accrued, currency) },
-        { label: "Saved so far", value: core.formatCurrency(saved, currency) },
-        { label: "Set aside / week", value: core.formatCurrency(reserve.totals.perWeek, currency) },
-        { label: "Set aside / month", value: core.formatCurrency(reserve.totals.perMonth, currency) },
-        { label: "Set aside / quarter", value: core.formatCurrency(reserve.totals.perQuarter, currency) },
-      ];
-      for (const card of reserveData) {
-        const element = reserveCards.createDiv({ cls: "finance-tracker-summary-card" });
-        element.createDiv({ cls: "finance-tracker-summary-label", text: card.label });
-        element.createDiv({ cls: "finance-tracker-summary-value", text: card.value });
-      }
+      return;
+    }
 
-      // By cadence: weekly bills only need a per-week figure, but monthly (and
-      // longer) cadences need both — how much to set aside each week AND each
-      // month towards those specifically, kept separate from the combined
-      // totals above.
-      if (reserve.byCadence.length) {
-        reserveSection.createEl("h5", { text: "By cadence" });
-        const cadenceTable = reserveSection.createEl("table", { cls: "finance-tracker-table" });
-        const headRow = cadenceTable.createEl("thead").createEl("tr");
-        for (const label of ["Cadence", "Per week", "Per month", "Per quarter"]) {
-          headRow.createEl("th", { text: label });
-        }
-        const body = cadenceTable.createEl("tbody");
-        for (const row of reserve.byCadence) {
-          const tr = body.createEl("tr");
-          tr.createEl("td", { text: row.label });
-          tr.createEl("td", { text: core.formatCurrency(row.perWeek, currency), cls: "is-numeric" });
-          tr.createEl("td", { text: core.formatCurrency(row.perMonth, currency), cls: "is-numeric" });
-          tr.createEl("td", { text: core.formatCurrency(row.perQuarter, currency), cls: "is-numeric" });
-        }
-      }
+    const covers = runway.mode === "bills" ? "recurring bills only" : "bills due plus your usual spending";
 
-      const reserveList = reserveSection.createDiv({ cls: "ft-budget-rows" });
-      for (const row of reserve.rows.filter((item) => item.accrued > 0).slice(0, 10)) {
-        const line = reserveList.createDiv({ cls: "ft-budget-row" });
+    const headline = section.createDiv({ cls: "finance-tracker-forecast-headline" });
+    headline.setText(`Keep ${core.formatCurrency(runway.target, currency)} available for the next ${runway.period}`);
+    section.createDiv({
+      cls: "finance-tracker-budget-meta",
+      // Sentence-case, not title-case: titleCaseSegment turned this fragment
+      // into "Recurring Bills Only, between today and …".
+      text: `${covers.charAt(0).toUpperCase()}${covers.slice(1)}, between today and ${runway.windowEnd}. Change the period or what counts in Settings → Runway.`,
+    });
+
+    renderStatCards(section, [
+      {
+        label: `Next ${runway.period}`,
+        value: core.formatCurrency(runway.target, currency),
+        hint:
+          runway.mode === "spending" && runway.discretionary > 0
+            ? `${core.formatCurrency(runway.bills, currency)} bills + ${core.formatCurrency(runway.discretionary, currency)} spending`
+            : `${runway.occurrences.length} bill${runway.occurrences.length === 1 ? "" : "s"} due`,
+      },
+      { label: "Per week", value: core.formatCurrency(runway.perWeek, currency) },
+      { label: "Per day", value: core.formatCurrency(runway.perDay, currency) },
+      {
+        label: "Bills due",
+        value: String(runway.occurrences.length),
+        hint: runway.occurrences.length ? `next on ${runway.occurrences[0].date}` : "",
+      },
+    ]);
+
+    if (runway.occurrences.length) {
+      section.createEl("h5", { text: `What makes up the ${runway.period}` });
+      const list = section.createDiv({ cls: "ft-budget-rows" });
+      for (const occurrence of runway.occurrences.slice(0, 12)) {
+        const line = list.createDiv({ cls: "ft-budget-row" });
         const top = line.createDiv({ cls: "ft-budget-row-top" });
-        top.createSpan({ cls: "ft-budget-row-name", text: row.label });
-        top.createSpan({
-          cls: "ft-budget-row-value",
-          text: `${formatCurrencyShort(row.accrued, currency)} accrued · ${formatCurrencyShort(row.perWeek, currency)}/wk`,
+        top.createSpan({ cls: "ft-budget-row-name", text: `${occurrence.label} · ${occurrence.date}` });
+        top.createSpan({ cls: "ft-budget-row-value", text: formatCurrencyShort(occurrence.amount, currency) });
+      }
+      if (runway.occurrences.length > 12) {
+        section.createDiv({
+          cls: "finance-tracker-budget-meta",
+          text: `+ ${runway.occurrences.length - 12} more bills in the window.`,
+        });
+      }
+      if (runway.mode === "spending" && runway.discretionary > 0) {
+        section.createDiv({
+          cls: "finance-tracker-budget-meta",
+          text: `Plus ${core.formatCurrency(runway.discretionary, currency)} of usual spending, from your average over the last 90 days.`,
         });
       }
     }
@@ -7690,18 +8057,21 @@ class FinanceTrackerPlugin extends Plugin {
       return;
     }
 
-    const cards = wrapper.createDiv({ cls: "finance-tracker-summary" });
-    const totalCard = cards.createDiv({ cls: "finance-tracker-summary-card" });
-    totalCard.createDiv({ cls: "finance-tracker-summary-label", text: "Outstanding" });
-    totalCard.createDiv({ cls: "finance-tracker-summary-value", text: core.formatCurrency(splits.totalOutstanding, currency) });
+    const owedCount = splits.people.filter((person) => person.outstanding > 0).length;
+    renderStatCards(wrapper, [
+      {
+        label: "Outstanding",
+        value: core.formatCurrency(splits.totalOutstanding, currency),
+        hint: owedCount ? `across ${owedCount} ${owedCount === 1 ? "person" : "people"}` : "everyone settled up",
+      },
+    ]);
 
     const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
     section.createEl("h4", { text: "Balances by person" });
     const list = section.createDiv({ cls: "finance-tracker-budget-list" });
     for (const personRow of splits.people) {
       const row = list.createDiv({ cls: "finance-tracker-budget-card" });
-      const title = row.createDiv({ cls: "finance-tracker-budget-title" });
-      title.createSpan({ text: `${personRow.displayName} owes ${core.formatCurrency(personRow.outstanding, currency)}` });
+      renderRowTitle(row, personRow.displayName, core.formatCurrency(personRow.outstanding, currency));
       const openEntries = personRow.entries.filter((item) => !item.settled);
       for (const item of openEntries.slice(0, 8)) {
         row.createDiv({
@@ -7710,18 +8080,15 @@ class FinanceTrackerPlugin extends Plugin {
         });
       }
       if (personRow.outstanding > 0) {
-        const actions = row.createDiv({ cls: "finance-tracker-header-actions" });
-        const settleButton = actions.createEl("button", { text: "Settle up" });
-        settleButton.addEventListener("click", async () => {
-          settleButton.disabled = true;
-          try {
+        addAction(
+          row.createDiv({ cls: "finance-tracker-header-actions" }),
+          "Settle up",
+          async () => {
             await this.settleUpWithPerson(personRow.person, personRow.displayName, personRow.outstanding);
             await this.renderSplitsBlock(source, el, ctx);
-          } catch (error) {
-            new Notice(`Settle up failed: ${error.message}`);
-            settleButton.disabled = false;
-          }
-        });
+          },
+          { primary: true, errorPrefix: "Settle up" }
+        );
       } else {
         row.createDiv({ cls: "finance-tracker-budget-meta", text: "All settled ✅" });
       }
@@ -7741,8 +8108,10 @@ class FinanceTrackerPlugin extends Plugin {
     const header = wrapper.createDiv({ cls: "finance-tracker-header" });
     header.createEl("h3", { text: config.title || "Net worth" });
     const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
-    const snapshotButton = headerActions.createEl("button", { text: "Snapshot balances" });
-    snapshotButton.addEventListener("click", () => new BalanceSnapshotModal(this.app, this).open());
+    addAction(headerActions, "Snapshot balances", () => new BalanceSnapshotModal(this.app, this).open(), {
+      primary: true,
+      opensModal: true,
+    });
 
     if (!summary.accounts.length) {
       wrapper.createDiv({
@@ -7752,7 +8121,6 @@ class FinanceTrackerPlugin extends Plugin {
       return;
     }
 
-    const cards = wrapper.createDiv({ cls: "finance-tracker-summary" });
     const cardData = [{ label: "Net worth", value: core.formatCurrency(summary.latestTotal, currency) }];
     if (Number.isFinite(summary.previousTotal)) {
       const delta = core.roundCurrencyAmount(summary.latestTotal - summary.previousTotal);
@@ -7763,11 +8131,7 @@ class FinanceTrackerPlugin extends Plugin {
       });
     }
     cardData.push({ label: "Accounts", value: String(summary.accounts.length) });
-    for (const card of cardData) {
-      const element = cards.createDiv({ cls: `finance-tracker-summary-card${card.cls ? ` ${card.cls}` : ""}` });
-      element.createDiv({ cls: "finance-tracker-summary-label", text: card.label });
-      element.createDiv({ cls: "finance-tracker-summary-value", text: card.value });
-    }
+    renderStatCards(wrapper, cardData);
 
     this.renderLineChartCard(wrapper, "Balance trend", summary.series.map((point) => ({ date: point.date, value: point.total })), {
       emptyText: "Take a second snapshot to draw the trend line.",
@@ -7778,10 +8142,7 @@ class FinanceTrackerPlugin extends Plugin {
     const list = section.createDiv({ cls: "finance-tracker-budget-list" });
     for (const account of summary.accounts) {
       const row = list.createDiv({ cls: "finance-tracker-budget-card" });
-      row.createDiv({
-        cls: "finance-tracker-budget-title",
-        text: `${account.label} — ${core.formatCurrency(account.latest?.amount || 0, currency)}`,
-      });
+      renderRowTitle(row, account.label, core.formatCurrency(account.latest?.amount || 0, currency));
       row.createDiv({ cls: "finance-tracker-budget-meta", text: `As of ${account.latest?.date || "?"} · ${account.history.length} snapshot${account.history.length === 1 ? "" : "s"}` });
     }
   }
@@ -7837,7 +8198,6 @@ class FinanceTrackerPlugin extends Plugin {
     const headline = wrapper.createDiv({ cls: "finance-tracker-forecast-headline" });
     headline.createSpan({ text: `~${core.formatCurrency(projection.endBalance, currency)} by ${projection.endDate}` });
 
-    const cards = wrapper.createDiv({ cls: "finance-tracker-summary" });
     const cardData = [
       { label: "Income / month", value: core.formatCurrency(core.parseNumber(config.income) ?? inputs.monthlyIncome, currency) },
       { label: "Recurring bills / month", value: core.formatCurrency(core.parseNumber(config.bills) ?? inputs.monthlyBills, currency) },
@@ -7849,11 +8209,7 @@ class FinanceTrackerPlugin extends Plugin {
         cls: projection.monthlyNet < 0 ? "is-up" : "is-down",
       },
     ];
-    for (const card of cardData) {
-      const element = cards.createDiv({ cls: `finance-tracker-summary-card${card.cls ? ` ${card.cls}` : ""}` });
-      element.createDiv({ cls: "finance-tracker-summary-label", text: card.label });
-      element.createDiv({ cls: "finance-tracker-summary-value", text: card.value });
-    }
+    renderStatCards(wrapper, cardData);
 
     this.renderLineChartCard(
       wrapper,
@@ -7962,14 +8318,18 @@ class FinanceTrackerPlugin extends Plugin {
     const header = wrapper.createDiv({ cls: "finance-tracker-header" });
     header.createEl("h3", { text: config.title || "Savings goals" });
     const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
-    const contributeButton = headerActions.createEl("button", { text: "Contribute" });
-    contributeButton.addEventListener("click", () => new ContributeGoalModal(this.app, this).open());
+    addAction(headerActions, "Contribute", () => new ContributeGoalModal(this.app, this).open(), {
+      primary: true,
+      opensModal: true,
+    });
 
-    const goals = (await this.collectSavingsGoalDefinitions()).filter((goal) => !activeOnly || goal.activeSavingsGoal);
+    const goals = (await this.collectSavingsGoalDefinitions()).filter(
+      (goal) => !activeOnly || goal.activeSavingsGoal
+    );
     if (!goals.length) {
       wrapper.createDiv({
         cls: "finance-tracker-empty",
-        text: "No goal notes yet. Create one with the Create savings goal command, or a trip via Select or create holiday.",
+        text: "No goal notes yet. Create one with the Create savings goal command, or a trip via Select or create trip.",
       });
       return;
     }
@@ -7985,7 +8345,6 @@ class FinanceTrackerPlugin extends Plugin {
       const balances = core.summarizeBalanceSnapshots(await this.collectAllTransactions());
       const account = balances.accounts.find((item) => item.key === accountKey);
       const allocated = core.roundCurrencyAmount(rows.reduce((sum, row) => sum + Number(row.summary.currentAccountBalance || 0), 0));
-      const cards = wrapper.createDiv({ cls: "finance-tracker-summary" });
       const accountBalance = account?.latest?.amount;
       const cardData = [
         {
@@ -8002,11 +8361,7 @@ class FinanceTrackerPlugin extends Plugin {
           cls: unallocated < 0 ? "is-over" : "",
         });
       }
-      for (const card of cardData) {
-        const element = cards.createDiv({ cls: `finance-tracker-summary-card${card.cls ? ` ${card.cls}` : ""}` });
-        element.createDiv({ cls: "finance-tracker-summary-label", text: card.label });
-        element.createDiv({ cls: "finance-tracker-summary-value", text: card.value });
-      }
+      renderStatCards(wrapper, cardData);
       if (!Number.isFinite(accountBalance)) {
         wrapper.createDiv({
           cls: "finance-tracker-budget-meta",
@@ -8019,11 +8374,14 @@ class FinanceTrackerPlugin extends Plugin {
     const list = section.createDiv({ cls: "finance-tracker-budget-list" });
     for (const { goal, summary } of rows) {
       const card = list.createDiv({ cls: "finance-tracker-budget-card" });
-      const title = card.createDiv({ cls: "finance-tracker-budget-title" });
-      title.createSpan({ text: `${goal.goalName} — ${core.formatCurrency(summary.currentSaved, goal.currency || currency)}` });
-      if (goal.targetAmount > 0) {
-        title.createSpan({ cls: "finance-tracker-budget-meta", text: ` of ${core.formatCurrency(goal.targetAmount, goal.currency || currency)}` });
-      }
+      const goalCurrency = goal.currency || currency;
+      renderRowTitle(
+        card,
+        goal.goalName,
+        summary.targetAmount > 0
+          ? `${core.formatCurrency(summary.currentSaved, goalCurrency)} / ${core.formatCurrency(summary.targetAmount, goalCurrency)}`
+          : core.formatCurrency(summary.currentSaved, goalCurrency)
+      );
       const bits = [];
       if (goal.goalType === "holiday") bits.push("trip");
       if (!goal.activeSavingsGoal) bits.push("inactive");
@@ -8036,15 +8394,16 @@ class FinanceTrackerPlugin extends Plugin {
         bits.push(paceLabels[summary.sinkingFund.status] || summary.sinkingFund.status);
       }
       if (bits.length) card.createDiv({ cls: "finance-tracker-budget-meta", text: bits.join(" · ") });
-      const goalTotal = goal.targetAmount > 0 ? goal.targetAmount : summary.currentSaved;
+      const goalTotal = summary.targetAmount > 0 ? summary.targetAmount : summary.currentSaved;
       const bar = card.createDiv({ cls: "finance-tracker-budget-bar" });
       const fill = bar.createDiv({ cls: "finance-tracker-budget-fill is-good" });
       fill.style.width = `${goalTotal > 0 ? Math.min((summary.currentSaved / goalTotal) * 100, 100) : 0}%`;
-      const actions = card.createDiv({ cls: "finance-tracker-header-actions" });
-      const addButton = actions.createEl("button", { text: "Contribute" });
-      addButton.addEventListener("click", () => {
-        new ContributeGoalModal(this.app, this, { goalKey: goal.goalKey, onDone: () => this.renderGoalsBlock(source, el, ctx) }).open();
-      });
+      addAction(
+        card.createDiv({ cls: "finance-tracker-header-actions" }),
+        "Contribute",
+        () => new ContributeGoalModal(this.app, this, { goalKey: goal.goalKey, onDone: () => this.renderGoalsBlock(source, el, ctx) }).open(),
+        { primary: true, opensModal: true }
+      );
     }
   }
 
@@ -8226,16 +8585,12 @@ class FinanceTrackerPlugin extends Plugin {
     });
 
     const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
-    const exportButton = headerActions.createEl("button", { text: "Export CSV" });
-    exportButton.addEventListener("click", async () => {
+    addAction(headerActions, "Export CSV", async () => {
       const entries = await this.collectTransactionsForRange(range);
       await this.exportEntriesToCsv(entries, `finance-${range.start}-${range.end}`);
-    });
+    }, { errorPrefix: "Export" });
 
-    const budgetsButton = headerActions.createEl("button", { text: "Budgets" });
-    budgetsButton.addEventListener("click", async () => {
-      await this.openDefaultBudgetNote();
-    });
+    addAction(headerActions, "Budgets", () => this.openDefaultBudgetNote(), { errorPrefix: "Opening budgets note" });
 
     const allEntries = await this.collectTransactionsForRange(range);
     const filterReal = (list) => list.filter((entry) => core.isSpendingEntry(entry));
@@ -8250,7 +8605,10 @@ class FinanceTrackerPlugin extends Plugin {
 
     this.renderSummary(wrapper, entries, currency, range, { previousTotal });
 
-    const hierarchy = core.buildHierarchicalCategoryGroups(entries, "full");
+    // Honour the Default grouping setting. This was hardcoded to "full", so a
+    // vault set to "Primary category" still got subcategory rings it had asked
+    // not to see.
+    const hierarchy = core.buildHierarchicalCategoryGroups(entries, groupBy);
     this.renderPieChart(wrapper, hierarchy, currency, Number(this.settings.dashboardSliceLabelThreshold || 0.08));
 
     const budgets = await this.loadBudgets("default");
@@ -8344,13 +8702,22 @@ class QuickAddTransactionModal extends Modal {
     const input = contentEl.createEl("input", {
       type: "text",
       cls: "finance-quick-add-input",
-      attr: { placeholder: "12 nobu restaurants   ·   24 dinner split=2   ·   4.50 coffee snacks @yesterday" },
+      attr: { placeholder: "12 nobu restaurants   ·   58 USD : 83.64 obsidian sync   ·   24 dinner split=2   ·   4.50 coffee @yesterday" },
     });
 
     // Suggestions derived from logging history: categories, merchants, people.
     // Arrows cycle, Tab accepts, Esc closes; Enter always submits the entry.
     const known = await this.plugin.collectKnownSuggestions();
     this._known = known;
+
+    // Fingerprints of what is already on this date, so a double-tap on the same
+    // purchase can be flagged before it becomes a second bullet.
+    try {
+      const sameDay = await this.plugin.collectTransactionsForRange({ start: this.date, end: this.date });
+      this._todayFingerprints = new Set(sameDay.map((entry) => core.transactionFingerprint(entry)));
+    } catch (_error) {
+      this._todayFingerprints = new Set();
+    }
     const popup = contentEl.createDiv({ cls: "finance-quick-add-suggestions" });
     popup.hide();
     let suggestions = [];
@@ -8440,7 +8807,7 @@ class QuickAddTransactionModal extends Modal {
       const { start, end } = currentToken();
       let insert = suggestion.text;
       if (suggestion.kind === "merchant" && suggestion.category) {
-        const parsedNow = core.parseQuickAddInput(input.value, known.categories);
+        const parsedNow = core.parseQuickAddInput(input.value, known.categories, { defaultCurrency: this.plugin.settings.defaultCurrency });
         if (!parsedNow.category) insert = `${suggestion.text} #${suggestion.category}`;
       }
       const trailing = suggestion.kind === "person" ? "" : " ";
@@ -8466,6 +8833,8 @@ class QuickAddTransactionModal extends Modal {
       update();
     });
 
+    const duplicateWarning = contentEl.createDiv({ cls: "finance-quick-add-duplicate is-hidden" });
+
     const buttons = contentEl.createDiv({ cls: "finance-quick-add-buttons" });
     const keepOpenLabel = buttons.createEl("label", { cls: "finance-quick-add-keep" });
     const keepOpen = keepOpenLabel.createEl("input", { type: "checkbox" });
@@ -8473,7 +8842,7 @@ class QuickAddTransactionModal extends Modal {
     const submit = buttons.createEl("button", { text: "Add", cls: "mod-cta" });
 
     const parseCurrent = () => {
-      const parsed = core.parseQuickAddInput(input.value, known.categories);
+      const parsed = core.parseQuickAddInput(input.value, known.categories, { defaultCurrency: this.plugin.settings.defaultCurrency });
       let date = this.date;
       if (parsed.dateToken) {
         const resolved = this.plugin.resolveDateToken(parsed.dateToken);
@@ -8488,21 +8857,53 @@ class QuickAddTransactionModal extends Modal {
 
     const update = () => {
       const { parsed, date } = parseCurrent();
+      const home = this.plugin.settings.defaultCurrency;
+
+      // A foreign amount on its own cannot be converted without a stored rate,
+      // and guessing one would be worse than asking. Say which half is missing.
+      if (parsed.needsConvertedAmount) {
+        preview.setText(
+          `${core.formatCurrencyWithCode(parsed.originalAmount, parsed.originalCurrency)} — now add what it cost in ${home}, e.g. "${parsed.originalAmount} ${parsed.originalCurrency} : 83.64"`
+        );
+        preview.removeClass("is-ready");
+        submit.disabled = true;
+        return;
+      }
       if (!Number.isFinite(parsed.amount)) {
         preview.setText("Type an amount to begin…");
         preview.removeClass("is-ready");
         submit.disabled = true;
         return;
       }
+
       const category = parsed.category || "uncategorized";
-      const merchant = parsed.merchant ? `  ·  ${parsed.merchant}` : "";
+      const bits = [core.formatCurrency(parsed.amount, home)];
+      if (parsed.originalCurrency) {
+        bits.push(
+          `${core.formatCurrencyWithCode(parsed.originalAmount, parsed.originalCurrency)}${
+            parsed.impliedRate ? ` @ ${parsed.impliedRate}` : ""
+          }`
+        );
+      }
+      bits.push(core.displayCategoryPath(category));
+      if (parsed.merchant) bits.push(parsed.merchant);
       const owedPreview = core.buildOwedSharesFromTokens(parsed.amount, parsed.splitCount, parsed.owedTokens || []);
-      const splitNote = owedPreview.length
-        ? `  ·  my share ${core.formatCurrency(parsed.amount - owedPreview.reduce((sum, item) => sum + item.amount, 0), this.plugin.settings.defaultCurrency)}`
-        : "";
-      preview.setText(`${core.formatCurrency(parsed.amount, this.plugin.settings.defaultCurrency)}  ·  ${core.displayCategoryPath(category)}${merchant}${splitNote}  ·  ${date}`);
+      if (owedPreview.length) {
+        bits.push(`my share ${core.formatCurrency(parsed.amount - owedPreview.reduce((sum, item) => sum + item.amount, 0), home)}`);
+      }
+      bits.push(date);
+      preview.setText(bits.join("  ·  "));
       preview.addClass("is-ready");
       submit.disabled = false;
+
+      // Same amount, same merchant, same day, already logged — almost always a
+      // double-tap rather than a real second purchase.
+      const fingerprint = core.transactionFingerprint({ date, amount: parsed.amount, merchant: parsed.merchant });
+      const isDuplicate = Boolean(parsed.merchant) && this._todayFingerprints?.has(fingerprint);
+      duplicateWarning.toggleClass("is-hidden", !isDuplicate);
+      if (isDuplicate) {
+        duplicateWarning.setText(`Already logged today: ${core.formatCurrency(parsed.amount, home)} at ${parsed.merchant}. Add anyway?`);
+      }
     };
 
     const commit = async () => {
@@ -8518,6 +8919,12 @@ class QuickAddTransactionModal extends Modal {
             date,
             merchant: parsed.merchant,
             name: parsed.merchant,
+            originalAmount: parsed.originalAmount,
+            originalCurrency: parsed.originalCurrency,
+            originalRateKey: parsed.originalCurrency,
+            // Both amounts were typed, so no stored rate is involved and trip
+            // mode must not re-convert this entry.
+            fxProvided: Boolean(parsed.originalCurrency),
             owedTokens: parsed.owedTokens || [],
             splitCount: parsed.splitCount,
             source: "quick-add",
@@ -8733,6 +9140,33 @@ class EditRecurringItemModal extends Modal {
       scheduleFields.toggleClass("is-hidden", !scheduleCheckbox.checked);
     });
 
+    const hasTerm = Boolean(item.endDate) || (Number.isFinite(item.paymentsLeft) && item.paymentsLeft !== null);
+    const termLabel = contentEl.createEl("label", { cls: "finance-edit-remember" });
+    const termCheckbox = termLabel.createEl("input", { type: "checkbox" });
+    termCheckbox.checked = hasTerm;
+    termLabel.appendText(" This bill stops eventually");
+
+    const termFields = contentEl.createDiv({ cls: "finance-edit-schedule" });
+    termFields.toggleClass("is-hidden", !hasTerm);
+    contentEl.createEl("p", {
+      cls: "finance-edit-hint",
+      text: "For a fixed-term contract or an instalment plan. Fill either one — the bill retires itself and moves to Archived when it runs out.",
+    });
+
+    const endDateRow = termFields.createDiv({ cls: "finance-edit-row" });
+    endDateRow.createEl("label", { text: "Ends on" });
+    const endDateInput = endDateRow.createEl("input", { type: "date" });
+    endDateInput.value = item.endDate || "";
+
+    const paymentsRow = termFields.createDiv({ cls: "finance-edit-row" });
+    paymentsRow.createEl("label", { text: "Payments left" });
+    const paymentsInput = paymentsRow.createEl("input", { type: "number", attr: { step: "1", min: "0" } });
+    paymentsInput.value = Number.isFinite(item.paymentsLeft) && item.paymentsLeft !== null ? String(item.paymentsLeft) : "";
+
+    termCheckbox.addEventListener("change", () => {
+      termFields.toggleClass("is-hidden", !termCheckbox.checked);
+    });
+
     const buttons = contentEl.createDiv({ cls: "finance-edit-buttons" });
     const saveButton = buttons.createEl("button", { text: "Save", cls: "mod-cta" });
     saveButton.addEventListener("click", async () => {
@@ -8749,6 +9183,14 @@ class EditRecurringItemModal extends Modal {
         } else {
           patch.nextAmount = null;
           patch.changeDate = null;
+        }
+        if (termCheckbox.checked) {
+          patch.endDate = core.parseIsoDate(endDateInput.value) || null;
+          const left = core.parseNumber(paymentsInput.value);
+          patch.paymentsLeft = Number.isFinite(left) && left >= 0 ? Math.floor(left) : null;
+        } else {
+          patch.endDate = null;
+          patch.paymentsLeft = null;
         }
         await this.plugin.updateRecurringRegistryEntry(item, patch);
         new Notice(`${item.label} updated`);
@@ -8940,7 +9382,7 @@ class HolidayBudgetModal extends Modal {
   updateCreateDefaults() {
     const name = this.query.trim();
     this.createForm.name = name;
-    this.createForm.holidayKey = core.normalizeHolidayKey(this.createForm.holidayKey || "") || guessHolidayTagFromName(name || "Holiday");
+    this.createForm.holidayKey = core.normalizeHolidayKey(this.createForm.holidayKey || "") || guessHolidayTagFromName(name || "Trip");
   }
 
   async createFromForm() {
@@ -8983,7 +9425,7 @@ class HolidayBudgetModal extends Modal {
     if (!trimmed) {
       this.resultsEl.createDiv({
         cls: "finance-tracker-empty",
-        text: "Search for an existing holiday budget, or type a new holiday name to create one.",
+        text: "Search for an existing trip budget, or type a new trip name to create one.",
       });
       if (this.createPanelEl) {
         this.createPanelEl.empty();
@@ -9013,13 +9455,13 @@ class HolidayBudgetModal extends Modal {
     if (!this.query.trim()) return;
 
     this.updateCreateDefaults();
-    this.createPanelEl.createEl("h3", { text: "New holiday details" });
+    this.createPanelEl.createEl("h3", { text: "New trip details" });
     this.createPanelEl.createEl("p", {
       cls: "finance-tracker-settings-section-copy",
-      text: "Set the tracking tag and trip dates now so the holiday budget note is ready to use immediately.",
+      text: "Set the tracking tag and trip dates now so the trip budget note is ready to use immediately.",
     });
 
-    const nameSetting = new Setting(this.createPanelEl).setName("Holiday name").setDesc("This is the budget note title and file name.");
+    const nameSetting = new Setting(this.createPanelEl).setName("Trip name").setDesc("This is the budget note title and file name.");
     nameSetting.addText((text) => {
       text.setPlaceholder("Japan 2026").setValue(this.createForm.name).onChange((value) => {
         this.createForm.name = value;
@@ -9027,7 +9469,7 @@ class HolidayBudgetModal extends Modal {
     });
 
     const tagSetting = new Setting(this.createPanelEl)
-      .setName("Holiday tracking tag")
+      .setName("Trip tracking tag")
       .setDesc("Used by the holiday dashboard to match tags like #log/spending/2026/japan/flights.");
     tagSetting.addText((text) => {
       text.setPlaceholder("2026/japan").setValue(this.createForm.holidayKey).onChange((value) => {
@@ -9035,7 +9477,7 @@ class HolidayBudgetModal extends Modal {
       });
     });
 
-    const startSetting = new Setting(this.createPanelEl).setName("Start date").setDesc("Saved as a date property in the holiday budget note.");
+    const startSetting = new Setting(this.createPanelEl).setName("Start date").setDesc("Saved as a date property in the trip budget note.");
     startSetting.addText((text) => {
       text.inputEl.type = "date";
       text.setValue(this.createForm.startDate).onChange((value) => {
@@ -9043,7 +9485,7 @@ class HolidayBudgetModal extends Modal {
       });
     });
 
-    const endSetting = new Setting(this.createPanelEl).setName("End date").setDesc("Saved as a date property in the holiday budget note.");
+    const endSetting = new Setting(this.createPanelEl).setName("End date").setDesc("Saved as a date property in the trip budget note.");
     endSetting.addText((text) => {
       text.inputEl.type = "date";
       text.setValue(this.createForm.endDate).onChange((value) => {
@@ -9052,7 +9494,7 @@ class HolidayBudgetModal extends Modal {
     });
 
     const actions = this.createPanelEl.createDiv({ cls: "finance-tracker-settings-actions" });
-    const createButton = actions.createEl("button", { text: "Create holiday budget" });
+    const createButton = actions.createEl("button", { text: "Create trip budget" });
     createButton.addEventListener("click", async () => {
       await this.createFromForm();
     });
@@ -9061,9 +9503,9 @@ class HolidayBudgetModal extends Modal {
   onOpen() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl("h2", { text: "Select or create holiday budget" });
+    contentEl.createEl("h2", { text: "Select or create a trip" });
     const intro = contentEl.createEl("p", {
-      text: "Search an existing holiday budget. If nothing matches, choose the create option to start a new one inside your budgets folder.",
+      text: "Search an existing trip budget. If nothing matches, choose the create option to start a new one inside your budgets folder.",
     });
     intro.addClass("finance-tracker-settings-section-copy");
 
@@ -9371,7 +9813,7 @@ class SetupWizardModal extends Modal {
     const noteToggles = [
       ["createBudgets", "💸 Budgets", "A budget table with example rows — edit the limits to make them yours."],
       ["createDashboard", "📊 Finance dashboard", "Weekly and monthly dashboards, net worth, forecast, and a sample query."],
-      ["createRecurring", "🔁 Recurring payments", "The bill management page: due dates, log/skip, and the bill reserve."],
+      ["createRecurring", "🔁 Recurring payments", "The bill management page: due dates, log/skip, and your runway."],
       ["createGoals", "🎯 Goals", "The goals overview with one-tap contributions."],
     ];
     for (const [key, name, desc] of noteToggles) {
@@ -9555,78 +9997,6 @@ class ContributeGoalModal extends Modal {
   }
 }
 
-class ContributeBillReserveModal extends Modal {
-  constructor(app, plugin, onDone) {
-    super(app);
-    this.plugin = plugin;
-    this.onDone = onDone;
-    this.form = { amount: "", date: core.todayIsoLocal(), note: "" };
-  }
-
-  onOpen() {
-    const { contentEl } = this;
-    contentEl.empty();
-    contentEl.createEl("h2", { text: "Contribute to bill reserve" });
-    contentEl.createEl("p", {
-      cls: "finance-tracker-settings-section-copy",
-      text: "Logs a contribution bullet like `- $50.00 #log/income/billreserve` into the chosen day's note — one shared envelope for every recurring bill, the same virtual-envelope idea as a savings goal.",
-    });
-
-    new Setting(contentEl)
-      .setName("Amount")
-      .addText((text) => {
-        text.inputEl.type = "number";
-        text.inputEl.step = "0.01";
-        text.setPlaceholder("50").onChange((value) => {
-          this.form.amount = value;
-        });
-        window.setTimeout(() => text.inputEl.focus(), 0);
-      });
-
-    new Setting(contentEl)
-      .setName("Date")
-      .addText((text) => {
-        text.inputEl.type = "date";
-        text.setValue(this.form.date).onChange((value) => {
-          this.form.date = core.parseIsoDate(value) || core.todayIsoLocal();
-        });
-      });
-
-    new Setting(contentEl)
-      .setName("Note")
-      .setDesc("Optional — defaults to \"Bill reserve contribution\".")
-      .addText((text) => {
-        text.setPlaceholder("Payday transfer").onChange((value) => {
-          this.form.note = value;
-        });
-      });
-
-    const actions = contentEl.createDiv({ cls: "finance-tracker-settings-actions" });
-    const saveButton = actions.createEl("button", { text: "Log contribution", cls: "mod-cta" });
-    saveButton.addEventListener("click", async () => {
-      const amount = core.parseNumber(this.form.amount);
-      if (!Number.isFinite(amount) || amount <= 0) {
-        new Notice("Enter a contribution amount first.");
-        return;
-      }
-      saveButton.disabled = true;
-      try {
-        await this.plugin.logBillReserveContribution(amount, this.form.date, this.form.note);
-        new Notice(`Logged ${core.formatCurrency(amount, this.plugin.settings.defaultCurrency)} to the bill reserve`);
-        if (typeof this.onDone === "function") await this.onDone();
-        this.close();
-      } catch (error) {
-        new Notice(`Contribution failed: ${error.message}`);
-        saveButton.disabled = false;
-      }
-    });
-  }
-
-  onClose() {
-    this.contentEl.empty();
-  }
-}
-
 class SettleUpModal extends Modal {
   constructor(app, plugin) {
     super(app);
@@ -9749,6 +10119,115 @@ class BalanceSnapshotModal extends Modal {
   }
 }
 
+// The eight "Insert … block" commands were eight near-identical palette rows
+// that pushed the commands doing real work further down the list. One entry
+// opens this instead, where each block gets a sentence saying what it is —
+// which the palette had no room for.
+const INSERTABLE_BLOCKS = [
+  {
+    name: "Dashboard",
+    block: DASHBOARD_BLOCK,
+    body: "period: week",
+    description: "Spend for a period: totals, category donut, daily trend, budget progress.",
+  },
+  {
+    name: "Recurring payments",
+    block: RECURRING_BLOCK,
+    body: "",
+    description: "Upcoming bills with their due dates, plus your runway target.",
+  },
+  {
+    name: "Recurring payments (manage)",
+    block: RECURRING_BLOCK,
+    body: "manage: true",
+    description: "As above, with Edit, Pause, Skip and Auto-log controls on each bill.",
+  },
+  {
+    name: "Goals",
+    block: GOALS_BLOCK,
+    body: "",
+    description: "Every savings goal and trip with progress bars and one-tap contributions.",
+  },
+  {
+    name: "Runway",
+    block: RUNWAY_BLOCK,
+    body: "",
+    description: "How much to keep available to be safe for a chosen period, from your bills.",
+  },
+  {
+    name: "Split expenses",
+    block: SPLITS_BLOCK,
+    body: "",
+    description: "Who owes you what, with one-tap settle up.",
+  },
+  {
+    name: "Forecast",
+    block: FORECAST_BLOCK,
+    body: "months: 6",
+    description: "Projects income minus bills and spending forward month by month.",
+  },
+  {
+    name: "Net worth",
+    block: NETWORTH_BLOCK,
+    body: "",
+    description: "Balance snapshots per account and the net-worth line over time.",
+  },
+  {
+    name: "Query",
+    block: QUERY_BLOCK,
+    body: "period: month\ngroup: category\nview: table",
+    description: "A filtered table or bar chart over any slice of your logged entries.",
+  },
+];
+
+class InsertBlockModal extends Modal {
+  constructor(app, plugin, editor) {
+    super(app);
+    this.plugin = plugin;
+    this.editor = editor;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h3", { text: "Insert a finance block" });
+    const list = contentEl.createDiv({ cls: "finance-tracker-holiday-results" });
+
+    const insert = (text) => {
+      this.editor.replaceSelection(text);
+      this.close();
+    };
+
+    for (const item of INSERTABLE_BLOCKS) {
+      const option = list.createDiv({ cls: "finance-tracker-holiday-result" });
+      option.createDiv({ cls: "finance-tracker-holiday-result-title", text: item.name });
+      option.createDiv({ cls: "finance-tracker-holiday-result-path", text: item.description });
+      option.addEventListener("click", () =>
+        insert(`\`\`\`${item.block}\n${item.body ? `${item.body}\n` : ""}\`\`\`\n`)
+      );
+    }
+
+    // Reviews compute once and paste finished numbers — a frozen snapshot, not
+    // a live block — but this is where someone looks for "put finance in a note".
+    for (const [period, name, description] of [
+      ["year", "Year in review", "Totals, best/worst month, top categories and transfers for this year — inserted as plain text."],
+      ["quarter", "Quarter in review", "The same summary, scoped to this quarter."],
+    ]) {
+      const option = list.createDiv({ cls: "finance-tracker-holiday-result" });
+      option.createDiv({ cls: "finance-tracker-holiday-result-title", text: name });
+      option.createDiv({ cls: "finance-tracker-holiday-result-path", text: description });
+      option.addEventListener("click", async () => {
+        const lines = await this.plugin.buildPeriodReview(period);
+        insert(`${lines.join("\n")}\n`);
+      });
+    }
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
 class ExportFolderModal extends Modal {
   constructor(app, plugin, suggestedFolder, onSubmit) {
     super(app);
@@ -9814,7 +10293,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
     containerEl.createEl("h2", { text: "Finance Tracker" });
     containerEl.createEl("p", {
       cls: "finance-tracker-settings-intro",
-      text: "Configure capture behavior, dashboard defaults, holiday budgets, goals, and recurring payments.",
+      text: "Configure capture, dashboards, trips, goals, and recurring payments.",
     });
 
     const addSection = (title, description) => {
@@ -9827,37 +10306,21 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
       }
     };
 
-    addSection("Capture", "These settings control where spending is written and how captured transactions are logged.");
+    // Progressive disclosure: settings that are auto-detected or set once by
+    // the wizard live behind a collapsed "Advanced" block, so the default view
+    // shows only what someone would actually come here to change.
+    const addAdvanced = (summary, description) => {
+      const details = containerEl.createEl("details", { cls: "finance-tracker-advanced" });
+      details.createEl("summary", { text: summary });
+      if (description) {
+        details.createEl("p", { cls: "finance-tracker-settings-section-copy", text: description });
+      }
+      return details;
+    };
 
-    new Setting(containerEl)
-      .setName("Daily notes folder")
-      .setDesc("Folder that stores your daily notes. The plugin follows your core Daily Notes folder and infers the existing file layout from notes already in the vault.")
-      .addText((text) =>
-        text.setPlaceholder("Journal/Periodics/1. Daily").setValue(this.plugin.settings.dailyNotesFolder).onChange(async (value) => {
-          this.plugin.settings.dailyNotesFolder = value.trim() || DEFAULT_SETTINGS.dailyNotesFolder;
-          await this.plugin.saveSettings();
-        })
-      );
+    addSection("Capture", "Where spending is written, and how captured transactions are logged.");
 
-    new Setting(containerEl)
-      .setName("Finance heading")
-      .setDesc("Heading used when the plugin looks for your finance section. Legacy ## Spending notes are still parsed.")
-      .addText((text) =>
-        text.setPlaceholder("## Finance").setValue(this.plugin.settings.spendingHeading).onChange(async (value) => {
-          this.plugin.settings.spendingHeading = value.trim() || DEFAULT_SETTINGS.spendingHeading;
-          await this.plugin.saveSettings();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName("Spending root tag")
-      .setDesc("The root task line the plugin updates in your daily note.")
-      .addText((text) =>
-        text.setPlaceholder("#log/spending").setValue(this.plugin.settings.spendingRootTag).onChange(async (value) => {
-          this.plugin.settings.spendingRootTag = value.trim() || DEFAULT_SETTINGS.spendingRootTag;
-          await this.plugin.saveSettings();
-        })
-      );
+    this.renderVaultStatus(containerEl).catch(() => {});
 
     new Setting(containerEl)
       .setName("Default currency")
@@ -9889,7 +10352,52 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
         })
       );
 
-    addSection("Dashboard", "These defaults shape the weekly finance dashboard code block.");
+    const captureAdvanced = addAdvanced(
+      "Advanced: note format",
+      "Auto-detected from the Journals or core Daily notes plugin, and set for you by first-time setup. Changing these will not rewrite notes you have already logged."
+    );
+
+    new Setting(captureAdvanced)
+      .setName("Daily notes folder")
+      .setDesc("Folder that stores your daily notes. The plugin follows your core Daily notes folder and infers the existing file layout from notes already in the vault.")
+      .addText((text) =>
+        text.setPlaceholder("Journal/Periodics/1. Daily").setValue(this.plugin.settings.dailyNotesFolder).onChange(async (value) => {
+          this.plugin.settings.dailyNotesFolder = value.trim() || DEFAULT_SETTINGS.dailyNotesFolder;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(captureAdvanced)
+      .setName("Finance heading")
+      .setDesc("Heading the plugin looks for when reading a daily note. Legacy ## Spending notes are still parsed.")
+      .addText((text) =>
+        text.setPlaceholder("## Finance").setValue(this.plugin.settings.spendingHeading).onChange(async (value) => {
+          this.plugin.settings.spendingHeading = value.trim() || DEFAULT_SETTINGS.spendingHeading;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(captureAdvanced)
+      .setName("Spending root tag")
+      .setDesc("The root task line the plugin keeps a running total on. Changing this after you have logged anything will orphan every existing note's total.")
+      .addText((text) =>
+        text.setPlaceholder("#log/spending").setValue(this.plugin.settings.spendingRootTag).onChange(async (value) => {
+          this.plugin.settings.spendingRootTag = value.trim() || DEFAULT_SETTINGS.spendingRootTag;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(captureAdvanced)
+      .setName("Capture inbox folder")
+      .setDesc("Folder an Apple Shortcut writes capture files into. The plugin drains it automatically.")
+      .addText((text) =>
+        text.setPlaceholder(DEFAULT_SETTINGS.captureInboxFolder).setValue(this.plugin.settings.captureInboxFolder).onChange(async (value) => {
+          this.plugin.settings.captureInboxFolder = value.trim() || DEFAULT_SETTINGS.captureInboxFolder;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    addSection("Dashboard", "Defaults for the dashboard block and the sidebar.");
 
     new Setting(containerEl)
       .setName("Default grouping")
@@ -9901,20 +10409,6 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.dashboardDefaultGroupBy)
           .onChange(async (value) => {
             this.plugin.settings.dashboardDefaultGroupBy = value;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Pie label threshold")
-      .setDesc("Minimum slice ratio shown with labels inside the chart. Example: 0.08 = 8%.")
-      .addText((text) =>
-        text
-          .setPlaceholder("0.08")
-          .setValue(String(this.plugin.settings.dashboardSliceLabelThreshold))
-          .onChange(async (value) => {
-            const parsed = Number(value);
-            this.plugin.settings.dashboardSliceLabelThreshold = Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_SETTINGS.dashboardSliceLabelThreshold;
             await this.plugin.saveSettings();
           })
       );
@@ -9951,11 +10445,17 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
           })
       );
 
-    addSection("Files", "Choose where your normal and holiday budget notes are stored.");
+    const budgetActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
+    addAction(budgetActions, "Open budgets note", () => this.plugin.openBudgetNote(), {
+      primary: true,
+      errorPrefix: "Opening budgets note",
+    });
 
-    new Setting(containerEl)
+    const filesAdvanced = addAdvanced("Advanced: file locations", "Set for you by first-time setup.");
+
+    new Setting(filesAdvanced)
       .setName("Budgets folder")
-      .setDesc("Folder where the default budget and holiday budgets are stored.")
+      .setDesc("Folder where the default budget, trip budgets, and the recurring payments note live.")
       .addText((text) =>
         text.setPlaceholder("Utility/Budgets").setValue(this.plugin.settings.budgetsFolderPath).onChange(async (value) => {
           this.plugin.settings.budgetsFolderPath = value.trim() || DEFAULT_SETTINGS.budgetsFolderPath;
@@ -9963,9 +10463,9 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
         })
       );
 
-    new Setting(containerEl)
+    new Setting(filesAdvanced)
       .setName("Budget archive folder")
-      .setDesc("Holiday budgets are moved here when you archive them from the settings page.")
+      .setDesc("Trips and goals are moved here when you archive them.")
       .addText((text) =>
         text.setPlaceholder("Utility/Budgets/Archive").setValue(this.plugin.settings.budgetArchiveFolderPath).onChange(async (value) => {
           this.plugin.settings.budgetArchiveFolderPath = value.trim() || DEFAULT_SETTINGS.budgetArchiveFolderPath;
@@ -9973,35 +10473,70 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
         })
       );
 
-    const actions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
-    const openBudgetsButton = actions.createEl("button", { text: "Open budgets note" });
-    openBudgetsButton.addEventListener("click", async () => {
-      await this.plugin.openBudgetNote();
-    });
+    new Setting(filesAdvanced)
+      .setName("Recurring payments note")
+      .setDesc("Filename of the bill-management note, inside the budgets folder.")
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_SETTINGS.recurringNoteName)
+          .setValue(this.plugin.settings.recurringNoteName)
+          .onChange(async (value) => {
+            this.plugin.settings.recurringNoteName = value.trim() || DEFAULT_SETTINGS.recurringNoteName;
+            await this.plugin.saveSettings();
+          })
+      );
 
-    addSection(
-      "Merchant map",
-      "Learned merchant → category associations, added automatically from the \"Remember this merchant → category\" checkbox when editing a transaction. Remove an entry here if it guesses wrong."
+    new Setting(filesAdvanced)
+      .setName("Budgets note name")
+      .setDesc("Filename of the default budget note, inside the budgets folder.")
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_SETTINGS.defaultBudgetNoteName)
+          .setValue(this.plugin.settings.defaultBudgetNoteName)
+          .onChange(async (value) => {
+            this.plugin.settings.defaultBudgetNoteName = value.trim() || DEFAULT_SETTINGS.defaultBudgetNoteName;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    const merchantAdvanced = addAdvanced(
+      "Advanced: merchant map",
+      "Learned merchant → category pairs, added by the \"Remember this merchant → category\" checkbox when editing a transaction. Remove one here if it guesses wrong."
     );
-    const merchantMapListEl = containerEl.createDiv({ cls: "finance-tracker-goal-list" });
-    this.renderMerchantMapList(merchantMapListEl);
+    this.renderMerchantMapList(merchantAdvanced.createDiv({ cls: "finance-tracker-goal-list" }));
 
+    // Trips: the notes, plus trip mode, in one place. Trip mode used to be its
+    // own section further down, which read as a separate feature rather than a
+    // switch belonging to the trip you just picked.
     addSection(
-      "Holiday budgets",
-      "Save for several holidays at once: each goal note below can be active at the same time. Spending is treated as holiday spending automatically when the note date falls inside a holiday's start and end dates. Archiving a finished holiday freezes its savings steps and spending record into the note and moves it out of the active set."
+      "Trips",
+      "Save for several trips at once — each note below can be active simultaneously. Spending counts as trip spending automatically when the note date falls inside a trip's start and end dates. Archiving a finished trip freezes its savings steps and spending record into the note."
     );
 
-    const holidayActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
-    const selectHolidayButton = holidayActions.createEl("button", { text: "Select or create holiday" });
-    selectHolidayButton.addEventListener("click", () => {
-      new HolidayBudgetModal(this.app, this.plugin, async () => {
-        this.display();
-      }).open();
-    });
-    const archiveFinishedButton = holidayActions.createEl("button", { text: "Archive finished holidays" });
-    archiveFinishedButton.addEventListener("click", async () => {
+    const tripActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
+    addAction(tripActions, "Select or create a trip", () => {
+      new HolidayBudgetModal(this.app, this.plugin, async () => this.display()).open();
+    }, { primary: true, opensModal: true });
+    addAction(tripActions, "Archive finished trips", async () => {
       await this.plugin.archiveFinishedHolidays({ notify: true });
       this.display();
+    }, { errorPrefix: "Archiving trips" });
+    addAction(
+      tripActions,
+      this.plugin.settings.tripModeActive ? "End trip mode" : "Start trip mode",
+      async () => {
+        if (this.plugin.settings.tripModeActive) await this.plugin.endTrip();
+        else await this.plugin.startTrip();
+        this.display();
+      },
+      { errorPrefix: "Trip mode" }
+    );
+
+    containerEl.createEl("p", {
+      cls: "finance-tracker-settings-section-copy",
+      text: this.plugin.settings.tripModeActive
+        ? `Trip mode is on — quick add and URL captures default to this trip's tag and currency: ${this.plugin.settings.activeTripGoalPath || this.plugin.settings.activeHolidayBudgetPath}`
+        : "Trip mode is off. Turn it on while you are away and quick add will default to the trip's tag and currency.",
     });
 
     const goalListEl = containerEl.createDiv({ cls: "finance-tracker-goal-list" });
@@ -10009,12 +10544,9 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
 
     addSection("Savings goals", "Create standalone savings goal notes for things like a house deposit or rainy day fund. Any goal with a target amount and a due date shows sinking-fund math automatically.");
     const savingsActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
-    const createSavingsGoalButton = savingsActions.createEl("button", { text: "Create savings goal" });
-    createSavingsGoalButton.addEventListener("click", () => {
-      new SavingsGoalModal(this.app, this.plugin, async () => {
-        this.display();
-      }).open();
-    });
+    addAction(savingsActions, "Create savings goal", () => {
+      new SavingsGoalModal(this.app, this.plugin, async () => this.display()).open();
+    }, { primary: true, opensModal: true });
 
     const savingsGoalListEl = containerEl.createDiv({ cls: "finance-tracker-goal-list" });
     this.renderGoalList(savingsGoalListEl, "savings").catch(() => {});
@@ -10035,19 +10567,6 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Recurring payments note name")
-      .setDesc("Filename of the bill-management note, inside the budgets folder. Set once during first-time setup, changeable any time.")
-      .addText((text) =>
-        text
-          .setPlaceholder(DEFAULT_SETTINGS.recurringNoteName)
-          .setValue(this.plugin.settings.recurringNoteName)
-          .onChange(async (value) => {
-            this.plugin.settings.recurringNoteName = value.trim() || DEFAULT_SETTINGS.recurringNoteName;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
       .setName("Auto-log recurring payments")
       .setDesc("Master switch: log recurring items automatically on their due day. Each bill below can opt out with its Auto-log toggle.")
       .addToggle((toggle) =>
@@ -10057,44 +10576,133 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
         })
       );
 
+    new Setting(containerEl)
+      .setName("Sort bills by")
+      .setDesc("Order for the Upcoming bills list, the sidebar's due-bills card, and the list below.")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("dueDate", "Due date (overdue first)")
+          .addOption("monthlyCostDesc", "Cost per month (highest first)")
+          .addOption("nameAsc", "Name (A–Z)")
+          .setValue(this.plugin.settings.recurringSortOrder || "dueDate")
+          .onChange(async (value) => {
+            this.plugin.settings.recurringSortOrder = value;
+            await this.plugin.saveSettings();
+            await this.renderRecurringList(recurringListEl);
+          })
+      );
+
     containerEl.createEl("p", {
       cls: "finance-tracker-settings-section-copy",
-      text: "Detected bills — Current: uncheck to pause a bill (it moves to the Archived section of the recurring payments block, where it can be resumed or removed for good); Auto-log: log this bill automatically on its due day. State is stored in the registry table of the recurring payments note.",
+      text: "Detected bills. Untick Active to pause one — it moves to the Archived section of the recurring payments block, where it can be resumed or removed for good. Auto-log logs it automatically on its due day. Both are stored in the registry table of the recurring payments note.",
     });
     const recurringListEl = containerEl.createDiv({ cls: "finance-tracker-goal-list" });
     this.renderRecurringList(recurringListEl).catch(() => {});
     const recurringActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
-    const openRecurringButton = recurringActions.createEl("button", { text: "Open recurring payments note" });
-    openRecurringButton.addEventListener("click", () => this.plugin.openRecurringNote());
-
+    addAction(recurringActions, "Open recurring payments note", () => this.plugin.openRecurringNote(), {
+      primary: true,
+      errorPrefix: "Opening recurring payments note",
+    });
     addSection(
-      "Trip mode",
-      "While a trip is active, quick-add and URL captures default to the trip tag and trip currency, and the sidebar shows trip cards."
+      "Runway",
+      "How much you need available to be safe for a chosen period, worked out from the bills above. Read-only — there is nothing to fund and nothing to keep in sync. Show it with the Runway block, or at the bottom of the recurring payments note."
     );
 
-    containerEl.createEl("p", {
-      cls: "finance-tracker-settings-section-copy",
-      text: this.plugin.settings.tripModeActive
-        ? `Trip mode is on: ${this.plugin.settings.activeTripGoalPath || this.plugin.settings.activeHolidayBudgetPath}`
-        : "Trip mode is off.",
-    });
+    new Setting(containerEl)
+      .setName("Runway period")
+      .setDesc("How far ahead to cover. The figure is the bills that actually fall inside that window, not an average.")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("1 week", "1 week")
+          .addOption("2 weeks", "2 weeks")
+          .addOption("1 month", "1 month")
+          .addOption("2 months", "2 months")
+          .addOption("3 months", "3 months")
+          .addOption("6 months", "6 months")
+          .setValue(core.parseRunwayPeriod(this.plugin.settings.runwayPeriod).label)
+          .onChange(async (value) => {
+            this.plugin.settings.runwayPeriod = value;
+            await this.plugin.saveSettings();
+            this.plugin.refreshDailyBudgetView();
+          })
+      );
 
-    const tripActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
-    const startTripButton = tripActions.createEl("button", { text: "Start trip" });
-    startTripButton.addEventListener("click", async () => {
-      await this.plugin.startTrip();
-      this.display();
-    });
-    const endTripButton = tripActions.createEl("button", { text: "End trip" });
-    endTripButton.addEventListener("click", async () => {
-      await this.plugin.endTrip();
-      this.display();
-    });
+    new Setting(containerEl)
+      .setName("What counts toward runway")
+      .setDesc("Bills only, or bills plus your average discretionary spend over the last 90 days.")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("spending", "Bills + usual spending")
+          .addOption("bills", "Recurring bills only")
+          .setValue(core.normalizeRunwayMode(this.plugin.settings.runwayMode))
+          .onChange(async (value) => {
+            this.plugin.settings.runwayMode = value;
+            await this.plugin.saveSettings();
+            this.plugin.refreshDailyBudgetView();
+          })
+      );
 
-    addSection("First-time setup", "Re-run the guided setup to create any missing starter notes. Existing notes are never overwritten.");
+    const runwayStatus = containerEl.createDiv({ cls: "finance-tracker-vault-status" });
+    this.renderRunwayStatus(runwayStatus).catch(() => {});
+
+    addSection("Setup", "Re-run the guided setup to create any missing starter notes. Existing notes are never overwritten.");
     const setupActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
-    const setupButton = setupActions.createEl("button", { text: "Run first-time setup" });
-    setupButton.addEventListener("click", () => new SetupWizardModal(this.app, this.plugin).open());
+    addAction(setupActions, "Set up finance notes", () => new SetupWizardModal(this.app, this.plugin).open(), {
+      opensModal: true,
+    });
+  }
+
+  // The three note-format settings are each a text box where a wrong value
+  // silently yields empty dashboards and no error at all. This says out loud
+  // what the plugin can currently see, which catches a misconfiguration faster
+  // than any amount of setting description.
+  async renderVaultStatus(containerEl) {
+    const statusEl = containerEl.createDiv({ cls: "finance-tracker-vault-status" });
+    statusEl.setText("Checking your vault…");
+    try {
+      const entries = await this.plugin.collectAllTransactions();
+      const notes = new Set(entries.map((entry) => entry.filePath).filter(Boolean));
+      statusEl.empty();
+      if (!entries.length) {
+        statusEl.addClass("is-warning");
+        statusEl.setText(
+          `No logged entries found yet. The plugin is reading "${this.plugin.settings.dailyNotesFolder}" and looking for a "${this.plugin.settings.spendingHeading}" heading — check those under Advanced if you expected to see something here.`
+        );
+        return;
+      }
+      statusEl.addClass("is-ok");
+      const dates = entries.map((entry) => entry.date).filter(Boolean).sort();
+      statusEl.setText(
+        `Reading ${entries.length} entries across ${notes.size} note${notes.size === 1 ? "" : "s"}` +
+          (dates.length ? ` — ${dates[0]} to ${dates[dates.length - 1]}.` : ".")
+      );
+    } catch (error) {
+      statusEl.empty();
+      statusEl.addClass("is-warning");
+      statusEl.setText(`Could not read your notes: ${error.message}`);
+    }
+  }
+
+  // Shows the figure the two dropdowns above produce, so the setting is not
+  // abstract: you pick a period and immediately see what it costs.
+  async renderRunwayStatus(statusEl) {
+    statusEl.setText("Working out your runway…");
+    try {
+      const runway = await this.plugin.computeRunwayState(core.todayIsoLocal());
+      statusEl.empty();
+      statusEl.addClass(runway.target > 0 ? "is-ok" : "is-warning");
+      statusEl.setText(
+        runway.target > 0
+          ? `Right now: keep ${core.formatCurrency(runway.target, this.plugin.settings.defaultCurrency)} available for the next ${runway.period} — ${runway.occurrences.length} bill${
+              runway.occurrences.length === 1 ? "" : "s"
+            } due by ${runway.windowEnd}.`
+          : `No bills fall inside the next ${runway.period}, so there is nothing to set aside yet.`
+      );
+    } catch (error) {
+      statusEl.empty();
+      statusEl.addClass("is-warning");
+      statusEl.setText(`Could not work out your runway: ${error.message}`);
+    }
   }
 
   renderMerchantMapList(listEl) {
@@ -10137,11 +10745,11 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
     const scroll = listEl.createDiv({ cls: "finance-tracker-recurring-settings-scroll" });
     const header = scroll.createDiv({ cls: "finance-tracker-recurring-settings-header" });
     header.createSpan({ text: "Bill" });
-    header.createSpan({ text: "Current" });
+    header.createSpan({ text: "Active" });
     header.createSpan({ text: "Auto-log" });
     for (const item of items) {
       const bits = [
-        RECURRING_CADENCE_LABELS[item.cadence] || item.cadence,
+        cadenceLabel(item.cadence),
         core.formatCurrency(item.lastAmount, item.currency || this.plugin.settings.defaultCurrency),
       ];
       if (item.nextDue) bits.push(`next due ${item.nextDue}`);
@@ -10150,7 +10758,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
       nameCell.createDiv({ text: item.label });
       nameCell.createDiv({ cls: "finance-tracker-budget-meta", text: bits.join(" · ") });
 
-      const currentLabel = row.createEl("label", { cls: "finance-tracker-recurring-check", attr: { "aria-label": "Current" } });
+      const currentLabel = row.createEl("label", { cls: "finance-tracker-recurring-check", attr: { "aria-label": "Active" } });
       const currentCheckbox = currentLabel.createEl("input", { type: "checkbox" });
       currentCheckbox.checked = true;
       currentCheckbox.addEventListener("change", async () => {
@@ -10193,7 +10801,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
 
     if (!rows.length) {
       const emptyText =
-        kind === "holiday" ? "No holiday budgets yet." : kind === "savings" ? "No savings goals yet." : "No goal or holiday notes yet.";
+        kind === "holiday" ? "No trips yet." : kind === "savings" ? "No savings goals yet." : "No goal or holiday notes yet.";
       listEl.createDiv({ cls: "finance-tracker-empty", text: emptyText });
       return;
     }
