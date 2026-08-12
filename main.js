@@ -1,6 +1,6 @@
 "use strict";
 
-const { ItemView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, normalizePath } = require("obsidian");
+const { ItemView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, normalizePath, requestUrl } = require("obsidian");
 
 const core = (() => {
   const DAY_MS = 24 * 60 * 60 * 1000;
@@ -1474,6 +1474,175 @@ const core = (() => {
     return `${date}|${amount}|${normalizeMerchant(data.merchant || data.name || "")}`;
   }
 
+  // ---------------------------------------------------------------------------
+  // Capture methods
+  //
+  // A capture *method* is a transport — the channel a transaction travelled down
+  // to reach the vault. It is deliberately not the same thing as the `source=`
+  // field, which is free text naming the account the money actually left (anz,
+  // wise, cash). Both matter, because the pair is what makes cross-method
+  // duplicate detection safe: the same amount at the same merchant on the same
+  // day arriving twice down the *same* channel is two coffees, but arriving down
+  // two *different* channels is one coffee captured twice.
+  // ---------------------------------------------------------------------------
+
+  // The transports that can be switched on and off. Quick add and hand-typed
+  // bullets are deliberately absent — they are the in-app fallback and always
+  // work, so there is nothing useful about being able to disable them.
+  const CAPTURE_METHODS = ["url", "batch", "inbox", "gist"];
+
+  const CAPTURE_METHOD_LABELS = {
+    url: "Obsidian URL",
+    batch: "Batched queue",
+    inbox: "Capture inbox folder",
+    gist: "GitHub gist",
+    "quick-add": "Quick add",
+    csv: "CSV reconcile",
+    recurring: "Recurring auto-log",
+  };
+
+  function captureMethodLabel(method) {
+    const key = normalizeCaptureMethod(method);
+    return CAPTURE_METHOD_LABELS[key] || key;
+  }
+
+  function normalizeCaptureMethod(value) {
+    return String(value || "").trim().toLowerCase() || "unknown";
+  }
+
+  // Method + account. Two captures sharing a channel came down the same pipe from
+  // the same place, which is the one case that is genuinely not a duplicate.
+  function captureChannelKey(record) {
+    const data = record || {};
+    const source = normalizeWhitespace(String(data.source || "")).toLowerCase();
+    return `${normalizeCaptureMethod(data.method)}:${source}`;
+  }
+
+  function describeCaptureChannel(channelKey) {
+    const [method, source] = String(channelKey || "").split(":");
+    const label = captureMethodLabel(method);
+    return source ? `${label} (${source})` : label;
+  }
+
+  // Splits a multi-line capture payload — the body of a batched URL open or a
+  // gist file — into one param object per line. Each line is the same one-line
+  // format the inbox folder already uses, so nothing new has to be learned to
+  // write one. Unparseable lines are returned rather than thrown, so one bad
+  // line never costs you the rest of the batch.
+  function parseCaptureBatch(raw) {
+    const text = String(raw || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    const entries = [];
+    const failures = [];
+    for (const rawLine of text.split("\n")) {
+      const line = rawLine.trim();
+      if (!line || /^(#|\/\/)/.test(line)) continue;
+      const params = parseInboxLine(line);
+      if (params) entries.push(params);
+      else failures.push({ line, reason: "Could not parse a transaction from this line" });
+    }
+    return { entries, failures };
+  }
+
+  // Looks for an already-captured transaction that this one is probably a second
+  // copy of. Only ever matches across channels (see the note above), and only
+  // within `windowDays`, because bank feeds settle a day or two after the tap.
+  function findDuplicateCapture(candidate, ledger, options = {}) {
+    const windowDays = Number.isFinite(options.windowDays) ? Math.max(0, options.windowDays) : 1;
+    const date = parseIsoDate(candidate?.date) || "";
+    const cents = toCents(candidate?.amount);
+    if (!date || !Number.isFinite(cents) || cents === 0) return null;
+
+    const merchant = normalizeMerchant(candidate?.merchant || candidate?.name || "");
+    const channel = captureChannelKey(candidate);
+    const records = Array.isArray(ledger) ? ledger : [];
+
+    // Newest first: if a purchase somehow has two prior copies, the most recent
+    // one is the more useful thing to name in the warning.
+    for (let index = records.length - 1; index >= 0; index -= 1) {
+      const record = records[index];
+      if (toCents(record?.amount) !== cents) continue;
+      const recordDate = parseIsoDate(record?.date) || "";
+      if (!recordDate) continue;
+      const gap = Math.abs(Math.round((new Date(`${date}T00:00:00`).getTime() - new Date(`${recordDate}T00:00:00`).getTime()) / DAY_MS));
+      if (!Number.isFinite(gap) || gap > windowDays) continue;
+      if (captureChannelKey(record) === channel) continue;
+      // A bank feed often carries a merchant the manual capture lacks, and vice
+      // versa. An empty merchant on either side still matches on amount + date.
+      const recordMerchant = normalizeMerchant(record?.merchant || "");
+      if (merchant && recordMerchant && merchant !== recordMerchant) continue;
+      return record;
+    }
+    return null;
+  }
+
+  // Appends to the rolling record of what each method has captured. Duplicates
+  // that were skipped are recorded too (flagged) — they are exactly the evidence
+  // the overlap report needs to tell you which two methods are fighting.
+  function appendCaptureLedger(ledger, record, limit = 400) {
+    const list = Array.isArray(ledger) ? ledger.slice() : [];
+    const entry = {
+      date: parseIsoDate(record?.date) || "",
+      amount: roundCurrencyAmount(Number(record?.amount || 0)),
+      merchant: normalizeWhitespace(record?.merchant || record?.name || ""),
+      method: normalizeCaptureMethod(record?.method),
+      source: normalizeWhitespace(record?.source || ""),
+      at: String(record?.at || ""),
+    };
+    if (record?.skipped) entry.skipped = true;
+    list.push(entry);
+    const max = Number.isFinite(limit) && limit > 0 ? limit : 400;
+    return list.length > max ? list.slice(-max) : list;
+  }
+
+  // Which pairs of channels have been logging the same transactions? Answers the
+  // "are two of my capture methods overlapping?" question from evidence rather
+  // than from guesswork about what a given Shortcut might be covering.
+  function summarizeCaptureOverlap(ledger, options = {}) {
+    const records = Array.isArray(ledger) ? ledger : [];
+    const since = parseIsoDate(options.since) || "";
+    const groups = new Map();
+
+    for (const record of records) {
+      const date = parseIsoDate(record?.date) || "";
+      if (!date || (since && date < since)) continue;
+      const key = transactionFingerprint(record);
+      if (!groups.has(key)) groups.set(key, { date, channels: new Set(), merchant: record?.merchant || "", amount: roundCurrencyAmount(Number(record?.amount || 0)) });
+      groups.get(key).channels.add(captureChannelKey(record));
+    }
+
+    const pairs = new Map();
+    for (const group of groups.values()) {
+      const channels = [...group.channels].sort();
+      if (channels.length < 2) continue;
+      for (let a = 0; a < channels.length; a += 1) {
+        for (let b = a + 1; b < channels.length; b += 1) {
+          const key = `${channels[a]}→${channels[b]}`;
+          if (!pairs.has(key)) pairs.set(key, { channels: [channels[a], channels[b]], count: 0, lastDate: "", sample: null });
+          const pair = pairs.get(key);
+          pair.count += 1;
+          if (group.date > pair.lastDate) {
+            pair.lastDate = group.date;
+            pair.sample = { date: group.date, amount: group.amount, merchant: group.merchant };
+          }
+        }
+      }
+    }
+
+    return [...pairs.values()].sort((left, right) => right.count - left.count || right.lastDate.localeCompare(left.lastDate));
+  }
+
+  // The phone can append to the gist between the read and the clear that follows
+  // it. Only the exact prefix that was consumed is removed, so anything that
+  // landed after it survives to the next poll. A `null` return means the file was
+  // rewritten out from under us and must be left alone.
+  function buildGistRemainder(consumed, current) {
+    const before = String(consumed || "");
+    const now = String(current || "");
+    if (!before) return now;
+    if (now.startsWith(before)) return now.slice(before.length);
+    return null;
+  }
+
   // Minimal RFC-4180-ish CSV reader: handles quoted fields, escaped quotes,
   // embedded commas and newlines. Returns an array of cell arrays.
   function parseCsvRows(text) {
@@ -1833,12 +2002,20 @@ const core = (() => {
       const cadence = normalizeCadence(rest[0]);
       if (!cadence) continue;
       const rawCadence = rest[0];
-      const name = rest.slice(1).join("/") || normalizeCategoryPath(entry.merchant || "") || "recurring";
+      const taggedName = rest.slice(1).join("/");
+      const name = taggedName || normalizeCategoryPath(entry.merchant || "") || "recurring";
       const key = `${cadence}/${name}`;
       const date = parseIsoDate(entry.date) || "";
       const amount = roundCurrencyAmount(entry.amount || 0);
       const current = items.get(key);
       if (!current) {
+        // A $0 line is a skip marker for a bill that already exists — it moves
+        // that bill's anchor forward. On a tag with no item name (a bare
+        // `subscriptions/monthly`) the name falls back to the merchant, which for
+        // a skip is its own note line: that used to mint a phantom "Skipped This
+        // Cycle" bill, and skipping *that* wrote another nameless line, so the
+        // ghost renewed itself forever. A skip can never introduce a bill.
+        if (!(amount > 0) && !taggedName) continue;
         items.set(key, {
           cadence,
           rawCadence,
@@ -1928,10 +2105,105 @@ const core = (() => {
     return Number((Math.round(Number(cents) || 0) / 100).toFixed(2));
   }
 
+  // Projects one bill's upcoming due dates together with the amount each of them
+  // will actually be charged at. A scheduled price change (Next Amount / Change
+  // Date) only applies from its date onward, so the cycles landing before it are
+  // still owed at the old price — that split is the whole point of this helper,
+  // and it is what lets the UI say "two more at $89.00, then $66.50" instead of
+  // only "changing to $66.50 on 2026-08-15". End Date and Payments Left stop the
+  // walk, so a bill that retires mid-window is not projected past its own end.
+  //
+  // Options: referenceDate, count (max occurrences, default 12), end (horizon
+  // date), plus amount/nextAmount/changeDate/endDate/paymentsLeft/nextDue
+  // overrides so an editor can preview terms that have not been saved yet.
+  function buildRecurringSchedule(item, options = {}) {
+    const cadence = normalizeCadence(options.cadence ?? item?.cadence);
+    const spec = RECURRING_CADENCES[cadence];
+    const referenceDate = parseIsoDate(options.referenceDate) || todayIsoLocal();
+    const horizon = parseIsoDate(options.end || "") || "";
+    const maxCount = Number.isFinite(options.count) && options.count > 0 ? Math.floor(options.count) : 12;
+
+    const pick = (key) => (options[key] !== undefined ? options[key] : item?.[key]);
+    // null/""/undefined all mean "not set" here. Number(null) is 0, not NaN, so
+    // a plain Number.isFinite guard would read an unset Payments Left as "none
+    // left" and stop the schedule before its first occurrence.
+    const asNumber = (value) => {
+      if (value === null || value === undefined || value === "") return null;
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : null;
+    };
+    const amount = roundCurrencyAmount(asNumber(pick("amount")) ?? asNumber(item?.lastAmount) ?? 0);
+    const rawNextAmount = asNumber(pick("nextAmount"));
+    const nextAmount = rawNextAmount !== null && rawNextAmount > 0 ? roundCurrencyAmount(rawNextAmount) : null;
+    const changeDate = nextAmount ? parseIsoDate(pick("changeDate") || "") : "";
+    const endDate = parseIsoDate(pick("endDate") || "") || "";
+    const rawPaymentsLeft = asNumber(pick("paymentsLeft"));
+    const paymentsLeft = rawPaymentsLeft !== null && rawPaymentsLeft >= 0 ? Math.floor(rawPaymentsLeft) : null;
+
+    const empty = {
+      afterChange: { count: 0, total: 0 },
+      beforeChange: { count: 0, total: 0 },
+      cadence,
+      changeDate: changeDate || "",
+      changeOccurrence: "",
+      finishReason: "",
+      finishesOn: "",
+      nextAmount: nextAmount || null,
+      occurrences: [],
+    };
+
+    const start = parseIsoDate(pick("nextDue") || "");
+    if (!spec || !start) return empty;
+
+    const occurrences = [];
+    let due = start;
+    let guard = 0;
+    let finishReason = "";
+    // The guard stops a corrupt cadence from looping forever.
+    while (due && guard < 400 && occurrences.length < maxCount) {
+      guard += 1;
+      if (endDate && due > endDate) {
+        finishReason = "end-date";
+        break;
+      }
+      if (paymentsLeft !== null && occurrences.length >= paymentsLeft) {
+        finishReason = "payments";
+        break;
+      }
+      if (horizon && due > horizon) break;
+      const isNewPrice = Boolean(changeDate && due >= changeDate);
+      occurrences.push({
+        amount: isNewPrice ? nextAmount : amount,
+        date: due,
+        index: occurrences.length,
+        isNewPrice,
+        isPast: due < referenceDate,
+      });
+      due = nextRecurringDate(due, cadence);
+    }
+
+    const before = occurrences.filter((occurrence) => !occurrence.isNewPrice);
+    const after = occurrences.filter((occurrence) => occurrence.isNewPrice);
+    const sum = (list) => roundCurrencyAmount(list.reduce((total, occurrence) => total + occurrence.amount, 0));
+
+    return {
+      ...empty,
+      afterChange: { count: after.length, total: sum(after) },
+      beforeChange: { count: before.length, total: sum(before) },
+      changeOccurrence: after[0]?.date || "",
+      finishReason,
+      finishesOn: finishReason ? occurrences[occurrences.length - 1]?.date || "" : "",
+      occurrences,
+    };
+  }
+
   // Walks each active bill's schedule forward and sums every occurrence landing
   // on or before `end`. This is what makes the runway target react to the
   // calendar rather than to an average: a yearly insurance renewal is worth
   // nothing to the target until it enters the window, then worth all of it.
+  // Each occurrence is priced through buildRecurringSchedule, so a bill with a
+  // price change landing inside the window is counted at the price that will
+  // actually be charged, and one that retires inside the window stops there.
   // Returns integer cents plus the individual occurrences, newest last.
   function sumRecurringDueWithin(recurring, referenceDate, end) {
     const today = parseIsoDate(referenceDate) || todayIsoLocal();
@@ -1942,14 +2214,21 @@ const core = (() => {
 
     for (const item of recurring?.items || []) {
       if (!RECURRING_CADENCES[item.cadence] || !(item.lastAmount > 0) || item.active === false) continue;
-      const amountCents = toCents(item.lastAmount);
-      let due = item.nextDue;
-      // The guard stops a corrupt cadence from looping forever; 400 covers a
-      // weekly bill across a 6-year window, far beyond any sane runway.
-      for (let guard = 0; due && due <= horizon && guard < 400; guard += 1) {
-        totalCents += amountCents;
-        occurrences.push({ date: due, amount: item.lastAmount, label: item.label, name: item.name, cadence: item.cadence });
-        due = nextRecurringDate(due, item.cadence);
+      const schedule = buildRecurringSchedule(item, {
+        count: 400,
+        end: horizon,
+        referenceDate: today,
+      });
+      for (const occurrence of schedule.occurrences) {
+        totalCents += toCents(occurrence.amount);
+        occurrences.push({
+          amount: occurrence.amount,
+          cadence: item.cadence,
+          date: occurrence.date,
+          isNewPrice: occurrence.isNewPrice,
+          label: item.label,
+          name: item.name,
+        });
       }
     }
 
@@ -2137,9 +2416,18 @@ const core = (() => {
       const baseAmount = entry?.amount > 0 ? entry.amount : variable ? item.averageAmount ?? item.lastAmount : item.lastAmount;
       const changePending = entry?.nextAmount > 0 && entry?.changeDate && entry.changeDate > referenceDate;
       const changeApplied = entry?.nextAmount > 0 && entry?.changeDate && entry.changeDate <= referenceDate;
+      // lastAmount is "what a payment made right now costs", so auto-logging and
+      // Log now stay on the old price until the change date genuinely arrives.
       const lastAmount = changeApplied ? entry.nextAmount : baseAmount;
       const spec = RECURRING_CADENCES[item.cadence];
       const nextDue = entry?.nextDue || item.nextDue;
+      // …but every forward-looking figure has to use the price that will apply on
+      // the next due date. A bill repricing on 15 Aug whose next payment is not
+      // until 8 Oct will never be charged the old price again, so projecting its
+      // monthly cost off that price simply overstates it.
+      const nextDueAmount = entry?.nextAmount > 0 && entry?.changeDate && nextDue && entry.changeDate <= nextDue
+        ? entry.nextAmount
+        : lastAmount;
 
       const endDate = entry?.endDate || null;
       const paymentsLeft = Number.isFinite(entry?.paymentsLeft) ? entry.paymentsLeft : null;
@@ -2172,6 +2460,7 @@ const core = (() => {
         variable,
         lastAmount,
         nextAmount: changePending ? entry.nextAmount : null,
+        nextDueAmount,
         changeDate: changePending ? entry.changeDate : null,
         nextDue,
         endDate,
@@ -2180,8 +2469,8 @@ const core = (() => {
         finishedReason,
         status,
         daysUntilDue,
-        monthlyCost: spec ? roundCurrencyAmount(lastAmount * spec.perMonth) : item.monthlyCost,
-        yearlyCost: spec ? roundCurrencyAmount(lastAmount * spec.perMonth * 12) : item.yearlyCost,
+        monthlyCost: spec ? roundCurrencyAmount(nextDueAmount * spec.perMonth) : item.monthlyCost,
+        yearlyCost: spec ? roundCurrencyAmount(nextDueAmount * spec.perMonth * 12) : item.yearlyCost,
       };
     });
     const activeItems = items.filter((item) => item.active);
@@ -3016,6 +3305,7 @@ const core = (() => {
     RUNWAY_LEGACY_KEYS,
     parseRunwayPeriod,
     runwayWindowEnd,
+    buildRecurringSchedule,
     sumRecurringDueWithin,
     toCents,
     fromCents,
@@ -3062,6 +3352,17 @@ const core = (() => {
     parseFlexibleDate,
     normalizeMerchant,
     transactionFingerprint,
+    CAPTURE_METHODS,
+    CAPTURE_METHOD_LABELS,
+    captureMethodLabel,
+    normalizeCaptureMethod,
+    captureChannelKey,
+    describeCaptureChannel,
+    parseCaptureBatch,
+    findDuplicateCapture,
+    appendCaptureLedger,
+    summarizeCaptureOverlap,
+    buildGistRemainder,
     recomputeSpendingTotals,
     computeBudgetPace,
     replaceTransactionBlock,
@@ -3139,6 +3440,9 @@ const DEFAULT_SETTINGS = {
   openDailyNoteAfterCapture: false,
   dashboardDefaultGroupBy: "primary",
   dashboardSliceLabelThreshold: 0.08,
+  // How far the recurring block's payment calendar looks ahead: "1", "3" or
+  // "12" months. A `months:` (or `weeks:`) key in the block overrides it.
+  paymentCalendarMonths: "3",
   budgetCheckPeriod: "week",
   weekStartsOn: "monday",
   captureInboxFolder: "Utility/Finance/Inbox",
@@ -3146,6 +3450,17 @@ const DEFAULT_SETTINGS = {
   merchantMap: {},
   autoDrainInbox: true,
   processedExternalIds: [],
+  // Which transports are live. Every one of these can run at the same time —
+  // crossMethodDuplicates is what stops that turning into double-logging.
+  captureMethods: { url: true, batch: true, inbox: true, gist: false },
+  crossMethodDuplicates: "skip",
+  duplicateWindowDays: 1,
+  captureLedger: [],
+  gistCaptureId: "",
+  gistCaptureToken: "",
+  gistCaptureFilename: "finance-capture.txt",
+  gistCapturePollMinutes: 15,
+  gistCaptureLastSync: "",
   recurringTagPrefix: "subscriptions",
   recurringNoteName: "🔁 Recurring Payments.md",
   recurringSortOrder: "dueDate",
@@ -3192,6 +3507,14 @@ const SETTINGS_MIGRATIONS = [
     },
   },
 ];
+
+// Shown against each toggle in Settings → Capture methods.
+const CAPTURE_METHOD_DESCRIPTIONS = {
+  url: "A Shortcut opens obsidian://finance-capture?amount=… and Obsidian logs it. Works with any sync, but briefly foregrounds Obsidian for every transaction.",
+  batch: "A Shortcut queues transactions on the phone and flushes them all at once via obsidian://finance-capture?lines=… — one app switch a day instead of one per tap.",
+  inbox: "A Shortcut, Mac script, or the CSV reconcile drops a capture file into the inbox folder. Needs a vault the Files app can write to (iCloud Drive or Mac-local), so it does not work on the phone with Obsidian Sync.",
+  gist: "The phone appends a line to a private GitHub gist and the plugin polls it. Captures without opening Obsidian, works on Obsidian Sync, and is the only method that works from an Apple Watch.",
+};
 
 const FINANCE_CAPTURE_ACTION = "finance-capture";
 const DASHBOARD_BLOCK = "finance-dashboard";
@@ -3668,6 +3991,18 @@ class FinanceTrackerPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: "finance-tracker-sync-gist",
+      name: "Sync capture gist now",
+      callback: () => this.syncCaptureGist({ notify: true }),
+    });
+
+    this.addCommand({
+      id: "finance-tracker-capture-overlap",
+      name: "Check capture methods for overlap",
+      callback: () => new CaptureOverlapModal(this.app, this).open(),
+    });
+
+    this.addCommand({
       id: "finance-tracker-reconcile-csv",
       name: "Reconcile a bank CSV",
       callback: () => new BankReconcileModal(this.app, this).open(),
@@ -3787,6 +4122,10 @@ class FinanceTrackerPlugin extends Plugin {
     this.drainCaptureInbox({ notify: true }).catch((error) =>
       console.warn("[finance-tracker] initial inbox drain failed", error)
     );
+    this.syncCaptureGist({ notify: false }).catch((error) =>
+      console.warn("[finance-tracker] initial gist sync failed", error)
+    );
+    this.scheduleGistSync();
   }
 
   async activateDailyBudgetView() {
@@ -4051,16 +4390,91 @@ class FinanceTrackerPlugin extends Plugin {
     };
   }
 
+  // True unless the user has switched this transport off in settings. Absent
+  // keys read as enabled so a partial captureMethods object from an older
+  // data.json can never silently disable a method someone relies on.
+  isCaptureMethodEnabled(method) {
+    const configured = this.settings.captureMethods;
+    if (!configured || typeof configured !== "object") return DEFAULT_SETTINGS.captureMethods[method] !== false;
+    if (!Object.prototype.hasOwnProperty.call(configured, method)) {
+      return DEFAULT_SETTINGS.captureMethods[method] !== false;
+    }
+    return configured[method] !== false;
+  }
+
+  // Entry point for `obsidian://finance-capture`. Handles both a single
+  // transaction (?amount=…) and a batched queue (?lines=…), which are separate
+  // methods because someone may well want the queue without the per-tap open.
   async handleCapture(params) {
+    const batch = String(params?.lines || params?.batch || "").trim();
+    if (batch) {
+      if (!this.isCaptureMethodEnabled("batch")) {
+        new Notice("Finance: batched capture is turned off in settings.");
+        return;
+      }
+      await this.handleCaptureBatch(batch);
+      return;
+    }
+
+    if (!this.isCaptureMethodEnabled("url")) {
+      new Notice("Finance: URL capture is turned off in settings.");
+      return;
+    }
+
     try {
       const expense = this.parseCaptureParams(params);
-      const result = await this.handleCaptureExpense(expense, { notify: true });
+      const result = await this.handleCaptureExpense(expense, { notify: true, method: "url" });
       if (result.skipped) {
-        new Notice(`Finance: skipped duplicate capture (${expense.externalId})`);
+        new Notice(this.describeSkippedCapture(result));
       }
     } catch (error) {
       new Notice(`Finance capture failed: ${error.message}`);
     }
+  }
+
+  // Drains a queue built up on the phone and flushed in one go, so an Apple Pay
+  // automation never has to foreground Obsidian per tap. Each line is the same
+  // one-line format the inbox folder uses; a bad line is quarantined rather
+  // than costing the rest of the batch.
+  async handleCaptureBatch(raw, options = {}) {
+    const method = options.method || "batch";
+    const { entries, failures } = core.parseCaptureBatch(raw);
+    let logged = 0;
+    let duplicates = 0;
+    const errors = [...failures];
+
+    for (const params of entries) {
+      try {
+        const expense = this.parseCaptureParams(params);
+        const result = await this.handleCaptureExpense(expense, { notify: false, method });
+        if (result.skipped) duplicates += 1;
+        else logged += 1;
+      } catch (error) {
+        errors.push({ line: core.buildInboxLine(params) || String(params), reason: error?.message || String(error) });
+      }
+    }
+
+    for (const failure of errors) {
+      await this.quarantineCaptureText(failure.line, failure.reason);
+    }
+
+    if (options.notify !== false) {
+      const parts = [];
+      if (logged) parts.push(`logged ${logged}`);
+      if (duplicates) parts.push(`skipped ${duplicates} duplicate${duplicates === 1 ? "" : "s"}`);
+      if (errors.length) parts.push(`${errors.length} need${errors.length === 1 ? "s" : ""} attention`);
+      new Notice(`Finance: ${parts.length ? parts.join(", ") : "nothing to log"}.`);
+    }
+    if (logged) this.refreshDailyBudgetView();
+    return { logged, duplicates, failed: errors.length };
+  }
+
+  describeSkippedCapture(result) {
+    if (result?.reason === "cross-method-duplicate" && result.duplicateOf) {
+      const channel = core.describeCaptureChannel(core.captureChannelKey(result.duplicateOf));
+      return `Finance: already captured via ${channel} — skipped.`;
+    }
+    return `Finance: skipped duplicate capture (${result?.expense?.externalId || "already logged"})`;
   }
 
   // Single write path shared by the URL handler, the inbox drainer, and the
@@ -4068,9 +4482,27 @@ class FinanceTrackerPlugin extends Plugin {
   // external-id de-duplication, then inserts into the routed daily note.
   async handleCaptureExpense(expenseInput, options = {}) {
     let expense = { ...expenseInput };
+    const method = core.normalizeCaptureMethod(options.method || "quick-add");
 
     if (expense.externalId && this.isExternalIdProcessed(expense.externalId)) {
       return { skipped: true, reason: "duplicate", expense };
+    }
+
+    // Cross-method check: has another transport already captured this exact
+    // purchase? Only fires across channels, so repeat purchases down the same
+    // pipe are still logged (see findDuplicateCapture).
+    const handling = this.settings.crossMethodDuplicates || "skip";
+    let duplicateOf = null;
+    if (handling !== "off" && !options.force) {
+      duplicateOf = core.findDuplicateCapture(
+        { ...expense, method, source: expense.source },
+        this.settings.captureLedger,
+        { windowDays: Number(this.settings.duplicateWindowDays) || 0 }
+      );
+    }
+    if (duplicateOf && handling === "skip") {
+      await this.recordCapture(expense, method, { skipped: true });
+      return { skipped: true, reason: "cross-method-duplicate", duplicateOf, expense };
     }
 
     if ((!expense.category || expense.category === "uncategorized") && expense.merchant) {
@@ -4116,8 +4548,17 @@ class FinanceTrackerPlugin extends Plugin {
     if (expense.externalId) {
       await this.markExternalIdProcessed(expense.externalId);
     }
+    await this.recordCapture(expense, method);
     this.invalidateIndexEntry(file.path);
     this._scheduleStatusBarUpdate();
+
+    // "warn" logs the entry anyway and tells you what it collided with, so a
+    // genuine second purchase is never silently swallowed.
+    if (duplicateOf && handling === "warn") {
+      new Notice(
+        `Finance: logged, but ${core.formatCurrency(expense.amount, expense.currency)} on ${expense.date} was already captured via ${core.describeCaptureChannel(core.captureChannelKey(duplicateOf))}.`
+      );
+    }
 
     const shouldOpen = options.openNote ?? this.settings.openDailyNoteAfterCapture;
     if (shouldOpen) {
@@ -4129,6 +4570,33 @@ class FinanceTrackerPlugin extends Plugin {
     }
 
     return { skipped: false, file, expense };
+  }
+
+  // The rolling record of what each transport has captured. It is kept in
+  // data.json rather than read back out of the notes because the daily-note
+  // bullet deliberately does not carry the capture method — and the method is
+  // the whole basis of cross-method duplicate detection. Skipped duplicates are
+  // recorded too: they are the evidence the overlap report runs on.
+  async recordCapture(expense, method, options = {}) {
+    this.settings.captureLedger = core.appendCaptureLedger(
+      this.settings.captureLedger,
+      {
+        date: expense?.date,
+        amount: expense?.amount,
+        merchant: expense?.merchant || expense?.name || "",
+        method,
+        source: expense?.source || "",
+        at: new Date().toISOString(),
+        skipped: Boolean(options.skipped),
+      },
+      400
+    );
+    await this.saveSettings();
+  }
+
+  captureOverlapReport(days = 60) {
+    const since = core.addDays(core.todayIsoLocal(), -Math.abs(Number(days) || 60));
+    return core.summarizeCaptureOverlap(this.settings.captureLedger, { since });
   }
 
   isExternalIdProcessed(id) {
@@ -4389,6 +4857,7 @@ class FinanceTrackerPlugin extends Plugin {
   // the correct daily notes, then deletes them. Unparseable files are moved to
   // an `_failed` subfolder with the error noted, never silently dropped.
   async drainCaptureInbox(options = {}) {
+    if (!this.isCaptureMethodEnabled("inbox")) return 0;
     const folderPath = normalizePath(this.settings.captureInboxFolder || "");
     if (!folderPath) return 0;
     const prefix = `${folderPath}/`;
@@ -4416,7 +4885,7 @@ class FinanceTrackerPlugin extends Plugin {
       }
       try {
         const expense = this.parseCaptureParams(params);
-        const result = await this.handleCaptureExpense(expense, { notify: false });
+        const result = await this.handleCaptureExpense(expense, { notify: false, method: "inbox" });
         await this.app.vault.delete(file);
         if (!result.skipped) processed += 1;
       } catch (error) {
@@ -4451,6 +4920,21 @@ class FinanceTrackerPlugin extends Plugin {
     }
   }
 
+  // Same idea as quarantineCapture, but for a line that never had a file of its
+  // own — a bad line inside a batch or a gist. Nothing is ever dropped silently.
+  async quarantineCaptureText(raw, reason) {
+    try {
+      const failedFolder = normalizePath(`${this.settings.captureInboxFolder}/_failed`);
+      await this.ensureFolder(failedFolder);
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const target = normalizePath(`${failedFolder}/${stamp}-${Math.random().toString(36).slice(2, 6)}.txt`);
+      const body = `<!-- finance-capture error: ${String(reason || "").replace(/--+>/g, "->")} -->\n${raw}`;
+      await this.upsertFile(target, body);
+    } catch (error) {
+      console.warn("[finance-tracker] failed to quarantine capture line", error);
+    }
+  }
+
   _scheduleInboxDrain() {
     if (!this.settings.autoDrainInbox) return;
     clearTimeout(this._inboxDrainTimer);
@@ -4459,6 +4943,155 @@ class FinanceTrackerPlugin extends Plugin {
         console.warn("[finance-tracker] inbox drain failed", error)
       );
     }, 1500);
+  }
+
+  // ---------------------------------------------------------------------------
+  // GitHub gist capture
+  //
+  // The only transport that captures without launching Obsidian *and* works on
+  // an Obsidian Sync vault: the phone appends a capture line to a private gist,
+  // and the plugin polls it with requestUrl (which works on iOS too, and is not
+  // subject to CORS). Drained lines are removed from the gist afterwards.
+  // ---------------------------------------------------------------------------
+
+  gistCaptureConfigured() {
+    return Boolean(String(this.settings.gistCaptureId || "").trim() && String(this.settings.gistCaptureToken || "").trim());
+  }
+
+  async _gistRequest(method, body) {
+    const id = String(this.settings.gistCaptureId || "").trim();
+    const response = await requestUrl({
+      url: `https://api.github.com/gists/${encodeURIComponent(id)}`,
+      method,
+      headers: {
+        Authorization: `Bearer ${String(this.settings.gistCaptureToken || "").trim()}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        ...(body ? { "Content-Type": "application/json" } : {}),
+      },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+      throw: false,
+    });
+    if (response.status === 401 || response.status === 403) {
+      throw new Error("GitHub rejected the token (check it has the `gist` scope and has not expired).");
+    }
+    if (response.status === 404) {
+      throw new Error("Gist not found — check the gist ID, and that the token can see it.");
+    }
+    if (response.status >= 400) {
+      throw new Error(`GitHub returned ${response.status}.`);
+    }
+    return response.json;
+  }
+
+  // Gists over ~1MB come back truncated, with the full body behind raw_url.
+  async _readGistFile(fileEntry) {
+    let content = String(fileEntry?.content || "");
+    if (fileEntry?.truncated && fileEntry.raw_url) {
+      const raw = await requestUrl({ url: fileEntry.raw_url, throw: false });
+      if (raw.status < 400) content = String(raw.text || "");
+    }
+    return content;
+  }
+
+  async syncCaptureGist(options = {}) {
+    if (!this.isCaptureMethodEnabled("gist")) return 0;
+    if (!this.gistCaptureConfigured()) {
+      if (options.notify) new Notice("Finance: set a gist ID and token in settings first.");
+      return 0;
+    }
+    if (this._gistSyncing) return 0;
+    this._gistSyncing = true;
+
+    try {
+      const filename = String(this.settings.gistCaptureFilename || "").trim() || DEFAULT_SETTINGS.gistCaptureFilename;
+      const gist = await this._gistRequest("GET");
+      const files = gist?.files && typeof gist.files === "object" ? gist.files : {};
+      const names = Object.keys(files);
+      if (!names.length) {
+        if (options.notify) new Notice("Finance: the capture gist is empty.");
+        return 0;
+      }
+
+      const totals = { logged: 0, duplicates: 0, failed: 0 };
+      const patch = {};
+      let raced = false;
+
+      for (const name of names) {
+        const consumed = await this._readGistFile(files[name]);
+        if (!consumed.trim()) continue;
+
+        const result = await this.handleCaptureBatch(consumed, { method: "gist", notify: false });
+        totals.logged += result.logged;
+        totals.duplicates += result.duplicates;
+        totals.failed += result.failed;
+        if (result.logged + result.duplicates + result.failed === 0) continue;
+
+        if (name === filename) {
+          // The shared queue file is appended to, so it is cleared down to a
+          // marker rather than deleted — and only the prefix we actually read
+          // is removed, so anything added mid-sync survives to the next poll.
+          const after = await this._gistRequest("GET");
+          const currentContent = String(after?.files?.[name]?.content ?? consumed);
+          const remainder = core.buildGistRemainder(consumed, currentContent);
+          if (remainder === null) raced = true;
+          else patch[name] = { content: `# drained ${new Date().toISOString()}\n${remainder}` };
+        } else {
+          // A one-file-per-capture drop from an automation. Nothing appends to
+          // it, so there is no race to guard against — just delete it. A gist
+          // must keep at least one file, which the queue file above provides.
+          patch[name] = null;
+        }
+      }
+
+      if (raced) {
+        new Notice("Finance: the capture gist changed mid-sync and was left as-is — check it for anything logged twice.");
+      }
+      if (Object.keys(patch).length) {
+        // A gist cannot be left with no files at all, which is what would happen
+        // to one holding nothing but per-capture drops. Recreate the queue file
+        // as the placeholder in that case.
+        const deletingEverything = names.every((name) => patch[name] === null);
+        if (deletingEverything) {
+          patch[filename] = { content: `# drained ${new Date().toISOString()}\n` };
+        }
+        await this._gistRequest("PATCH", { files: patch });
+      }
+
+      this.settings.gistCaptureLastSync = new Date().toISOString();
+      await this.saveSettings();
+
+      if (options.notify) {
+        const parts = [];
+        if (totals.logged) parts.push(`logged ${totals.logged}`);
+        if (totals.duplicates) parts.push(`skipped ${totals.duplicates} duplicate${totals.duplicates === 1 ? "" : "s"}`);
+        if (totals.failed) parts.push(`${totals.failed} need attention`);
+        new Notice(`Finance gist: ${parts.length ? parts.join(", ") : "nothing waiting"}.`);
+      }
+      if (totals.logged) this.refreshDailyBudgetView();
+      return totals.logged;
+    } catch (error) {
+      if (options.notify) new Notice(`Finance gist sync failed: ${error.message}`);
+      console.warn("[finance-tracker] gist sync failed", error);
+      return 0;
+    } finally {
+      this._gistSyncing = false;
+    }
+  }
+
+  // Polling is re-armed from scratch whenever the settings change, so toggling
+  // the method or editing the interval takes effect without a reload.
+  scheduleGistSync() {
+    if (this._gistPollTimer) {
+      window.clearInterval(this._gistPollTimer);
+      this._gistPollTimer = null;
+    }
+    if (!this.isCaptureMethodEnabled("gist") || !this.gistCaptureConfigured()) return;
+    const minutes = Math.max(1, Number(this.settings.gistCapturePollMinutes) || 15);
+    this._gistPollTimer = window.setInterval(() => {
+      this.syncCaptureGist({ notify: false }).catch(() => {});
+    }, minutes * 60 * 1000);
+    this.registerInterval(this._gistPollTimer);
   }
 
   refreshDailyBudgetView() {
@@ -5330,8 +5963,16 @@ class FinanceTrackerPlugin extends Plugin {
   // Logs a $0 entry dated on the due day: the cadence anchor advances, the
   // inferred amount is untouched, and the skip is visible in the daily note.
   async logRecurringSkip(item) {
+    // The tag must name the bill. A bare `#log/spending/subscriptions/monthly`
+    // skip line names no item, so the next parse can only fall back to the
+    // line's own note text and invent a bill out of the marker.
+    const category = core.normalizeCategoryPath(item.category || "");
+    const named = category && item.name && !category.endsWith(`/${item.name}`)
+      ? `${category}/${item.name}`
+      : category;
+    const tag = named ? core.buildCategoryTag(named) : item.tag;
     return this.appendFinanceLines(item.nextDue || core.todayIsoLocal(), [
-      `\t- ${core.formatCurrency(0, item.currency || this.settings.defaultCurrency)} ${item.tag}`,
+      `\t- ${core.formatCurrency(0, item.currency || this.settings.defaultCurrency)} ${tag}`,
       "\t\t- Skipped this cycle",
     ]);
   }
@@ -5747,7 +6388,14 @@ class FinanceTrackerPlugin extends Plugin {
     const sourceFile = this.app.vault.getAbstractFileByPath(sourcePath);
     if (sourceFile instanceof TFile) {
       const cache = this.app.metadataCache.getFileCache(sourceFile);
-      const frontmatterDate = core.parseIsoDate(cache?.frontmatter?.date);
+      // Daily notes carry `date`, but the Journals plugin's week/month/
+      // quarter/year notes only carry `journal-date` — without this fallback
+      // a dashboard block embedded in e.g. a monthly note has no frontmatter
+      // date to read, and its filename (`2026-07.md`) has no day component
+      // either, so it silently fell through to today's date instead of the
+      // note's own month.
+      const frontmatterDate =
+        core.parseIsoDate(cache?.frontmatter?.date) || core.parseIsoDate(cache?.frontmatter?.["journal-date"]);
       if (frontmatterDate) return frontmatterDate;
       const pathDate = core.extractNoteDate("", sourceFile.path);
       if (pathDate) return pathDate;
@@ -6708,6 +7356,15 @@ class FinanceTrackerPlugin extends Plugin {
         weekRefs.set(`week:${weekIndex}:${week[0]}`, { detail, days: week });
       }
 
+      // Traces an outline around each month's days as a proper rectilinear
+      // polygon (union of the grid cells belonging to that month), instead of
+      // stitching together per-row segments left-to-right. The old approach
+      // assumed each month's row segments nested neatly under one another —
+      // true for a plain calendar month, but a trip calendar's rows rarely
+      // start on column 0, so a month can occupy e.g. only the last column in
+      // one row and only the first two in the next. Connecting those with a
+      // simple left/right "staircase" produced a path that doubled back on
+      // itself. Tracing actual cell-union boundary edges handles any shape.
       const renderMonthOutlines = () => {
         overlayHost.empty();
         const bodyRect = calendarBody.getBoundingClientRect();
@@ -6724,125 +7381,178 @@ class FinanceTrackerPlugin extends Plugin {
           ? calendarCellMeta.get(selectedDay).weekIndex
           : -1;
 
-        const weekRowBounds = tripWeeks.map((week) => {
-          const firstDay = week[0];
-          const firstMeta = calendarCellMeta.get(firstDay);
-          const rect = firstMeta?.cell?.getBoundingClientRect();
-          return rect
-            ? {
-                bottom: rect.bottom - bodyRect.top,
-                top: rect.top - bodyRect.top,
-              }
-            : null;
-        });
+        const outerInset = 2;
+        const numRows = tripWeeks.length;
 
-        const monthSegmentsByKey = new Map();
-        const outlineStrokeWidth = 2;
-        const outlineHalfStroke = outlineStrokeWidth / 2;
-        for (let weekIndex = 0; weekIndex < tripWeeks.length; weekIndex += 1) {
-          const week = tripWeeks[weekIndex];
-          let segmentStart = 0;
-          while (segmentStart < week.length) {
-            const segmentMonthKey = monthKeyForDay(week[segmentStart]);
-            let segmentEnd = segmentStart;
-            while (segmentEnd + 1 < week.length && monthKeyForDay(week[segmentEnd + 1]) === segmentMonthKey) {
-              segmentEnd += 1;
-            }
-
-            const startDay = week[segmentStart];
-            const endDay = week[segmentEnd];
-            const startMeta = calendarCellMeta.get(startDay);
-            const endMeta = calendarCellMeta.get(endDay);
-            if (startMeta?.cell && endMeta?.cell) {
-              const startRect = startMeta.cell.getBoundingClientRect();
-              const endRect = endMeta.cell.getBoundingClientRect();
-              const outerInset = 2;
-              const previousDay = segmentStart > 0 ? week[segmentStart - 1] : "";
-              const nextDay = segmentEnd < week.length - 1 ? week[segmentEnd + 1] : "";
-              const previousRect = previousDay ? calendarCellMeta.get(previousDay)?.cell?.getBoundingClientRect() : null;
-              const nextRect = nextDay ? calendarCellMeta.get(nextDay)?.cell?.getBoundingClientRect() : null;
-              const monthMeta = monthMetaByKey.get(segmentMonthKey);
-              const currentRow = weekRowBounds[weekIndex];
-              const previousRow = weekIndex > 0 ? weekRowBounds[weekIndex - 1] : null;
-              const nextRow = weekIndex < weekRowBounds.length - 1 ? weekRowBounds[weekIndex + 1] : null;
-              const segments = monthSegmentsByKey.get(segmentMonthKey) || [];
-              segments.push({
-                accent: monthMeta?.accent || "var(--h1-color, var(--text-accent))",
-                bottom: currentRow && nextRow
-                  ? weekIndex === selectedWeekIndex
-                    ? currentRow.bottom - outlineHalfStroke
-                    : ((currentRow.bottom + nextRow.top) / 2) - outlineHalfStroke
-                  : startRect.bottom - bodyRect.top + outerInset,
-                isMonthStart: startDay === monthMeta?.firstDay,
-                label: monthMeta?.label || "",
-                left: previousRect
-                  ? (((previousRect.right + startRect.left) / 2) - bodyRect.left) + outlineHalfStroke
-                  : startRect.left - bodyRect.left - outerInset,
-                right: nextRect
-                  ? (((endRect.right + nextRect.left) / 2) - bodyRect.left) - outlineHalfStroke
-                  : endRect.right - bodyRect.left + outerInset,
-                top: currentRow && previousRow
-                  ? (weekIndex - 1) === selectedWeekIndex
-                    ? currentRow.top + outlineHalfStroke
-                    : ((previousRow.bottom + currentRow.top) / 2) + outlineHalfStroke
-                  : startRect.top - bodyRect.top - outerInset,
-              });
-              monthSegmentsByKey.set(segmentMonthKey, segments);
-            }
-            segmentStart = segmentEnd + 1;
+        // day -> {row, col}, plus each day's live rect keyed the same way.
+        const dayAt = new Map();
+        const posByDay = new Map();
+        const rectByDay = new Map();
+        for (let weekIndex = 0; weekIndex < numRows; weekIndex += 1) {
+          for (const day of tripWeeks[weekIndex]) {
+            const col = getWeekdayIndex(day);
+            dayAt.set(`${weekIndex}:${col}`, day);
+            posByDay.set(day, { col, row: weekIndex });
+            const rect = calendarCellMeta.get(day)?.cell?.getBoundingClientRect();
+            if (rect) rectByDay.set(day, rect);
           }
         }
 
-        const buildMonthPath = (segments) => {
-          if (!segments.length) return "";
-          const ordered = segments.slice().sort((left, right) => left.top - right.top);
-          const points = [];
-          const first = ordered[0];
-          points.push([first.left, first.top], [first.right, first.top]);
-          for (let index = 0; index < ordered.length; index += 1) {
-            const current = ordered[index];
-            points.push([current.right, current.bottom]);
-            if (index < ordered.length - 1) {
-              const next = ordered[index + 1];
-              if (next.right !== current.right) {
-                points.push([next.right, current.bottom]);
-              }
-              if (next.top !== current.bottom) {
-                points.push([next.right, next.top]);
-              }
+        // Columns share the same 7-track grid width in every week row, so a
+        // single column's left/right only needs to be read from whichever row
+        // happens to have a day there.
+        const colLeftRaw = new Array(7).fill(null);
+        const colRightRaw = new Array(7).fill(null);
+        for (let col = 0; col < 7; col += 1) {
+          for (let row = 0; row < numRows; row += 1) {
+            const rect = rectByDay.get(dayAt.get(`${row}:${col}`));
+            if (rect) {
+              colLeftRaw[col] = rect.left - bodyRect.left;
+              colRightRaw[col] = rect.right - bodyRect.left;
+              break;
             }
           }
-          const last = ordered[ordered.length - 1];
-          points.push([last.left, last.bottom]);
-          for (let index = ordered.length - 1; index >= 0; index -= 1) {
-            const current = ordered[index];
-            points.push([current.left, current.top]);
-            if (index > 0) {
-              const previous = ordered[index - 1];
-              if (previous.left !== current.left) {
-                points.push([previous.left, current.top]);
-              }
-              if (previous.bottom !== current.top) {
-                points.push([previous.left, previous.bottom]);
-              }
+        }
+        // Plain midpoints, not offset by half the stroke width: two months
+        // sharing a border draw their strokes on that exact same line, which
+        // is what keeps every edge end-to-end connectable (see loop-stitch
+        // below) instead of leaving a stroke-width gap that breaks the trace.
+        const colBound = (col, side) => {
+          if (side === "left") {
+            if (colLeftRaw[col] == null) return null;
+            if (col > 0 && colRightRaw[col - 1] != null) {
+              return (colRightRaw[col - 1] + colLeftRaw[col]) / 2;
             }
+            return colLeftRaw[col] - outerInset;
           }
-          return points.map(([x, y], index) => `${index === 0 ? "M" : "L"} ${x} ${y}`).join(" ") + " Z";
+          if (colRightRaw[col] == null) return null;
+          if (col < 6 && colLeftRaw[col + 1] != null) {
+            return (colRightRaw[col] + colLeftRaw[col + 1]) / 2;
+          }
+          return colRightRaw[col] + outerInset;
         };
 
-        for (const [, segments] of monthSegmentsByKey.entries()) {
-          if (!segments.length) continue;
-          const ordered = segments.slice().sort((left, right) => left.top - right.top);
+        const rowTopRaw = new Array(numRows).fill(null);
+        const rowBottomRaw = new Array(numRows).fill(null);
+        for (let row = 0; row < numRows; row += 1) {
+          const rect = rectByDay.get(tripWeeks[row][0]);
+          if (rect) {
+            rowTopRaw[row] = rect.top - bodyRect.top;
+            rowBottomRaw[row] = rect.bottom - bodyRect.top;
+          }
+        }
+        const rowBound = (row, side) => {
+          if (side === "top") {
+            if (rowTopRaw[row] == null) return null;
+            if (row - 1 === selectedWeekIndex) return rowTopRaw[row] - outerInset;
+            if (row > 0 && rowBottomRaw[row - 1] != null) {
+              return (rowBottomRaw[row - 1] + rowTopRaw[row]) / 2;
+            }
+            return rowTopRaw[row] - outerInset;
+          }
+          if (rowBottomRaw[row] == null) return null;
+          if (row === selectedWeekIndex) return rowBottomRaw[row] + outerInset;
+          if (row < numRows - 1 && rowTopRaw[row + 1] != null) {
+            return (rowBottomRaw[row] + rowTopRaw[row + 1]) / 2;
+          }
+          return rowBottomRaw[row] + outerInset;
+        };
+
+        const monthAt = (row, col) => {
+          const day = dayAt.get(`${row}:${col}`);
+          return day ? monthKeyForDay(day) : null;
+        };
+
+        const monthsInGrid = new Map();
+        for (let row = 0; row < numRows; row += 1) {
+          for (let col = 0; col < 7; col += 1) {
+            const monthKey = monthAt(row, col);
+            if (monthKey && !monthsInGrid.has(monthKey)) monthsInGrid.set(monthKey, monthMetaByKey.get(monthKey));
+          }
+        }
+
+        const pointKey = (x, y) => `${x.toFixed(1)}:${y.toFixed(1)}`;
+
+        for (const [monthKey, monthMeta] of monthsInGrid.entries()) {
+          const edges = [];
+          for (let row = 0; row < numRows; row += 1) {
+            for (let col = 0; col < 7; col += 1) {
+              if (monthAt(row, col) !== monthKey) continue;
+              const left = colBound(col, "left");
+              const right = colBound(col, "right");
+              const top = rowBound(row, "top");
+              const bottom = rowBound(row, "bottom");
+              if (left == null || right == null || top == null || bottom == null) continue;
+
+              // Emit an edge for each side whose neighbour isn't the same
+              // month. Directions are chosen so a solid region's boundary
+              // walks clockwise, letting adjacent cells' edges chain end-to-
+              // start into one continuous loop. A row touching the expanded
+              // detail panel (selectedWeekIndex) is never visually adjacent
+              // to the row on the panel's far side, so that boundary always
+              // gets an edge even when the same month sits on both sides —
+              // otherwise the trace treats them as touching and cuts a
+              // diagonal straight through the gap.
+              const topOpen = (row - 1) === selectedWeekIndex || monthAt(row - 1, col) !== monthKey;
+              const bottomOpen = row === selectedWeekIndex || monthAt(row + 1, col) !== monthKey;
+              if (monthAt(row, col - 1) !== monthKey) edges.push([left, bottom, left, top]);
+              if (monthAt(row, col + 1) !== monthKey) edges.push([right, top, right, bottom]);
+              if (topOpen) edges.push([left, top, right, top]);
+              if (bottomOpen) edges.push([right, bottom, left, bottom]);
+            }
+          }
+          if (!edges.length) continue;
+
+          const byStart = new Map();
+          for (const edge of edges) {
+            const k = pointKey(edge[0], edge[1]);
+            const list = byStart.get(k) || [];
+            list.push(edge);
+            byStart.set(k, list);
+          }
+
+          const used = new Set();
+          const loops = [];
+          for (const startEdge of edges) {
+            if (used.has(startEdge)) continue;
+            const startPoint = [startEdge[0], startEdge[1]];
+            const loopPoints = [startPoint];
+            let current = startEdge;
+            used.add(current);
+            let guard = 0;
+            while (guard <= edges.length) {
+              guard += 1;
+              const endPoint = [current[2], current[3]];
+              if (endPoint[0] === startPoint[0] && endPoint[1] === startPoint[1]) break;
+              loopPoints.push(endPoint);
+              const candidates = (byStart.get(pointKey(endPoint[0], endPoint[1])) || []).filter((edge) => !used.has(edge));
+              if (!candidates.length) break;
+              current = candidates[0];
+              used.add(current);
+            }
+            if (loopPoints.length > 2) loops.push(loopPoints);
+          }
+          if (!loops.length) continue;
+
+          const pathData = loops
+            .map((loop) => loop.map(([x, y], index) => `${index === 0 ? "M" : "L"} ${x} ${y}`).join(" ") + " Z")
+            .join(" ");
+
           const path = svg.createSvg("path", { cls: "finance-tracker-calendar-month-path" });
-          path.setAttr("d", buildMonthPath(ordered));
-          path.setAttr("stroke", ordered[0].accent);
+          path.setAttr("d", pathData);
+          path.setAttr("stroke", monthMeta?.accent || "var(--h1-color, var(--text-accent))");
           path.setAttr("fill", "none");
-          const labelSegment = ordered.find((segment) => segment.isMonthStart) || ordered[0];
-          if (labelSegment.label) {
-            const label = overlayHost.createDiv({ cls: "finance-tracker-calendar-month-label", text: labelSegment.label });
-            label.style.left = `${labelSegment.left + 14}px`;
-            label.style.top = `${labelSegment.top + 10}px`;
-            label.style.color = labelSegment.accent;
+
+          const firstPos = monthMeta?.firstDay ? posByDay.get(monthMeta.firstDay) : null;
+          if (monthMeta?.label && firstPos) {
+            const labelLeft = colBound(firstPos.col, "left");
+            const labelTop = rowBound(firstPos.row, "top");
+            if (labelLeft != null && labelTop != null) {
+              const label = overlayHost.createDiv({ cls: "finance-tracker-calendar-month-label", text: monthMeta.label });
+              label.style.left = `${labelLeft + 14}px`;
+              label.style.top = `${labelTop + 10}px`;
+              label.style.color = monthMeta.accent;
+            }
           }
         }
       };
@@ -7746,6 +8456,296 @@ class FinanceTrackerPlugin extends Plugin {
     return logged;
   }
 
+  // A month-grid view of when the bills actually land, built the same way as
+  // the trip's planned-expenses calendar: dots per day, click a day for the
+  // detail. Seeing the cluster is the point — a list sorted by due date hides
+  // that three bills all fall on the 10th. Occurrences come from the same
+  // projection the runway uses, so a repriced cycle shows its new amount here.
+  renderRecurringCalendar(wrapper, recurring, currency, referenceDate, options = {}) {
+    const RANGE_CHOICES = [
+      { label: "1 month", months: 1 },
+      { label: "3 months", months: 3 },
+      { label: "12 months", months: 12 },
+    ];
+    const normalizeMonths = (value) => {
+      const months = Number(value);
+      if (!Number.isFinite(months)) return null;
+      // Snap to the nearest offered range so a hand-typed `months: 2` still
+      // lands on something the buttons can show as selected.
+      return RANGE_CHOICES.reduce(
+        (best, choice) => (Math.abs(choice.months - months) < Math.abs(best - months) ? choice.months : best),
+        RANGE_CHOICES[0].months
+      );
+    };
+    // Block config wins, then the setting, then three months.
+    let activeMonths =
+      normalizeMonths(options.months) ??
+      (Number.isFinite(options.weeks) && options.weeks > 0 ? normalizeMonths(Math.round(options.weeks / 4.345)) : null) ??
+      normalizeMonths(this.settings?.paymentCalendarMonths) ??
+      3;
+
+    const weekStartsOn = this.settings?.weekStartsOn === "sunday" ? "sunday" : "monday";
+    const weekdayLabels = weekStartsOn === "sunday"
+      ? ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+      : ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+    const thisWeek = core.toPeriodRange({ period: "week", referenceDate, weekStartsOn });
+    const start = thisWeek.start;
+
+    const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
+    const calendarHeader = section.createDiv({ cls: "finance-tracker-header" });
+    calendarHeader.createEl("h4", { text: "Payment calendar" });
+    const rangeBar = calendarHeader.createDiv({ cls: "finance-tracker-calendar-filter-bar" });
+
+    const headers = section.createDiv({ cls: "finance-tracker-calendar-weekdays" });
+    for (const label of weekdayLabels) {
+      headers.createDiv({ cls: "finance-tracker-calendar-weekday", text: label });
+    }
+
+    const body = section.createDiv({ cls: "finance-tracker-calendar-body" });
+    const monthLabel = (iso) => new Date(`${iso}T12:00:00`).toLocaleDateString("en-AU", { month: "long", year: "numeric" });
+    const dayLabel = (iso) =>
+      new Date(`${iso}T12:00:00`).toLocaleDateString("en-AU", { day: "numeric", month: "long", weekday: "long" });
+
+    let selectedDay = "";
+    let cellRefs = new Map();
+    // Each entry is { host, from, to }: the detail panel that owns a given span
+    // of days. The week view has one per week, the year view a single one.
+    let detailHosts = [];
+    let seenMonth = "";
+    let byDay = new Map();
+
+    const renderDetail = (host, day) => {
+      host.empty();
+      const items = byDay.get(day) || [];
+      if (!items.length) return;
+      const panel = host.createDiv({ cls: "finance-tracker-calendar-inline-details" });
+      const dayTotal = items.reduce((sum, occurrence) => sum + Number(occurrence.amount || 0), 0);
+      const heading = panel.createDiv({ cls: "finance-tracker-calendar-inline-date" });
+      heading.setText(`${dayLabel(day)} · ${core.formatCurrency(core.roundCurrencyAmount(dayTotal), currency)}`);
+      for (const occurrence of items) {
+        const row = panel.createDiv({ cls: "finance-tracker-calendar-inline-item" });
+        const summary = row.createDiv({ cls: "finance-tracker-calendar-inline-summary" });
+        summary.createSpan({ text: occurrence.label });
+        const meta = [cadenceLabel(occurrence.cadence)];
+        if (occurrence.isNewPrice) meta.push("new price");
+        summary.createSpan({
+          cls: "finance-tracker-budget-meta",
+          text: `${core.formatCurrency(occurrence.amount, currency)} · ${meta.join(" · ")}`,
+        });
+      }
+    };
+
+    const refresh = () => {
+      for (const [day, cell] of cellRefs.entries()) {
+        cell.toggleClass("is-selected", day === selectedDay);
+      }
+      for (const { host, from, to } of detailHosts) {
+        if (selectedDay && selectedDay >= from && selectedDay <= to) {
+          renderDetail(host, selectedDay);
+        } else {
+          host.empty();
+        }
+      }
+    };
+
+    // A year of week grids would be 52 stacked rows — technically the same
+    // information, useless to actually read. At twelve months the calendar
+    // switches to a month-per-row heat grid instead: one line per month, one
+    // cell per day-of-month, shaded by what falls due. Bills recur on the same
+    // day each month, so the vertical stripes *are* the pattern — the 9th and
+    // the 14th being heavy every month is visible in one glance.
+    const drawYearGrid = (start, end) => {
+      const monthCount = 12;
+      const dayTotals = new Map();
+      let heaviest = 0;
+      for (const [day, items] of byDay.entries()) {
+        const total = core.roundCurrencyAmount(items.reduce((sum, item) => sum + Number(item.amount || 0), 0));
+        dayTotals.set(day, total);
+        if (total > heaviest) heaviest = total;
+      }
+
+      const grid = body.createDiv({ cls: "finance-tracker-year-grid" });
+      grid.createDiv({ cls: "finance-tracker-year-head" });
+      for (let dayOfMonth = 1; dayOfMonth <= 31; dayOfMonth += 1) {
+        grid.createDiv({
+          cls: "finance-tracker-year-head",
+          // Labelling all 31 columns is unreadable at this size.
+          text: dayOfMonth === 1 || dayOfMonth % 5 === 0 ? String(dayOfMonth) : "",
+        });
+      }
+      grid.createDiv({ cls: "finance-tracker-year-head is-total", text: "Total" });
+
+      const firstOfStartMonth = `${start.slice(0, 7)}-01`;
+      for (let monthIndex = 0; monthIndex < monthCount; monthIndex += 1) {
+        const monthStart = core.addMonths(firstOfStartMonth, monthIndex);
+        const monthKey = monthStart.slice(0, 7);
+        const daysInMonth = new Date(Number(monthKey.slice(0, 4)), Number(monthKey.slice(5, 7)), 0).getDate();
+        grid.createDiv({
+          cls: "finance-tracker-year-month",
+          text: new Date(`${monthStart}T12:00:00`).toLocaleDateString("en-AU", { month: "short", year: "2-digit" }),
+        });
+
+        let monthTotal = 0;
+        for (let dayOfMonth = 1; dayOfMonth <= 31; dayOfMonth += 1) {
+          if (dayOfMonth > daysInMonth) {
+            grid.createDiv({ cls: "finance-tracker-year-cell is-void" });
+            continue;
+          }
+          const day = `${monthKey}-${String(dayOfMonth).padStart(2, "0")}`;
+          const items = byDay.get(day) || [];
+          const total = dayTotals.get(day) || 0;
+          monthTotal += total;
+
+          const cell = grid.createEl("button", { cls: "finance-tracker-year-cell", attr: { type: "button" } });
+          if (day < start || day > end) cell.addClass("is-outside");
+          if (day === referenceDate) cell.addClass("is-today");
+          if (items.length) {
+            cellRefs.set(day, cell);
+            // Four bands rather than a continuous ramp: enough to read the
+            // shape, few enough that neighbouring days stay distinguishable.
+            const level = heaviest > 0 ? Math.max(1, Math.ceil((total / heaviest) * 4)) : 1;
+            cell.addClass(`is-level-${level}`);
+            if (items.some((item) => item.isNewPrice)) cell.addClass("is-repriced");
+            if (day < referenceDate) cell.addClass("is-overdue");
+            cell.setAttr(
+              "title",
+              `${dayLabel(day)} · ${core.formatCurrency(total, currency)} · ${items.length} bill${items.length === 1 ? "" : "s"}`
+            );
+            cell.addEventListener("click", () => {
+              selectedDay = selectedDay === day ? "" : day;
+              refresh();
+            });
+          } else {
+            cell.addClass("is-quiet");
+          }
+        }
+
+        grid.createDiv({
+          cls: "finance-tracker-year-total",
+          text: monthTotal > 0 ? core.formatCurrency(core.roundCurrencyAmount(monthTotal), currency) : "—",
+        });
+      }
+
+      const legend = body.createDiv({ cls: "finance-tracker-year-legend" });
+      legend.createSpan({ text: "Lighter to darker: smaller to larger day totals." });
+      legend.createSpan({ cls: "finance-tracker-year-swatch is-level-1" });
+      legend.createSpan({ cls: "finance-tracker-year-swatch is-level-2" });
+      legend.createSpan({ cls: "finance-tracker-year-swatch is-level-3" });
+      legend.createSpan({ cls: "finance-tracker-year-swatch is-level-4" });
+      legend.createSpan({ cls: "finance-tracker-year-swatch is-repriced" });
+      legend.createSpan({ text: "repriced" });
+
+      detailHosts.push({ from: start, host: body.createDiv({ cls: "finance-tracker-calendar-inline-host" }), to: end });
+    };
+
+    const drawCalendar = () => {
+      body.empty();
+      cellRefs = new Map();
+      detailHosts = [];
+      seenMonth = "";
+      selectedDay = "";
+
+      // Walk whole weeks so the grid always starts on the week's first column,
+      // covering at least the requested months.
+      const end = core.addMonths(start, activeMonths);
+      const weeksAhead = Math.ceil(core.daysBetweenInclusive(start, end) / 7);
+      const { occurrences } = core.sumRecurringDueWithin(recurring, start, end);
+
+      byDay = new Map();
+      for (const occurrence of occurrences) {
+        const list = byDay.get(occurrence.date) || [];
+        list.push(occurrence);
+        byDay.set(occurrence.date, list);
+      }
+
+      if (!byDay.size) {
+        body.createDiv({
+          cls: "finance-tracker-empty",
+          text: `No bills fall due in the next ${activeMonths === 1 ? "month" : `${activeMonths} months`}.`,
+        });
+        return;
+      }
+
+      const total = occurrences.reduce((sum, occurrence) => sum + Number(occurrence.amount || 0), 0);
+      body.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: `${occurrences.length} payment${occurrences.length === 1 ? "" : "s"} · ${core.formatCurrency(core.roundCurrencyAmount(total), currency)} total`,
+      });
+
+      if (activeMonths >= 12) {
+        drawYearGrid(start, end);
+        return;
+      }
+
+      for (let weekIndex = 0; weekIndex < weeksAhead; weekIndex += 1) {
+        const weekStart = core.addDays(start, weekIndex * 7);
+        const days = Array.from({ length: 7 }, (_unused, offset) => core.addDays(weekStart, offset));
+        // Only draw weeks that actually carry a bill — an empty fortnight in the
+        // middle of the horizon is noise, not information.
+        if (!days.some((day) => byDay.has(day))) continue;
+
+        const month = monthLabel(days.find((day) => byDay.has(day)) || weekStart);
+        if (month !== seenMonth) {
+          body.createDiv({ cls: "finance-tracker-calendar-month-caption", text: month });
+          seenMonth = month;
+        }
+
+        const weekBlock = body.createDiv({ cls: "finance-tracker-calendar-week-block" });
+        const grid = weekBlock.createDiv({ cls: "finance-tracker-calendar-grid month-grid" });
+        for (const day of days) {
+          const items = byDay.get(day) || [];
+          const cell = grid.createEl("button", { cls: "finance-tracker-calendar-day", attr: { type: "button" } });
+          cellRefs.set(day, cell);
+          if (!items.length) cell.addClass("is-empty");
+          if (day === referenceDate) cell.addClass("is-today");
+
+          const dots = cell.createDiv({ cls: "finance-tracker-calendar-dots" });
+          for (const occurrence of items.slice(0, 4)) {
+            const tone = day < referenceDate ? "is-bill-overdue" : occurrence.isNewPrice ? "is-bill-change" : "is-bill";
+            dots.createDiv({ cls: `finance-tracker-calendar-dot ${tone}`, attr: { title: occurrence.label } });
+          }
+          if (items.length > 4) dots.createSpan({ cls: "finance-tracker-calendar-dot-more", text: `+${items.length - 4}` });
+
+          const dateText = cell.createSpan({ cls: "finance-tracker-calendar-date", text: day });
+          dateText.setAttr("data-short-date", day.slice(-2));
+          if (items.length) {
+            const dayTotal = items.reduce((sum, occurrence) => sum + Number(occurrence.amount || 0), 0);
+            cell.createSpan({
+              cls: "finance-tracker-calendar-day-total",
+              text: core.formatCurrency(core.roundCurrencyAmount(dayTotal), currency),
+            });
+          }
+
+          cell.addEventListener("click", () => {
+            if (!items.length) return;
+            selectedDay = selectedDay === day ? "" : day;
+            refresh();
+          });
+        }
+        detailHosts.push({
+          from: weekStart,
+          host: weekBlock.createDiv({ cls: "finance-tracker-calendar-inline-host" }),
+          to: core.addDays(weekStart, 6),
+        });
+      }
+    };
+
+    const rangeButtons = new Map();
+    for (const choice of RANGE_CHOICES) {
+      const button = rangeBar.createEl("button", { cls: "finance-tracker-calendar-filter-button", text: choice.label });
+      rangeButtons.set(choice.months, button);
+      button.addEventListener("click", () => {
+        activeMonths = choice.months;
+        for (const [months, other] of rangeButtons.entries()) other.toggleClass("is-active", months === activeMonths);
+        drawCalendar();
+      });
+    }
+    for (const [months, button] of rangeButtons.entries()) button.toggleClass("is-active", months === activeMonths);
+
+    drawCalendar();
+  }
+
   async renderRecurringBlock(source, el, ctx) {
     el.empty();
     const config = parseConfigBlock(source);
@@ -7798,7 +8798,9 @@ class FinanceTrackerPlugin extends Plugin {
       if (item.active === false) continue;
       const row = list.createDiv({ cls: "finance-tracker-budget-card finance-tracker-recurring-row" });
       if (item.status === "overdue") row.addClass("is-overdue");
-      renderRowTitle(row, item.label, core.formatCurrency(item.lastAmount, currency));
+      // The headline is what the next payment will cost, which is not the same
+      // as today's price once a scheduled change lands before the next due date.
+      renderRowTitle(row, item.label, core.formatCurrency(item.nextDueAmount ?? item.lastAmount, currency));
 
       const statusText =
         item.status === "overdue"
@@ -7809,7 +8811,17 @@ class FinanceTrackerPlugin extends Plugin {
       const metaBits = [cadenceLabel(item.cadence), statusText, `${core.formatCurrency(item.monthlyCost, currency)}/month`];
       if (item.variable) metaBits.push("variable");
       if (item.nextAmount > 0 && item.changeDate) {
-        metaBits.push(`changing to ${core.formatCurrency(item.nextAmount, currency)} on ${item.changeDate}`);
+        // Say how many cycles are left at the old price rather than just naming
+        // the change date — a change dated before the next due date reprices
+        // every remaining payment, which "changing on 15 Aug" alone hides.
+        const schedule = core.buildRecurringSchedule(item, { count: 12, referenceDate });
+        const oldPrice = core.formatCurrency(item.lastAmount, currency);
+        const newPrice = core.formatCurrency(item.nextAmount, currency);
+        metaBits.push(
+          schedule.beforeChange.count
+            ? `${oldPrice} for ${schedule.beforeChange.count} more, then ${newPrice} from ${schedule.changeOccurrence || item.changeDate}`
+            : `${newPrice} from ${item.changeDate} (was ${oldPrice})`
+        );
       }
       if (item.endDate) metaBits.push(`ends ${item.endDate}`);
       if (Number.isFinite(item.paymentsLeft) && item.paymentsLeft !== null) {
@@ -7867,6 +8879,11 @@ class FinanceTrackerPlugin extends Plugin {
         });
       }
     }
+
+    this.renderRecurringCalendar(wrapper, recurring, currency, referenceDate, {
+      months: core.parseNumber(config.months),
+      weeks: core.parseNumber(config.weeks),
+    });
 
     // Archived bills: paused by hand, or retired by their own End Date /
     // Payments Left. Collapsed by default, still reachable to resume or drop.
@@ -8929,7 +9946,10 @@ class QuickAddTransactionModal extends Modal {
             splitCount: parsed.splitCount,
             source: "quick-add",
           },
-          { notify: true }
+          // `force` because this modal does its own duplicate warning above and
+          // the user has just answered it by pressing the button. A deliberate
+          // human action is never silently dropped by the cross-method check.
+          { notify: true, method: "quick-add", force: true }
         );
         input.value = "";
         update();
@@ -9136,10 +10156,6 @@ class EditRecurringItemModal extends Modal {
     const changeDateInput = changeDateRow.createEl("input", { type: "date" });
     changeDateInput.value = item.changeDate || "";
 
-    scheduleCheckbox.addEventListener("change", () => {
-      scheduleFields.toggleClass("is-hidden", !scheduleCheckbox.checked);
-    });
-
     const hasTerm = Boolean(item.endDate) || (Number.isFinite(item.paymentsLeft) && item.paymentsLeft !== null);
     const termLabel = contentEl.createEl("label", { cls: "finance-edit-remember" });
     const termCheckbox = termLabel.createEl("input", { type: "checkbox" });
@@ -9163,9 +10179,100 @@ class EditRecurringItemModal extends Modal {
     const paymentsInput = paymentsRow.createEl("input", { type: "number", attr: { step: "1", min: "0" } });
     paymentsInput.value = Number.isFinite(item.paymentsLeft) && item.paymentsLeft !== null ? String(item.paymentsLeft) : "";
 
+    // Live schedule preview. A price change is easy to mis-set by a few days —
+    // the date decides which cycles are still billed at the old price, and that
+    // is invisible from two input boxes. This lays the upcoming cycles out with
+    // the price each one will actually be charged at, and updates as you type.
+    const previewSection = contentEl.createDiv({ cls: "finance-edit-preview" });
+    const previewHeading = previewSection.createEl("h4", { text: "Upcoming payments" });
+    const previewSummary = previewSection.createDiv({ cls: "finance-edit-preview-summary" });
+    const previewGrid = previewSection.createDiv({ cls: "finance-edit-preview-grid" });
+    const currency = core.normalizeCurrency(this.plugin.settings.defaultCurrency);
+    const today = core.todayIsoLocal();
+
+    const shortDate = (iso) =>
+      new Date(`${iso}T12:00:00`).toLocaleDateString("en-AU", { day: "numeric", month: "short", year: "numeric" });
+
+    const renderPreview = () => {
+      previewGrid.empty();
+      previewSummary.empty();
+      const scheduling = scheduleCheckbox.checked && nextAmountInput.value && changeDateInput.value;
+      const terming = termCheckbox.checked;
+      const schedule = core.buildRecurringSchedule(item, {
+        amount: core.parseNumber(amountInput.value),
+        changeDate: scheduling ? core.parseIsoDate(changeDateInput.value) : null,
+        count: 8,
+        endDate: terming ? core.parseIsoDate(endDateInput.value) || null : null,
+        nextAmount: scheduling ? core.parseNumber(nextAmountInput.value) : null,
+        nextDue: core.parseIsoDate(nextDueInput.value) || item.nextDue,
+        paymentsLeft: terming ? core.parseNumber(paymentsInput.value) : null,
+        referenceDate: today,
+      });
+
+      previewHeading.setText(`Upcoming payments · ${cadenceLabel(item.cadence)}`);
+
+      if (!schedule.occurrences.length) {
+        previewSummary.createSpan({ text: "No upcoming payments — check the next due date and the bill's terms." });
+        return;
+      }
+
+      for (const occurrence of schedule.occurrences) {
+        const cell = previewGrid.createDiv({ cls: "finance-edit-preview-cell" });
+        if (occurrence.isNewPrice) cell.addClass("is-new-price");
+        // The first cycle at the new price is the one worth spotting at a glance.
+        if (occurrence.date === schedule.changeOccurrence) cell.addClass("is-change");
+        cell.createDiv({ cls: "finance-edit-preview-date", text: shortDate(occurrence.date) });
+        cell.createDiv({
+          cls: "finance-edit-preview-amount",
+          text: core.formatCurrency(occurrence.amount, currency),
+        });
+      }
+
+      if (schedule.changeOccurrence) {
+        const before = schedule.beforeChange;
+        const oldPrice = core.formatCurrency(core.parseNumber(amountInput.value) || 0, currency);
+        const newPrice = core.formatCurrency(schedule.nextAmount || 0, currency);
+        previewSummary.createSpan({
+          text: before.count
+            ? `${before.count} more payment${before.count === 1 ? "" : "s"} at ${oldPrice} (${core.formatCurrency(before.total, currency)}), then ${newPrice} from ${shortDate(schedule.changeOccurrence)}.`
+            : `Every upcoming payment is already at the new ${newPrice}, from ${shortDate(schedule.changeOccurrence)}.`,
+        });
+      } else if (scheduling) {
+        // The change is real but lands beyond the previewed cycles.
+        previewSummary.createSpan({
+          text: `The new price does not apply to any of the next ${schedule.occurrences.length} payments — it starts ${shortDate(core.parseIsoDate(changeDateInput.value) || today)}.`,
+        });
+      } else {
+        previewSummary.createSpan({
+          text: `${schedule.occurrences.length} upcoming payment${schedule.occurrences.length === 1 ? "" : "s"} at ${core.formatCurrency(schedule.occurrences[0].amount, currency)}.`,
+        });
+      }
+
+      if (schedule.finishReason) {
+        previewSummary.createSpan({
+          cls: "finance-edit-preview-note",
+          text: schedule.finishesOn
+            ? ` Last payment ${shortDate(schedule.finishesOn)}, then the bill retires.`
+            : " The bill has no payments left.",
+        });
+      }
+    };
+
+    scheduleCheckbox.addEventListener("change", () => {
+      scheduleFields.toggleClass("is-hidden", !scheduleCheckbox.checked);
+      renderPreview();
+    });
+
     termCheckbox.addEventListener("change", () => {
       termFields.toggleClass("is-hidden", !termCheckbox.checked);
+      renderPreview();
     });
+
+    for (const input of [amountInput, nextDueInput, nextAmountInput, changeDateInput, endDateInput, paymentsInput]) {
+      input.addEventListener("input", renderPreview);
+      input.addEventListener("change", renderPreview);
+    }
+    renderPreview();
 
     const buttons = contentEl.createDiv({ cls: "finance-edit-buttons" });
     const saveButton = buttons.createEl("button", { text: "Save", cls: "mod-cta" });
@@ -9253,6 +10360,66 @@ class LogVariableBillModal extends Modal {
       }
     });
     window.setTimeout(() => amountInput.focus(), 0);
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+// Answers "are two of my capture methods logging the same thing?" from the
+// capture ledger rather than from guesswork about what each Shortcut covers.
+class CaptureOverlapModal extends Modal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h3", { text: "Capture method overlap" });
+
+    const active = core.CAPTURE_METHODS.filter((method) => this.plugin.isCaptureMethodEnabled(method));
+    contentEl.createEl("p", {
+      cls: "finance-tracker-settings-section-copy",
+      text: active.length
+        ? `Active methods: ${active.map((method) => core.captureMethodLabel(method)).join(", ")}. Quick add and hand-typed bullets always work.`
+        : "No capture methods are turned on — only quick add and hand-typed bullets will log anything.",
+    });
+
+    const overlap = this.plugin.captureOverlapReport(60);
+    if (!overlap.length) {
+      contentEl.createDiv({
+        cls: "finance-tracker-empty",
+        text: "No two methods have captured the same transaction in the last 60 days. Nothing is overlapping.",
+      });
+    } else {
+      contentEl.createEl("p", {
+        cls: "finance-tracker-settings-section-copy",
+        text: "These pairs have captured the same transaction. That is fine while duplicate handling is on — but if one pair dominates, you are paying for a method you could turn off.",
+      });
+      const table = contentEl.createEl("table", { cls: "finance-tracker-table" });
+      const head = table.createEl("thead").createEl("tr");
+      for (const label of ["Methods", "Collisions", "Most recent"]) head.createEl("th", { text: label });
+      const body = table.createEl("tbody");
+      for (const pair of overlap) {
+        const row = body.createEl("tr");
+        row.createEl("td", { text: pair.channels.map((channel) => core.describeCaptureChannel(channel)).join("  ↔  ") });
+        row.createEl("td", { text: String(pair.count) });
+        row.createEl("td", {
+          text: pair.sample
+            ? `${pair.sample.date} · ${core.formatCurrency(pair.sample.amount, this.plugin.settings.defaultCurrency)}${pair.sample.merchant ? ` · ${pair.sample.merchant}` : ""}`
+            : pair.lastDate,
+        });
+      }
+    }
+
+    const handling = this.plugin.settings.crossMethodDuplicates || "skip";
+    contentEl.createEl("p", {
+      cls: "finance-tracker-settings-section-copy",
+      text: `Duplicate handling is set to "${handling}". Detection only ever compares captures from different methods, so two identical purchases down the same method are still logged as two.`,
+    });
   }
 
   onClose() {
@@ -10352,6 +11519,143 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
         })
       );
 
+    addSection(
+      "Capture methods",
+      "Every method below can run at the same time. Quick add and hand-typed bullets always work and are not listed."
+    );
+
+    for (const method of core.CAPTURE_METHODS) {
+      new Setting(containerEl)
+        .setName(core.captureMethodLabel(method))
+        .setDesc(CAPTURE_METHOD_DESCRIPTIONS[method] || "")
+        .addToggle((toggle) =>
+          toggle.setValue(this.plugin.isCaptureMethodEnabled(method)).onChange(async (value) => {
+            if (!this.plugin.settings.captureMethods || typeof this.plugin.settings.captureMethods !== "object") {
+              this.plugin.settings.captureMethods = { ...DEFAULT_SETTINGS.captureMethods };
+            }
+            this.plugin.settings.captureMethods[method] = value;
+            await this.plugin.saveSettings();
+            if (method === "gist") this.plugin.scheduleGistSync();
+            this.display();
+          })
+        );
+    }
+
+    new Setting(containerEl)
+      .setName("When two methods capture the same transaction")
+      .setDesc(
+        "Only ever compares captures that arrived by different methods — two identical purchases down the same method are still logged as two."
+      )
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("skip", "Skip the second one")
+          .addOption("warn", "Log it, but tell me")
+          .addOption("off", "Log everything")
+          .setValue(this.plugin.settings.crossMethodDuplicates || "skip")
+          .onChange(async (value) => {
+            this.plugin.settings.crossMethodDuplicates = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Duplicate window (days)")
+      .setDesc("How far apart two captures can be and still count as the same purchase. Bank feeds often settle a day after the tap.")
+      .addText((text) =>
+        text
+          .setPlaceholder("1")
+          .setValue(String(this.plugin.settings.duplicateWindowDays ?? DEFAULT_SETTINGS.duplicateWindowDays))
+          .onChange(async (value) => {
+            const parsed = Number(String(value).trim());
+            this.plugin.settings.duplicateWindowDays = Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_SETTINGS.duplicateWindowDays;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    // Evidence, not guesswork: which pairs of methods have actually been
+    // logging the same transactions lately.
+    const overlap = this.plugin.captureOverlapReport(60);
+    new Setting(containerEl)
+      .setName("Overlap check")
+      .setDesc(
+        overlap.length
+          ? `${overlap[0].channels.map((channel) => core.describeCaptureChannel(channel)).join(" and ")} have captured the same transaction ${overlap[0].count} time${overlap[0].count === 1 ? "" : "s"} in the last 60 days.`
+          : "No two methods have captured the same transaction in the last 60 days."
+      )
+      .addButton((button) =>
+        button.setButtonText("Details").onClick(() => new CaptureOverlapModal(this.app, this.plugin).open())
+      );
+
+    if (this.plugin.isCaptureMethodEnabled("gist")) {
+      const gistAdvanced = addAdvanced(
+        "GitHub gist capture",
+        "The phone appends a capture line to a private gist; the plugin polls it and drains it. The only method that captures without opening Obsidian and still works on an Obsidian Sync vault."
+      );
+
+      new Setting(gistAdvanced)
+        .setName("Gist ID")
+        .setDesc("The ID from the gist URL — the part after your username.")
+        .addText((text) =>
+          text.setPlaceholder("a1b2c3d4…").setValue(this.plugin.settings.gistCaptureId).onChange(async (value) => {
+            this.plugin.settings.gistCaptureId = value.trim();
+            await this.plugin.saveSettings();
+            this.plugin.scheduleGistSync();
+          })
+        );
+
+      new Setting(gistAdvanced)
+        .setName("Access token")
+        .setDesc("A fine-grained token with only the Gists permission. Stored in this vault's data.json in plain text — treat it like a password and revoke it if the vault is ever shared.")
+        .addText((text) => {
+          text.inputEl.type = "password";
+          text.setPlaceholder("github_pat_…").setValue(this.plugin.settings.gistCaptureToken).onChange(async (value) => {
+            this.plugin.settings.gistCaptureToken = value.trim();
+            await this.plugin.saveSettings();
+            this.plugin.scheduleGistSync();
+          });
+        });
+
+      new Setting(gistAdvanced)
+        .setName("File name")
+        .setDesc("The file inside the gist that captures are appended to.")
+        .addText((text) =>
+          text
+            .setPlaceholder(DEFAULT_SETTINGS.gistCaptureFilename)
+            .setValue(this.plugin.settings.gistCaptureFilename)
+            .onChange(async (value) => {
+              this.plugin.settings.gistCaptureFilename = value.trim() || DEFAULT_SETTINGS.gistCaptureFilename;
+              await this.plugin.saveSettings();
+            })
+        );
+
+      new Setting(gistAdvanced)
+        .setName("Check every (minutes)")
+        .setDesc("How often to poll while Obsidian is open. It also syncs on launch.")
+        .addText((text) =>
+          text
+            .setPlaceholder("15")
+            .setValue(String(this.plugin.settings.gistCapturePollMinutes ?? DEFAULT_SETTINGS.gistCapturePollMinutes))
+            .onChange(async (value) => {
+              const parsed = Number(String(value).trim());
+              this.plugin.settings.gistCapturePollMinutes = Number.isFinite(parsed) && parsed >= 1 ? parsed : DEFAULT_SETTINGS.gistCapturePollMinutes;
+              await this.plugin.saveSettings();
+              this.plugin.scheduleGistSync();
+            })
+        );
+
+      new Setting(gistAdvanced)
+        .setName(this.plugin.settings.gistCaptureLastSync ? `Last synced ${new Date(this.plugin.settings.gistCaptureLastSync).toLocaleString()}` : "Never synced")
+        .addButton((button) =>
+          button
+            .setButtonText("Sync now")
+            .setCta()
+            .onClick(async () => {
+              await this.plugin.syncCaptureGist({ notify: true });
+              this.display();
+            })
+        );
+    }
+
     const captureAdvanced = addAdvanced(
       "Advanced: note format",
       "Auto-detected from the Journals or core Daily notes plugin, and set for you by first-time setup. Changing these will not rewrite notes you have already logged."
@@ -10409,6 +11713,21 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.dashboardDefaultGroupBy)
           .onChange(async (value) => {
             this.plugin.settings.dashboardDefaultGroupBy = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Payment calendar range")
+      .setDesc("How far ahead the recurring block's payment calendar looks. The buttons above the calendar switch it for one session.")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("1", "1 month")
+          .addOption("3", "3 months")
+          .addOption("12", "12 months")
+          .setValue(String(this.plugin.settings.paymentCalendarMonths || DEFAULT_SETTINGS.paymentCalendarMonths))
+          .onChange(async (value) => {
+            this.plugin.settings.paymentCalendarMonths = value;
             await this.plugin.saveSettings();
           })
       );

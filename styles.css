@@ -346,6 +346,126 @@
   background: #4a5568;
 }
 
+/* Bill payments reuse the trip calendar's grid; only the dot tones differ. */
+.finance-tracker-calendar-dot.is-bill {
+  background: var(--interactive-accent);
+}
+
+.finance-tracker-calendar-dot.is-bill-overdue {
+  background: var(--color-red, #e53e3e);
+}
+
+.finance-tracker-calendar-dot.is-bill-change {
+  background: var(--color-yellow, #d69e2e);
+}
+
+.finance-tracker-calendar-dot-more {
+  color: var(--text-muted);
+  font-size: 0.7em;
+}
+
+.finance-tracker-calendar-month-caption {
+  color: var(--text-muted);
+  font-size: 0.78em;
+  letter-spacing: 0.04em;
+  margin: 0.6em 0 0.2em;
+  text-transform: uppercase;
+}
+
+.finance-tracker-calendar-day-total {
+  color: var(--text-muted);
+  font-size: 0.72em;
+  font-variant-numeric: tabular-nums;
+}
+
+.finance-tracker-calendar-day.is-today {
+  border-color: var(--interactive-accent);
+}
+
+/* ---- 12-month payment view: a month per row, a day-of-month per column ---- */
+.finance-tracker-year-grid {
+  align-items: center;
+  display: grid;
+  gap: 2px;
+  grid-template-columns: 3.2em repeat(31, minmax(0, 1fr)) 5.4em;
+  margin-top: 0.4em;
+}
+
+.finance-tracker-year-head {
+  color: var(--text-faint);
+  font-size: 0.62em;
+  text-align: center;
+}
+
+.finance-tracker-year-head.is-total { text-align: right; }
+
+.finance-tracker-year-month {
+  color: var(--text-muted);
+  font-size: 0.72em;
+  white-space: nowrap;
+}
+
+.finance-tracker-year-total {
+  color: var(--text-muted);
+  font-size: 0.72em;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.finance-tracker-year-cell {
+  aspect-ratio: 1;
+  background: var(--background-modifier-border);
+  border: none;
+  border-radius: 3px;
+  box-shadow: none;
+  cursor: pointer;
+  min-height: 12px;
+  min-width: 0;
+  opacity: 0.35;
+  padding: 0;
+  width: 100%;
+}
+
+/* Days with nothing due, and the padding cells of shorter months. */
+.finance-tracker-year-cell.is-quiet { cursor: default; }
+.finance-tracker-year-cell.is-void { background: none; cursor: default; opacity: 0; }
+.finance-tracker-year-cell.is-outside { opacity: 0.15; }
+
+.finance-tracker-year-cell.is-level-1 { background: var(--interactive-accent); opacity: 0.35; }
+.finance-tracker-year-cell.is-level-2 { background: var(--interactive-accent); opacity: 0.55; }
+.finance-tracker-year-cell.is-level-3 { background: var(--interactive-accent); opacity: 0.78; }
+.finance-tracker-year-cell.is-level-4 { background: var(--interactive-accent); opacity: 1; }
+.finance-tracker-year-cell.is-repriced { background: var(--color-yellow, #d69e2e); }
+.finance-tracker-year-cell.is-overdue { background: var(--color-red, #e53e3e); }
+
+.finance-tracker-year-cell.is-today { box-shadow: 0 0 0 1px var(--text-normal); }
+.finance-tracker-year-cell.is-selected { box-shadow: 0 0 0 2px var(--interactive-accent); opacity: 1; }
+.finance-tracker-year-cell:hover:not(.is-quiet):not(.is-void) { opacity: 1; }
+
+.finance-tracker-year-legend {
+  align-items: center;
+  color: var(--text-faint);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 0.7em;
+  gap: 4px;
+  margin-top: 0.6em;
+}
+
+.finance-tracker-year-swatch {
+  background: var(--interactive-accent);
+  border-radius: 2px;
+  display: inline-block;
+  height: 10px;
+  width: 10px;
+}
+
+.finance-tracker-year-swatch.is-level-1 { opacity: 0.35; }
+.finance-tracker-year-swatch.is-level-2 { opacity: 0.55; }
+.finance-tracker-year-swatch.is-level-3 { opacity: 0.78; }
+.finance-tracker-year-swatch.is-level-4 { opacity: 1; }
+.finance-tracker-year-swatch.is-repriced { background: var(--color-yellow, #d69e2e); margin-left: 6px; }
+
 .finance-tracker-calendar-dot.is-flights {
   background: #2b6cb0;
 }
@@ -711,6 +831,62 @@
 .finance-edit-buttons { display: flex; justify-content: space-between; margin-top: 0.75em; }
 .finance-edit-schedule.is-hidden { display: none; }
 .finance-edit-hint { color: var(--text-muted); font-size: 0.85em; margin: -0.2em 0 0.6em; }
+
+/* ---- Upcoming-payments preview inside the edit-bill modal ---- */
+.finance-edit-preview {
+  border-top: 1px solid var(--background-modifier-border);
+  margin-top: 0.9em;
+  padding-top: 0.7em;
+}
+
+.finance-edit-preview h4 {
+  font-size: 0.9em;
+  margin: 0 0 0.4em;
+}
+
+.finance-edit-preview-summary {
+  color: var(--text-muted);
+  font-size: 0.85em;
+  margin-bottom: 0.6em;
+}
+
+.finance-edit-preview-note { color: var(--text-faint); }
+
+.finance-edit-preview-grid {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+}
+
+.finance-edit-preview-cell {
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+
+.finance-edit-preview-date {
+  color: var(--text-muted);
+  font-size: 0.75em;
+}
+
+.finance-edit-preview-amount {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+/* The cycles already repriced, and the first one that is. */
+.finance-edit-preview-cell.is-new-price {
+  border-color: var(--interactive-accent);
+}
+
+.finance-edit-preview-cell.is-new-price .finance-edit-preview-amount {
+  color: var(--interactive-accent);
+}
+
+.finance-edit-preview-cell.is-change {
+  box-shadow: 0 0 0 1px var(--interactive-accent);
+}
 
 /* ============================================================
    0.2.0 — shared dashboard polish

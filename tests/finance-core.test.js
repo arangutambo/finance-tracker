@@ -1512,3 +1512,359 @@ test("a Next Due override keeps the schedule anchored even when a bill is logged
   assert.equal(spotify.status, "upcoming"); // not overdue, thanks to the override
   assert.equal(spotify.daysUntilDue, 12);
 });
+
+// --- capture methods: batching, cross-method duplicates, gist drain ---------
+
+test("parses a batched capture payload one line at a time", () => {
+  const { entries, failures } = core.parseCaptureBatch(
+    [
+      "# queued by Shortcuts",
+      "amount=12.50 | cat=food/groceries | merchant=Coles | date=2026-07-30 | source=anz",
+      "",
+      "amount=4.20 | merchant=Boost Juice | date=2026-07-30 | source=anz",
+    ].join("\n")
+  );
+
+  // Entries are loose param objects, exactly as the inbox drainer produces
+  // them — parseCaptureParams does the numeric coercion downstream.
+  assert.equal(failures.length, 0);
+  assert.equal(entries.length, 2);
+  assert.equal(core.parseNumber(entries[0].amount), 12.5);
+  assert.equal(entries[0].merchant, "Coles");
+  assert.equal(entries[0].source, "anz");
+  assert.equal(core.parseNumber(entries[1].amount), 4.2);
+});
+
+test("a bad line in a batch is reported without costing the good lines", () => {
+  const { entries, failures } = core.parseCaptureBatch(
+    ["amount=9 | merchant=Kmart", "this is not a transaction", "amount=3 | merchant=Coffee"].join("\n")
+  );
+
+  assert.equal(entries.length, 2);
+  assert.equal(failures.length, 1);
+  assert.match(failures[0].line, /not a transaction/);
+});
+
+test("the same purchase down two different channels is flagged as a duplicate", () => {
+  const ledger = core.appendCaptureLedger([], {
+    date: "2026-07-30",
+    amount: 12.5,
+    merchant: "Coles",
+    method: "batch",
+    source: "anz",
+  });
+
+  const found = core.findDuplicateCapture(
+    { date: "2026-07-30", amount: 12.5, merchant: "Coles", method: "gist", source: "wise" },
+    ledger
+  );
+
+  assert.ok(found);
+  assert.equal(found.method, "batch");
+});
+
+test("two identical coffees down the same channel are two real purchases", () => {
+  const ledger = core.appendCaptureLedger([], {
+    date: "2026-07-30",
+    amount: 4.2,
+    merchant: "Boost Juice",
+    method: "batch",
+    source: "anz",
+  });
+
+  assert.equal(
+    core.findDuplicateCapture(
+      { date: "2026-07-30", amount: 4.2, merchant: "Boost Juice", method: "batch", source: "anz" },
+      ledger
+    ),
+    null
+  );
+});
+
+test("a bank feed settling a day late still matches the tap it came from", () => {
+  const ledger = core.appendCaptureLedger([], {
+    date: "2026-07-30",
+    amount: 31.4,
+    merchant: "",
+    method: "batch",
+    source: "anz",
+  });
+
+  // Merchant missing on one side, date a day off: still the same purchase.
+  const found = core.findDuplicateCapture(
+    { date: "2026-07-31", amount: 31.4, merchant: "Nobu", method: "inbox", source: "wise" },
+    ledger,
+    { windowDays: 1 }
+  );
+  assert.ok(found);
+
+  // Outside the window it is left alone.
+  assert.equal(
+    core.findDuplicateCapture(
+      { date: "2026-08-05", amount: 31.4, merchant: "Nobu", method: "inbox", source: "wise" },
+      ledger,
+      { windowDays: 1 }
+    ),
+    null
+  );
+});
+
+test("different merchants at the same amount and date are not duplicates", () => {
+  const ledger = core.appendCaptureLedger([], {
+    date: "2026-07-30",
+    amount: 20,
+    merchant: "Coles",
+    method: "batch",
+    source: "anz",
+  });
+
+  assert.equal(
+    core.findDuplicateCapture(
+      { date: "2026-07-30", amount: 20, merchant: "Woolworths", method: "gist", source: "wise" },
+      ledger
+    ),
+    null
+  );
+});
+
+test("the capture ledger stays capped at its limit", () => {
+  let ledger = [];
+  for (let index = 0; index < 12; index += 1) {
+    ledger = core.appendCaptureLedger(ledger, { date: "2026-07-30", amount: index, method: "url" }, 5);
+  }
+  assert.equal(ledger.length, 5);
+  assert.equal(ledger[ledger.length - 1].amount, 11);
+});
+
+test("overlap report names the two channels that keep colliding", () => {
+  let ledger = [];
+  for (const day of ["2026-07-28", "2026-07-29", "2026-07-30"]) {
+    ledger = core.appendCaptureLedger(ledger, { date: day, amount: 12.5, merchant: "Coles", method: "batch", source: "anz" });
+    ledger = core.appendCaptureLedger(ledger, { date: day, amount: 12.5, merchant: "Coles", method: "inbox", source: "wise", skipped: true });
+  }
+  // A one-off from a third channel that nothing else saw.
+  ledger = core.appendCaptureLedger(ledger, { date: "2026-07-30", amount: 88, merchant: "Kmart", method: "url", source: "manual" });
+
+  const overlap = core.summarizeCaptureOverlap(ledger);
+  assert.equal(overlap.length, 1);
+  assert.equal(overlap[0].count, 3);
+  assert.deepEqual(overlap[0].channels, ["batch:anz", "inbox:wise"]);
+  assert.equal(overlap[0].sample.merchant, "Coles");
+});
+
+test("overlap report can be limited to recent history", () => {
+  let ledger = [];
+  ledger = core.appendCaptureLedger(ledger, { date: "2026-01-05", amount: 5, merchant: "Old", method: "batch", source: "anz" });
+  ledger = core.appendCaptureLedger(ledger, { date: "2026-01-05", amount: 5, merchant: "Old", method: "gist", source: "wise" });
+
+  assert.equal(core.summarizeCaptureOverlap(ledger).length, 1);
+  assert.equal(core.summarizeCaptureOverlap(ledger, { since: "2026-07-01" }).length, 0);
+});
+
+test("draining a gist keeps whatever the phone appended mid-drain", () => {
+  const consumed = "amount=5 | merchant=A\n";
+  const current = "amount=5 | merchant=A\namount=9 | merchant=B\n";
+  assert.equal(core.buildGistRemainder(consumed, current), "amount=9 | merchant=B\n");
+});
+
+test("a gist rewritten out from under the drain is left untouched", () => {
+  assert.equal(core.buildGistRemainder("amount=5 | merchant=A\n", "something else entirely"), null);
+  assert.equal(core.buildGistRemainder("", "amount=5 | merchant=A\n"), "amount=5 | merchant=A\n");
+});
+
+// v0.7.x: price-change-aware bill schedules
+
+test("a bill's schedule prices each cycle by whether the change date has landed", () => {
+  const schedule = core.buildRecurringSchedule(
+    {
+      cadence: "monthly",
+      changeDate: "2026-10-15",
+      lastAmount: 89,
+      nextAmount: 66.5,
+      nextDue: "2026-08-10",
+    },
+    { count: 5, referenceDate: "2026-08-03" }
+  );
+
+  assert.deepEqual(
+    schedule.occurrences.map((occurrence) => [occurrence.date, occurrence.amount, occurrence.isNewPrice]),
+    [
+      ["2026-08-10", 89, false],
+      ["2026-09-10", 89, false],
+      ["2026-10-10", 89, false],
+      ["2026-11-10", 66.5, true],
+      ["2026-12-10", 66.5, true],
+    ]
+  );
+  // The change lands on the 15th, so October's bill on the 10th is still old price.
+  assert.equal(schedule.changeOccurrence, "2026-11-10");
+  assert.equal(schedule.beforeChange.count, 3);
+  assert.equal(schedule.beforeChange.total, 267);
+  assert.equal(schedule.afterChange.count, 2);
+  assert.equal(schedule.afterChange.total, 133);
+});
+
+test("a change date falling exactly on a due date applies to that cycle", () => {
+  const schedule = core.buildRecurringSchedule(
+    { cadence: "monthly", changeDate: "2026-09-10", lastAmount: 89, nextAmount: 66.5, nextDue: "2026-08-10" },
+    { count: 3, referenceDate: "2026-08-03" }
+  );
+  assert.equal(schedule.changeOccurrence, "2026-09-10");
+  assert.equal(schedule.beforeChange.count, 1);
+});
+
+test("a bill with no scheduled change prices every cycle the same", () => {
+  const schedule = core.buildRecurringSchedule(
+    { cadence: "weekly", lastAmount: 30, nextDue: "2026-08-05" },
+    { count: 3, referenceDate: "2026-08-03" }
+  );
+  assert.deepEqual(schedule.occurrences.map((occurrence) => occurrence.amount), [30, 30, 30]);
+  assert.equal(schedule.afterChange.count, 0);
+  assert.equal(schedule.changeOccurrence, "");
+});
+
+test("the schedule stops at an end date and at the last remaining payment", () => {
+  const byEndDate = core.buildRecurringSchedule(
+    { cadence: "monthly", endDate: "2026-10-01", lastAmount: 50, nextDue: "2026-08-10" },
+    { count: 12, referenceDate: "2026-08-03" }
+  );
+  assert.deepEqual(byEndDate.occurrences.map((occurrence) => occurrence.date), ["2026-08-10", "2026-09-10"]);
+  assert.equal(byEndDate.finishReason, "end-date");
+  assert.equal(byEndDate.finishesOn, "2026-09-10");
+
+  const byPaymentsLeft = core.buildRecurringSchedule(
+    { cadence: "monthly", lastAmount: 50, nextDue: "2026-08-10", paymentsLeft: 3 },
+    { count: 12, referenceDate: "2026-08-03" }
+  );
+  assert.equal(byPaymentsLeft.occurrences.length, 3);
+  assert.equal(byPaymentsLeft.finishReason, "payments");
+});
+
+test("unsaved edits can be previewed without touching the stored bill", () => {
+  const item = { cadence: "monthly", lastAmount: 89, nextDue: "2026-08-10" };
+  const preview = core.buildRecurringSchedule(item, {
+    changeDate: "2026-09-01",
+    count: 2,
+    nextAmount: 66.5,
+    referenceDate: "2026-08-03",
+  });
+  assert.deepEqual(preview.occurrences.map((occurrence) => occurrence.amount), [89, 66.5]);
+  // The stored item is untouched, so cancelling the modal changes nothing.
+  assert.equal(item.nextAmount, undefined);
+});
+
+test("bills due inside the window are summed at the price they will actually be charged", () => {
+  const recurring = {
+    items: [
+      {
+        active: true,
+        cadence: "monthly",
+        changeDate: "2026-09-01",
+        label: "Broadband",
+        lastAmount: 89,
+        name: "broadband",
+        nextAmount: 66.5,
+        nextDue: "2026-08-10",
+      },
+    ],
+  };
+
+  const window = core.sumRecurringDueWithin(recurring, "2026-08-03", "2026-09-30");
+  assert.deepEqual(window.occurrences.map((occurrence) => [occurrence.date, occurrence.amount]), [
+    ["2026-08-10", 89],
+    ["2026-09-10", 66.5],
+  ]);
+  assert.equal(core.fromCents(window.totalCents), 155.5);
+});
+
+test("a bill that retires inside the window is not projected past its end", () => {
+  const recurring = {
+    items: [
+      { active: true, cadence: "monthly", endDate: "2026-09-15", label: "Gym", lastAmount: 60, name: "gym", nextDue: "2026-08-20" },
+    ],
+  };
+  const window = core.sumRecurringDueWithin(recurring, "2026-08-03", "2026-12-31");
+  assert.deepEqual(window.occurrences.map((occurrence) => occurrence.date), ["2026-08-20", "2026-09-20"].slice(0, 1));
+  assert.equal(core.fromCents(window.totalCents), 60);
+});
+
+test("a change landing before the next due date reprices every projection", () => {
+  const detected = core.detectRecurringPayments(
+    [{ amount: 89, category: "subscriptions/monthly/broadband", date: "2026-07-08", merchant: "Broadband Co" }],
+    { prefix: "subscriptions", referenceDate: "2026-08-03" }
+  );
+  const registry = core.parseRecurringRegistry(`
+| Item | Cadence | Amount | Active | Auto-log | Next Amount | Change Date | Next Due |
+| ---- | ------- | -----: | ------ | -------- | ----------: | ----------- | -------- |
+| broadband | monthly | 89 | yes    | yes      |        66.5 | 2026-08-15  | 2026-10-08 |
+`.trim());
+
+  const applied = core.applyRecurringRegistry(detected, registry, "2026-08-03");
+  const broadband = applied.items.find((item) => item.name === "broadband");
+
+  // Logging one today still costs today's price…
+  assert.equal(broadband.lastAmount, 89);
+  // …but the next payment isn't until October, well after the change.
+  assert.equal(broadband.nextDueAmount, 66.5);
+  assert.equal(broadband.monthlyCost, 66.5);
+  assert.equal(applied.totals.monthly, 66.5);
+
+  // And no remaining cycle is billed at the old price.
+  const schedule = core.buildRecurringSchedule(broadband, { count: 3, referenceDate: "2026-08-03" });
+  assert.equal(schedule.beforeChange.count, 0);
+  assert.equal(schedule.changeOccurrence, "2026-10-08");
+});
+
+test("a change landing after the next due date leaves that payment alone", () => {
+  const detected = core.detectRecurringPayments(
+    [{ amount: 89, category: "subscriptions/monthly/broadband", date: "2026-07-08", merchant: "Broadband Co" }],
+    { prefix: "subscriptions", referenceDate: "2026-08-03" }
+  );
+  const registry = core.parseRecurringRegistry(`
+| Item | Cadence | Amount | Active | Auto-log | Next Amount | Change Date | Next Due |
+| ---- | ------- | -----: | ------ | -------- | ----------: | ----------- | -------- |
+| broadband | monthly | 89 | yes    | yes      |        66.5 | 2026-09-20  | 2026-09-08 |
+`.trim());
+
+  const broadband = core.applyRecurringRegistry(detected, registry, "2026-08-03").items.find((item) => item.name === "broadband");
+  assert.equal(broadband.nextDueAmount, 89); // September's bill predates the change
+  assert.equal(broadband.monthlyCost, 89);
+  const schedule = core.buildRecurringSchedule(broadband, { count: 3, referenceDate: "2026-08-03" });
+  assert.equal(schedule.beforeChange.count, 1);
+  assert.equal(schedule.changeOccurrence, "2026-10-08");
+});
+
+test("a nameless $0 skip line never invents a bill of its own", () => {
+  const recurring = core.detectRecurringPayments(
+    [
+      { amount: 89, category: "subscriptions/monthly/broadband", date: "2026-07-08", merchant: "Broadband Co" },
+      // What "Skip cycle" used to write when the bill's tag carried no name:
+      // the merchant fallback then named a bill after the marker's note line.
+      { amount: 0, category: "subscriptions/monthly", date: "2026-08-08", merchant: "Skipped this cycle" },
+    ],
+    { prefix: "subscriptions", referenceDate: "2026-08-12" }
+  );
+
+  assert.deepEqual(recurring.items.map((item) => item.name), ["broadband"]);
+});
+
+test("a nameless payment with a real amount still falls back to its merchant", () => {
+  const recurring = core.detectRecurringPayments(
+    [{ amount: 19.99, category: "subscriptions/monthly", date: "2026-07-08", merchant: "Netflix" }],
+    { prefix: "subscriptions", referenceDate: "2026-08-12" }
+  );
+  assert.deepEqual(recurring.items.map((item) => item.name), ["netflix"]);
+});
+
+test("a skip still advances the bill it belongs to", () => {
+  const recurring = core.detectRecurringPayments(
+    [
+      { amount: 89, category: "subscriptions/monthly/broadband", date: "2026-07-08", merchant: "Broadband Co" },
+      { amount: 0, category: "subscriptions/monthly/broadband", date: "2026-08-08", merchant: "Skipped this cycle" },
+    ],
+    { prefix: "subscriptions", referenceDate: "2026-08-12" }
+  );
+  const broadband = recurring.items.find((item) => item.name === "broadband");
+  assert.equal(broadband.lastAmount, 89); // the $0 marker does not redefine the price
+  assert.equal(broadband.nextDue, "2026-09-08"); // but it does move the anchor
+});

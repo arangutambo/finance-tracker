@@ -1471,6 +1471,175 @@ function transactionFingerprint(entry) {
   return `${date}|${amount}|${normalizeMerchant(data.merchant || data.name || "")}`;
 }
 
+// ---------------------------------------------------------------------------
+// Capture methods
+//
+// A capture *method* is a transport — the channel a transaction travelled down
+// to reach the vault. It is deliberately not the same thing as the `source=`
+// field, which is free text naming the account the money actually left (anz,
+// wise, cash). Both matter, because the pair is what makes cross-method
+// duplicate detection safe: the same amount at the same merchant on the same
+// day arriving twice down the *same* channel is two coffees, but arriving down
+// two *different* channels is one coffee captured twice.
+// ---------------------------------------------------------------------------
+
+// The transports that can be switched on and off. Quick add and hand-typed
+// bullets are deliberately absent — they are the in-app fallback and always
+// work, so there is nothing useful about being able to disable them.
+const CAPTURE_METHODS = ["url", "batch", "inbox", "gist"];
+
+const CAPTURE_METHOD_LABELS = {
+  url: "Obsidian URL",
+  batch: "Batched queue",
+  inbox: "Capture inbox folder",
+  gist: "GitHub gist",
+  "quick-add": "Quick add",
+  csv: "CSV reconcile",
+  recurring: "Recurring auto-log",
+};
+
+function captureMethodLabel(method) {
+  const key = normalizeCaptureMethod(method);
+  return CAPTURE_METHOD_LABELS[key] || key;
+}
+
+function normalizeCaptureMethod(value) {
+  return String(value || "").trim().toLowerCase() || "unknown";
+}
+
+// Method + account. Two captures sharing a channel came down the same pipe from
+// the same place, which is the one case that is genuinely not a duplicate.
+function captureChannelKey(record) {
+  const data = record || {};
+  const source = normalizeWhitespace(String(data.source || "")).toLowerCase();
+  return `${normalizeCaptureMethod(data.method)}:${source}`;
+}
+
+function describeCaptureChannel(channelKey) {
+  const [method, source] = String(channelKey || "").split(":");
+  const label = captureMethodLabel(method);
+  return source ? `${label} (${source})` : label;
+}
+
+// Splits a multi-line capture payload — the body of a batched URL open or a
+// gist file — into one param object per line. Each line is the same one-line
+// format the inbox folder already uses, so nothing new has to be learned to
+// write one. Unparseable lines are returned rather than thrown, so one bad
+// line never costs you the rest of the batch.
+function parseCaptureBatch(raw) {
+  const text = String(raw || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const entries = [];
+  const failures = [];
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.trim();
+    if (!line || /^(#|\/\/)/.test(line)) continue;
+    const params = parseInboxLine(line);
+    if (params) entries.push(params);
+    else failures.push({ line, reason: "Could not parse a transaction from this line" });
+  }
+  return { entries, failures };
+}
+
+// Looks for an already-captured transaction that this one is probably a second
+// copy of. Only ever matches across channels (see the note above), and only
+// within `windowDays`, because bank feeds settle a day or two after the tap.
+function findDuplicateCapture(candidate, ledger, options = {}) {
+  const windowDays = Number.isFinite(options.windowDays) ? Math.max(0, options.windowDays) : 1;
+  const date = parseIsoDate(candidate?.date) || "";
+  const cents = toCents(candidate?.amount);
+  if (!date || !Number.isFinite(cents) || cents === 0) return null;
+
+  const merchant = normalizeMerchant(candidate?.merchant || candidate?.name || "");
+  const channel = captureChannelKey(candidate);
+  const records = Array.isArray(ledger) ? ledger : [];
+
+  // Newest first: if a purchase somehow has two prior copies, the most recent
+  // one is the more useful thing to name in the warning.
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    const record = records[index];
+    if (toCents(record?.amount) !== cents) continue;
+    const recordDate = parseIsoDate(record?.date) || "";
+    if (!recordDate) continue;
+    const gap = Math.abs(Math.round((new Date(`${date}T00:00:00`).getTime() - new Date(`${recordDate}T00:00:00`).getTime()) / DAY_MS));
+    if (!Number.isFinite(gap) || gap > windowDays) continue;
+    if (captureChannelKey(record) === channel) continue;
+    // A bank feed often carries a merchant the manual capture lacks, and vice
+    // versa. An empty merchant on either side still matches on amount + date.
+    const recordMerchant = normalizeMerchant(record?.merchant || "");
+    if (merchant && recordMerchant && merchant !== recordMerchant) continue;
+    return record;
+  }
+  return null;
+}
+
+// Appends to the rolling record of what each method has captured. Duplicates
+// that were skipped are recorded too (flagged) — they are exactly the evidence
+// the overlap report needs to tell you which two methods are fighting.
+function appendCaptureLedger(ledger, record, limit = 400) {
+  const list = Array.isArray(ledger) ? ledger.slice() : [];
+  const entry = {
+    date: parseIsoDate(record?.date) || "",
+    amount: roundCurrencyAmount(Number(record?.amount || 0)),
+    merchant: normalizeWhitespace(record?.merchant || record?.name || ""),
+    method: normalizeCaptureMethod(record?.method),
+    source: normalizeWhitespace(record?.source || ""),
+    at: String(record?.at || ""),
+  };
+  if (record?.skipped) entry.skipped = true;
+  list.push(entry);
+  const max = Number.isFinite(limit) && limit > 0 ? limit : 400;
+  return list.length > max ? list.slice(-max) : list;
+}
+
+// Which pairs of channels have been logging the same transactions? Answers the
+// "are two of my capture methods overlapping?" question from evidence rather
+// than from guesswork about what a given Shortcut might be covering.
+function summarizeCaptureOverlap(ledger, options = {}) {
+  const records = Array.isArray(ledger) ? ledger : [];
+  const since = parseIsoDate(options.since) || "";
+  const groups = new Map();
+
+  for (const record of records) {
+    const date = parseIsoDate(record?.date) || "";
+    if (!date || (since && date < since)) continue;
+    const key = transactionFingerprint(record);
+    if (!groups.has(key)) groups.set(key, { date, channels: new Set(), merchant: record?.merchant || "", amount: roundCurrencyAmount(Number(record?.amount || 0)) });
+    groups.get(key).channels.add(captureChannelKey(record));
+  }
+
+  const pairs = new Map();
+  for (const group of groups.values()) {
+    const channels = [...group.channels].sort();
+    if (channels.length < 2) continue;
+    for (let a = 0; a < channels.length; a += 1) {
+      for (let b = a + 1; b < channels.length; b += 1) {
+        const key = `${channels[a]}→${channels[b]}`;
+        if (!pairs.has(key)) pairs.set(key, { channels: [channels[a], channels[b]], count: 0, lastDate: "", sample: null });
+        const pair = pairs.get(key);
+        pair.count += 1;
+        if (group.date > pair.lastDate) {
+          pair.lastDate = group.date;
+          pair.sample = { date: group.date, amount: group.amount, merchant: group.merchant };
+        }
+      }
+    }
+  }
+
+  return [...pairs.values()].sort((left, right) => right.count - left.count || right.lastDate.localeCompare(left.lastDate));
+}
+
+// The phone can append to the gist between the read and the clear that follows
+// it. Only the exact prefix that was consumed is removed, so anything that
+// landed after it survives to the next poll. A `null` return means the file was
+// rewritten out from under us and must be left alone.
+function buildGistRemainder(consumed, current) {
+  const before = String(consumed || "");
+  const now = String(current || "");
+  if (!before) return now;
+  if (now.startsWith(before)) return now.slice(before.length);
+  return null;
+}
+
 // Minimal RFC-4180-ish CSV reader: handles quoted fields, escaped quotes,
 // embedded commas and newlines. Returns an array of cell arrays.
 function parseCsvRows(text) {
@@ -1830,12 +1999,20 @@ function detectRecurringPayments(entries, options = {}) {
     const cadence = normalizeCadence(rest[0]);
     if (!cadence) continue;
     const rawCadence = rest[0];
-    const name = rest.slice(1).join("/") || normalizeCategoryPath(entry.merchant || "") || "recurring";
+    const taggedName = rest.slice(1).join("/");
+    const name = taggedName || normalizeCategoryPath(entry.merchant || "") || "recurring";
     const key = `${cadence}/${name}`;
     const date = parseIsoDate(entry.date) || "";
     const amount = roundCurrencyAmount(entry.amount || 0);
     const current = items.get(key);
     if (!current) {
+      // A $0 line is a skip marker for a bill that already exists — it moves
+      // that bill's anchor forward. On a tag with no item name (a bare
+      // `subscriptions/monthly`) the name falls back to the merchant, which for
+      // a skip is its own note line: that used to mint a phantom "Skipped This
+      // Cycle" bill, and skipping *that* wrote another nameless line, so the
+      // ghost renewed itself forever. A skip can never introduce a bill.
+      if (!(amount > 0) && !taggedName) continue;
       items.set(key, {
         cadence,
         rawCadence,
@@ -1925,10 +2102,105 @@ function fromCents(cents) {
   return Number((Math.round(Number(cents) || 0) / 100).toFixed(2));
 }
 
+// Projects one bill's upcoming due dates together with the amount each of them
+// will actually be charged at. A scheduled price change (Next Amount / Change
+// Date) only applies from its date onward, so the cycles landing before it are
+// still owed at the old price — that split is the whole point of this helper,
+// and it is what lets the UI say "two more at $89.00, then $66.50" instead of
+// only "changing to $66.50 on 2026-08-15". End Date and Payments Left stop the
+// walk, so a bill that retires mid-window is not projected past its own end.
+//
+// Options: referenceDate, count (max occurrences, default 12), end (horizon
+// date), plus amount/nextAmount/changeDate/endDate/paymentsLeft/nextDue
+// overrides so an editor can preview terms that have not been saved yet.
+function buildRecurringSchedule(item, options = {}) {
+  const cadence = normalizeCadence(options.cadence ?? item?.cadence);
+  const spec = RECURRING_CADENCES[cadence];
+  const referenceDate = parseIsoDate(options.referenceDate) || todayIsoLocal();
+  const horizon = parseIsoDate(options.end || "") || "";
+  const maxCount = Number.isFinite(options.count) && options.count > 0 ? Math.floor(options.count) : 12;
+
+  const pick = (key) => (options[key] !== undefined ? options[key] : item?.[key]);
+  // null/""/undefined all mean "not set" here. Number(null) is 0, not NaN, so
+  // a plain Number.isFinite guard would read an unset Payments Left as "none
+  // left" and stop the schedule before its first occurrence.
+  const asNumber = (value) => {
+    if (value === null || value === undefined || value === "") return null;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+  const amount = roundCurrencyAmount(asNumber(pick("amount")) ?? asNumber(item?.lastAmount) ?? 0);
+  const rawNextAmount = asNumber(pick("nextAmount"));
+  const nextAmount = rawNextAmount !== null && rawNextAmount > 0 ? roundCurrencyAmount(rawNextAmount) : null;
+  const changeDate = nextAmount ? parseIsoDate(pick("changeDate") || "") : "";
+  const endDate = parseIsoDate(pick("endDate") || "") || "";
+  const rawPaymentsLeft = asNumber(pick("paymentsLeft"));
+  const paymentsLeft = rawPaymentsLeft !== null && rawPaymentsLeft >= 0 ? Math.floor(rawPaymentsLeft) : null;
+
+  const empty = {
+    afterChange: { count: 0, total: 0 },
+    beforeChange: { count: 0, total: 0 },
+    cadence,
+    changeDate: changeDate || "",
+    changeOccurrence: "",
+    finishReason: "",
+    finishesOn: "",
+    nextAmount: nextAmount || null,
+    occurrences: [],
+  };
+
+  const start = parseIsoDate(pick("nextDue") || "");
+  if (!spec || !start) return empty;
+
+  const occurrences = [];
+  let due = start;
+  let guard = 0;
+  let finishReason = "";
+  // The guard stops a corrupt cadence from looping forever.
+  while (due && guard < 400 && occurrences.length < maxCount) {
+    guard += 1;
+    if (endDate && due > endDate) {
+      finishReason = "end-date";
+      break;
+    }
+    if (paymentsLeft !== null && occurrences.length >= paymentsLeft) {
+      finishReason = "payments";
+      break;
+    }
+    if (horizon && due > horizon) break;
+    const isNewPrice = Boolean(changeDate && due >= changeDate);
+    occurrences.push({
+      amount: isNewPrice ? nextAmount : amount,
+      date: due,
+      index: occurrences.length,
+      isNewPrice,
+      isPast: due < referenceDate,
+    });
+    due = nextRecurringDate(due, cadence);
+  }
+
+  const before = occurrences.filter((occurrence) => !occurrence.isNewPrice);
+  const after = occurrences.filter((occurrence) => occurrence.isNewPrice);
+  const sum = (list) => roundCurrencyAmount(list.reduce((total, occurrence) => total + occurrence.amount, 0));
+
+  return {
+    ...empty,
+    afterChange: { count: after.length, total: sum(after) },
+    beforeChange: { count: before.length, total: sum(before) },
+    changeOccurrence: after[0]?.date || "",
+    finishReason,
+    finishesOn: finishReason ? occurrences[occurrences.length - 1]?.date || "" : "",
+    occurrences,
+  };
+}
+
 // Walks each active bill's schedule forward and sums every occurrence landing
 // on or before `end`. This is what makes the runway target react to the
 // calendar rather than to an average: a yearly insurance renewal is worth
 // nothing to the target until it enters the window, then worth all of it.
+// Each occurrence is priced through buildRecurringSchedule, so a bill with a
+// price change landing inside the window is counted at the price that will
+// actually be charged, and one that retires inside the window stops there.
 // Returns integer cents plus the individual occurrences, newest last.
 function sumRecurringDueWithin(recurring, referenceDate, end) {
   const today = parseIsoDate(referenceDate) || todayIsoLocal();
@@ -1939,14 +2211,21 @@ function sumRecurringDueWithin(recurring, referenceDate, end) {
 
   for (const item of recurring?.items || []) {
     if (!RECURRING_CADENCES[item.cadence] || !(item.lastAmount > 0) || item.active === false) continue;
-    const amountCents = toCents(item.lastAmount);
-    let due = item.nextDue;
-    // The guard stops a corrupt cadence from looping forever; 400 covers a
-    // weekly bill across a 6-year window, far beyond any sane runway.
-    for (let guard = 0; due && due <= horizon && guard < 400; guard += 1) {
-      totalCents += amountCents;
-      occurrences.push({ date: due, amount: item.lastAmount, label: item.label, name: item.name, cadence: item.cadence });
-      due = nextRecurringDate(due, item.cadence);
+    const schedule = buildRecurringSchedule(item, {
+      count: 400,
+      end: horizon,
+      referenceDate: today,
+    });
+    for (const occurrence of schedule.occurrences) {
+      totalCents += toCents(occurrence.amount);
+      occurrences.push({
+        amount: occurrence.amount,
+        cadence: item.cadence,
+        date: occurrence.date,
+        isNewPrice: occurrence.isNewPrice,
+        label: item.label,
+        name: item.name,
+      });
     }
   }
 
@@ -2134,9 +2413,18 @@ function applyRecurringRegistry(recurring, registry, referenceDate = todayIsoLoc
     const baseAmount = entry?.amount > 0 ? entry.amount : variable ? item.averageAmount ?? item.lastAmount : item.lastAmount;
     const changePending = entry?.nextAmount > 0 && entry?.changeDate && entry.changeDate > referenceDate;
     const changeApplied = entry?.nextAmount > 0 && entry?.changeDate && entry.changeDate <= referenceDate;
+    // lastAmount is "what a payment made right now costs", so auto-logging and
+    // Log now stay on the old price until the change date genuinely arrives.
     const lastAmount = changeApplied ? entry.nextAmount : baseAmount;
     const spec = RECURRING_CADENCES[item.cadence];
     const nextDue = entry?.nextDue || item.nextDue;
+    // …but every forward-looking figure has to use the price that will apply on
+    // the next due date. A bill repricing on 15 Aug whose next payment is not
+    // until 8 Oct will never be charged the old price again, so projecting its
+    // monthly cost off that price simply overstates it.
+    const nextDueAmount = entry?.nextAmount > 0 && entry?.changeDate && nextDue && entry.changeDate <= nextDue
+      ? entry.nextAmount
+      : lastAmount;
 
     const endDate = entry?.endDate || null;
     const paymentsLeft = Number.isFinite(entry?.paymentsLeft) ? entry.paymentsLeft : null;
@@ -2169,6 +2457,7 @@ function applyRecurringRegistry(recurring, registry, referenceDate = todayIsoLoc
       variable,
       lastAmount,
       nextAmount: changePending ? entry.nextAmount : null,
+      nextDueAmount,
       changeDate: changePending ? entry.changeDate : null,
       nextDue,
       endDate,
@@ -2177,8 +2466,8 @@ function applyRecurringRegistry(recurring, registry, referenceDate = todayIsoLoc
       finishedReason,
       status,
       daysUntilDue,
-      monthlyCost: spec ? roundCurrencyAmount(lastAmount * spec.perMonth) : item.monthlyCost,
-      yearlyCost: spec ? roundCurrencyAmount(lastAmount * spec.perMonth * 12) : item.yearlyCost,
+      monthlyCost: spec ? roundCurrencyAmount(nextDueAmount * spec.perMonth) : item.monthlyCost,
+      yearlyCost: spec ? roundCurrencyAmount(nextDueAmount * spec.perMonth * 12) : item.yearlyCost,
     };
   });
   const activeItems = items.filter((item) => item.active);
@@ -3013,6 +3302,7 @@ module.exports = {
   RUNWAY_LEGACY_KEYS,
   parseRunwayPeriod,
   runwayWindowEnd,
+  buildRecurringSchedule,
   sumRecurringDueWithin,
   toCents,
   fromCents,
@@ -3059,6 +3349,17 @@ module.exports = {
   parseFlexibleDate,
   normalizeMerchant,
   transactionFingerprint,
+  CAPTURE_METHODS,
+  CAPTURE_METHOD_LABELS,
+  captureMethodLabel,
+  normalizeCaptureMethod,
+  captureChannelKey,
+  describeCaptureChannel,
+  parseCaptureBatch,
+  findDuplicateCapture,
+  appendCaptureLedger,
+  summarizeCaptureOverlap,
+  buildGistRemainder,
   recomputeSpendingTotals,
   computeBudgetPace,
   replaceTransactionBlock,

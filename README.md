@@ -29,7 +29,7 @@ Support the project: [Buy Me a Coffee](https://buymeacoffee.com/tonyhad)
 ## Contents
 
 - [First-time setup](#first-time-setup-empty-vault) — the wizard, and what it creates
-- [How logging works](#how-logging-works) — the tag format, and five ways to capture
+- [How logging works](#how-logging-works) — the tag format, and six ways to capture
 - [Tag language](#tag-language) — spending, income, balances, trips, splits
 - [Budgets](#budgets) — pace-aware limits in a markdown table
 - [Dashboards](#dashboards) — the donut, trends and budget bars
@@ -107,20 +107,33 @@ The same thing rendered in a real daily note:
 
 ![A daily note with a Finance section of logged spending bullets](docs/images/daily-note-example.jpg)
 
-You rarely type this by hand. Four ways to log:
+You rarely type this by hand. Six ways to log:
 
-| Method | Use it for |
-| --- | --- |
-| **`obsidian://finance-capture` Shortcut** | phone capture with **any** sync (incl. Obsidian Sync); briefly opens Obsidian |
-| **Apple Shortcuts → capture inbox file** | phone capture when the vault is **Files-writable** (iCloud Drive / Mac-local); no Obsidian launch |
-| **Quick add modal** (command or status bar) | logging while you're in Obsidian |
-| **Type the bullet yourself** | edge cases; the total self-heals on note open |
+| Method | Opens Obsidian? | Use it for |
+| --- | --- | --- |
+| **`obsidian://finance-capture` URL** | yes, briefly | phone capture with **any** sync (incl. Obsidian Sync) |
+| **Batched queue** (`?lines=`) | once per flush | high-volume phone capture — queue all day, flush once |
+| **GitHub gist** | no | silent phone capture on **any** sync; the only method that works from an Apple Watch |
+| **Capture inbox file** | no | **Files-writable** vaults only (iCloud Drive / Mac-local) |
+| **Quick add modal** (command or status bar) | — | logging while you're in Obsidian |
+| **Type the bullet yourself** | — | edge cases; the total self-heals on note open |
 
-**Which phone method?** It depends on how the vault syncs:
-- **Obsidian Sync** (the vault lives inside the Obsidian app) → use the **URL Shortcut**.
-  Shortcuts can't write into Obsidian's sandbox, so the inbox-file method won't work on the phone.
-- **iCloud Drive / Mac-local folder** → the **inbox-file** method is best (silent, no app launch),
-  and the same folder lets Mac-side scripts and the in-app bank-CSV reconcile drop captures in.
+The first four are **capture methods**, and each has its own toggle in
+**Settings → Capture methods**. They are designed to run at the same time — see
+[Running several methods at once](#running-several-methods-at-once) for how the
+plugin stops that turning into double-logged transactions. Quick add and
+hand-typed bullets always work and have no toggle.
+
+**Which phone method?** It depends on how the vault syncs, and on how much you spend:
+- **Obsidian Sync** (the vault lives inside the Obsidian app) → **URL**, **batched queue**,
+  or **gist**. Shortcuts can't write into Obsidian's sandbox, so the inbox-file method
+  won't work on the phone.
+- **iCloud Drive / Mac-local folder** → the **inbox-file** method also works (silent, no app
+  launch), and the same folder lets Mac-side scripts and the in-app bank-CSV reconcile drop
+  captures in.
+- **A few transactions a day** → plain **URL** is simplest: nothing to set up but a Shortcut.
+- **Every tap-to-pay auto-logged** → **batched queue** (one app switch a day) or **gist**
+  (no app switch at all).
 
 ### URL Shortcut (works with any sync)
 A Shortcut opens `obsidian://finance-capture?amount=12.5&merchant=Coles&category=food/groceries&source=manual`.
@@ -140,6 +153,74 @@ trigger set to Run Immediately —
 `obsidian://finance-capture?vault=<vault>&amount=12.5&category=food/groceries&merchant=Coles&source=manual` —
 and run it from the Home Screen, Lock Screen, or Action Button. This is the only phone method that
 works on an Obsidian Sync vault; use it whenever you want the dashboard to update immediately.
+
+### Batched queue (works with any sync)
+The cost of the URL method is that every tap-to-pay yanks you into Obsidian. The batched
+queue removes that: the automation **appends** each transaction to a list on the phone and
+does nothing else, and a second Shortcut flushes the whole list in one app switch.
+
+Capture a queue of lines into `lines=`, newline-separated, in the same one-line format the
+capture inbox uses:
+
+```
+obsidian://finance-capture?lines=amount%3D12.50%20%7C%20merchant%3DColes%20%7C%20date%3D2026-07-30%0Aamount%3D4.20%20%7C%20merchant%3DBoost%20Juice%20%7C%20date%3D2026-07-30
+```
+
+**Shortcut E — "Queue spend" (automation)**: Shortcuts → **Automation** → **Transaction**
+trigger, **Run Immediately**. Build one **Text** line —
+`amount=[Transaction Amount] | merchant=[Transaction Merchant] | date=[Current Date · yyyy-MM-dd] | source=anz | id=[Current Date · yyyy-MM-dd'T'HHmmss]-[Random 1000–9999]`
+— then **Add to Variable** → `FinanceQueue`, or append it to a [Data Jar](https://datajar.app)
+value if you want the queue to survive between Shortcut runs (it does not otherwise).
+
+**Shortcut F — "Flush spend queue"**: **Get Value from Data Jar** → **Combine Text** with
+**New Lines** → **URL Encode** → **Text** = `obsidian://finance-capture?lines=[URL Encoded Text]`
+→ **Open URLs** → **Delete Value from Data Jar**. Put it on an Automation for a time of day,
+or on the Home Screen. Obsidian opens once, logs everything, and reports
+`logged 7, skipped 1 duplicate`.
+
+Each line is parsed independently, so one malformed line never costs you the rest of the
+batch — bad lines land in `Inbox/_failed/` with the reason, exactly like a bad inbox file.
+Including `id=` is worth the extra action: it means a re-run of the flush can never
+double-log.
+
+### GitHub gist (silent, works with any sync)
+The only method that captures **without opening Obsidian** and still works on an Obsidian
+Sync vault. The phone appends a line to a private gist; the plugin polls the gist with
+Obsidian's own network layer (which works on iOS and Android), logs whatever is waiting,
+then clears it. It is also the only method that works from an **Apple Watch**, where
+`obsidian://` cannot open anything.
+
+**Setup:**
+1. Create a **secret gist** at [gist.github.com](https://gist.github.com) with one file named
+   `finance-capture.txt` and any placeholder content (a `# queue` comment line is ideal — comment
+   lines are ignored). Copy the gist **ID** from its URL: the long hex string after your username.
+2. Create a **fine-grained personal access token** at
+   *GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens*.
+   Give it **only** the **Gists: Read and write** account permission — nothing else, no repository
+   access — and the shortest expiry you can live with.
+3. In Obsidian: **Settings → Finance Tracker → Capture methods** → turn on **GitHub gist**, then
+   fill in the gist ID, token, file name, and how often to poll. Hit **Sync now** to check it.
+
+> **On the token.** It is stored in this vault's `data.json` in plain text, which is how every
+> Obsidian plugin stores settings. A Gists-only token can read and write your gists and nothing
+> else, but treat it like a password: don't commit `data.json`, and revoke the token on GitHub if
+> the vault is ever shared or synced somewhere you don't control.
+
+**Shortcut G — "Log spend (silent)"**: **Get Contents of URL** →
+`https://api.github.com/gists/<gist-id>`, Method **GET**, Headers
+`Authorization: Bearer <token>` → **Get Dictionary Value** `files` → `finance-capture.txt` →
+`content`. Then **Text** = the existing content, a new line, and your capture line. Finally
+**Get Contents of URL** → same URL, Method **PATCH**, same header, **Request Body → JSON**:
+`{"files": {"finance-capture.txt": {"content": "[Text]"}}}`.
+
+That is a read-modify-write, so keep the token in the Shortcut (never in the vault) and don't
+run two flushes at the same second. The plugin's own drain is safe against this: it re-reads
+the gist before clearing and preserves anything that arrived mid-sync, and if the file was
+rewritten underneath it, it leaves the gist alone and says so rather than destroying captures.
+
+The trade-off versus the URL methods: a gist write **needs a connection**. Shortcuts will fail
+the action offline, where opening `obsidian://` would still have worked. If you're often
+offline, add an **Otherwise** branch to the Shortcut that falls back to the URL method.
 
 ### Capture inbox (Files-writable vaults)
 A Shortcut (or Mac script, or the bank-CSV reconcile) drops a one-line file into the
@@ -207,6 +288,68 @@ export the bank CSV and run **Reconcile a bank CSV**; unmatched charges
 can be sent to the capture inbox. Matching is by date+amount, so already-logged taps aren't duplicated.
 
 </details>
+
+### Running several methods at once
+Every capture method has its own toggle in **Settings → Capture methods**, and they are meant
+to be combined — a bank automation feeding the queue, a gist for the Watch, quick add when
+you're at the desk. The risk in combining them is the same purchase arriving twice.
+
+**How duplicates are detected.** The plugin keeps a rolling record of what each method has
+captured (the last 400, in `data.json`). A new capture is compared against it on **amount +
+date + merchant**, and is treated as a duplicate only when the earlier copy came in by a
+**different method or from a different `source=`**. That distinction is the whole point:
+
+- Two $4.20 Boost Juices on the same day, both from the ANZ automation → **two real coffees**,
+  both logged.
+- One $12.50 Coles charge, once from the ANZ automation and once from the Wise sync →
+  **one purchase captured twice**, logged once.
+
+A missing merchant on one side still matches (bank feeds often carry a merchant the manual
+capture lacks, and vice versa), and the **duplicate window** — 1 day by default — allows for a
+feed that settles the day after the tap.
+
+| Setting | Effect |
+| --- | --- |
+| **Skip the second one** (default) | The duplicate is not logged. A notice names the method that got there first. |
+| **Log it, but tell me** | Both are logged, with a notice. Use this while you're still tuning which methods you want. |
+| **Log everything** | Detection off. |
+
+Quick add is exempt: it does its own "already logged today" check *before* you submit, so
+pressing the button always logs. A deliberate human action is never silently dropped.
+
+**Finding overlap.** Settings → Capture methods shows a live **Overlap check**, and the
+**Check capture methods for overlap** command opens the full report: which pairs of methods
+have been capturing the same transactions, how often, and the most recent example. If one pair
+dominates, you're maintaining a method you could switch off. This is measured from what
+actually happened rather than guessed from what each Shortcut is supposed to cover.
+
+### Android
+Nothing in the plugin is Apple-specific — the capture formats are a URL and an HTTP request,
+and Obsidian's mobile app handles both identically on Android. Only the automation app changes:
+
+| iOS | Android equivalent |
+| --- | --- |
+| Shortcuts (manual run) | [HTTP Shortcuts](https://http-shortcuts.rmy.ch/) (gist), or any launcher shortcut to an `obsidian://` URL |
+| Shortcuts Automation (Transaction trigger) | [Tasker](https://tasker.joaoapps.com/) or [MacroDroid](https://www.macrodroid.com/), triggered on a **notification** from your banking app |
+| Data Jar (queue storage) | Tasker variables or a local file |
+| Action Button / Back Tap | home-screen widget, or Tasker's Quick Settings tile |
+
+Two Android-specific notes:
+- **There is no Apple Pay `Transaction` trigger.** The usual substitute is a **notification
+  trigger** on your banking app, parsing the amount and merchant out of the notification text
+  with a regex. That is inherently bank-specific and breaks when the bank rewords its
+  notifications, so treat it as best-effort and keep the monthly CSV reconcile as the backstop.
+- **The gist method is the better fit on Android**, because Tasker's HTTP Request action is
+  first-class and you avoid the app-switch entirely.
+
+> Untested. The author develops on iOS and has no Android device, so the Android column above is
+> reasoning from each app's documented capabilities rather than something that has been run.
+> The plugin side is identical either way — if you use it on Android, corrections are welcome.
+>
+> At current rates, [Buy Me a Coffee](https://buymeacoffee.com/tonyhad) needs to be clicked
+> roughly 150 times before it becomes Buy Me A Second-Hand Pixel, at which point this section
+> gets promoted from "reasoned about" to "actually tested". The finance tracker has, of course,
+> already logged this as `#log/spending/hardware/research` and flagged it as over budget.
 
 ### Deferred categorisation
 Capture is instant and dumb; categorisation is a quick daily review. Anything logged as
@@ -552,6 +695,24 @@ behind **Edit**:
 
 ![Edit bill modal: amount, next due, and three collapsed options — variable amount, price changes on a future date, and this bill stops eventually](docs/images/edit-recurring-modal.png)
 
+**Price changes show you which cycles they hit.** Under the fields, **Upcoming
+payments** lays out the next eight cycles with the amount each one will actually
+be charged, highlighting the first cycle at the new price, and sums it up in a
+line like *"3 more payments at $89.00 ($267.00), then $66.50 from 10 Nov 2026"*.
+It updates as you type, so moving the change date a few days either side of a
+due date shows the consequence before you save. A change dated before the next
+due date reprices every remaining payment, and the per-month/per-year totals,
+the runway target and *due next 30 days* all follow it. **Log now** and auto-log
+deliberately don't: a payment made today is charged today's price.
+
+**Payment calendar** — below the bill list, a month grid shows when the bills
+actually land, so a week with three of them due on the same day is obvious at a
+glance. Each day carries a dot per bill (red overdue, accent normal, yellow for
+a repriced payment) and its daily total; click one for the breakdown. Weeks with
+nothing due are skipped. The **1 month / 3 months / 12 months** buttons switch
+the horizon for the session, Settings → Dashboard → **Payment calendar range**
+sets the default, and `months: 12` in the block config pins it per note.
+
 **Pausing, retiring and removing** — **Pause** moves a bill into a collapsed
 **Archived** section at the bottom of the block. A bill that reached its End Date
 or ran out of Payments Left lands there too, labelled *ended 2027-03-01* or *all
@@ -811,6 +972,8 @@ with **Finance Tracker:**.
 | **Archive finished trips** | Archives every trip past its `end_date` — writes a frozen summary and moves the note to the archive folder. |
 | **Archive completed goals** | The same, for every savings goal that has reached its target. |
 | **Process capture inbox** | Processes every file waiting in the capture inbox folder immediately, instead of waiting for the next automatic drain. |
+| **Sync capture gist now** | Polls the capture gist immediately instead of waiting for the next scheduled check. |
+| **Check capture methods for overlap** | Reports which pairs of capture methods have been logging the same transactions, so you can switch off one you don't need. |
 | **Reconcile a bank CSV** | Paste a bank or Wise CSV export; matches rows by date+amount and can send unmatched charges to the capture inbox. |
 | **Repair daily note totals** | Recomputes the `#log/spending` running total on every daily note in one pass. Individual notes heal when opened; this fixes a whole backlog at once. |
 | **Export transactions to CSV** | Exports every transaction ever logged (all time, all categories) to a CSV file. |
@@ -820,8 +983,8 @@ with **Finance Tracker:**.
 
 ## Key settings
 
-Settings are grouped into **Capture**, **Dashboard**, **Trips**, **Savings
-goals**, **Recurring payments** and **Setup**. Anything that first-time setup
+Settings are grouped into **Capture**, **Capture methods**, **Dashboard**,
+**Trips**, **Savings goals**, **Recurring payments** and **Setup**. Anything that first-time setup
 sets for you — folder paths, the finance heading, the spending root tag, note
 filenames, the merchant map — lives behind an **Advanced** disclosure in its
 section rather than in the default view.
@@ -833,6 +996,11 @@ dashboard.
 
 `dailyNotesFolder`, `spendingHeading` (`## Finance`), `defaultCurrency`,
 `budgetsFolderPath` / `defaultBudgetNoteName`, `captureInboxFolder`,
+`captureMethods` (per-method on/off), `crossMethodDuplicates`
+(`skip` / `warn` / `off`), `duplicateWindowDays`, `captureLedger` (the rolling
+record of what each method captured, used for duplicate detection and the
+overlap report), `gistCaptureId` / `gistCaptureToken` / `gistCaptureFilename` /
+`gistCapturePollMinutes`,
 `merchantMap` (learned merchant → category pairs), `autoDrainInbox`,
 `budgetCheckPeriod`, `weekStartsOn`, `activeHolidayBudgetPath`,
 `recurringTagPrefix` (`subscriptions`), `recurringNoteName`
