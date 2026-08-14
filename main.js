@@ -3428,6 +3428,60 @@ function _ftCreate(app, path, data) {
   return app.vault.create(path, data);
 }
 
+// Shortest merchant key allowed to match as a substring rather than in full.
+// Bank feeds pad the merchant with branch and terminal noise ("Woolworths/cnr
+// Brisbane H", "SQ * Taco De Birria"), so one rule has to cover every variant —
+// but a two- or three-letter key ("iga") turns up inside unrelated names, so
+// short keys stay exact-match only.
+const MERCHANT_SUBSTRING_MIN = 4;
+
+// Bank feeds also truncate to a fixed column width ("S & H Pharmacy Investm"),
+// which containment cannot catch because there the stored name is the longer
+// string. Truncation always keeps the prefix, so a prefix match recovers those
+// — with a higher floor, since a short prefix is a far weaker signal than a
+// whole name sitting inside a padded descriptor.
+const MERCHANT_PREFIX_MIN = 8;
+
+// Resolves a merchant key against a set of stored keys, in descending order of
+// how sure the match makes us: the key itself, then the longest stored key
+// sitting inside it, then an unambiguous truncation of a stored key.
+function lookupMerchantKey(key, entries, read) {
+  if (!key) return "";
+
+  const exact = entries.get(key);
+  if (exact) {
+    const resolved = read(exact);
+    if (resolved) return resolved;
+  }
+
+  // Longest wins, so a specific rule ("costcogas") beats a general one
+  // ("costco") regardless of what order the map happens to be in.
+  let contained = "";
+  let containedLength = 0;
+  for (const [candidate, value] of entries) {
+    if (candidate.length < MERCHANT_SUBSTRING_MIN || candidate.length <= containedLength) continue;
+    if (candidate === key || !key.includes(candidate)) continue;
+    const resolved = read(value);
+    if (!resolved) continue;
+    contained = resolved;
+    containedLength = candidate.length;
+  }
+  if (contained) return contained;
+
+  // A truncated descriptor is a prefix of several stored merchants as often as
+  // one ("costco" prefixes both Costco rules), and there is no basis for
+  // picking between them. Only act when every candidate agrees on the category
+  // — a wrong guess here is worse than leaving it uncategorized.
+  if (key.length < MERCHANT_PREFIX_MIN) return "";
+  const agreed = new Set();
+  for (const [candidate, value] of entries) {
+    if (candidate === key || !candidate.startsWith(key)) continue;
+    const resolved = read(value);
+    if (resolved) agreed.add(resolved);
+  }
+  return agreed.size === 1 ? [...agreed][0] : "";
+}
+
 const DEFAULT_SETTINGS = {
   dailyNotesFolder: "Journal/Periodics/1. Daily",
   spendingHeading: "## Finance",
@@ -3448,6 +3502,8 @@ const DEFAULT_SETTINGS = {
   captureInboxFolder: "Utility/Finance/Inbox",
   merchantMapPath: "Utility/Finance/Merchant Map.md",
   merchantMap: {},
+  merchantMapMigrated: false,
+  learnCategoriesFromHistory: true,
   autoDrainInbox: true,
   processedExternalIds: [],
   // Which transports are live. Every one of these can run at the same time —
@@ -4627,12 +4683,21 @@ class FinanceTrackerPlugin extends Plugin {
 
   // One-time upgrade from the old markdown-file merchant map: reads whatever
   // is there, folds it into settings, and removes the now-redundant file.
+  // Whether this has run is its own flag rather than "is the settings map
+  // empty?" — the moment a single merchant was remembered the old guard
+  // decided the upgrade was already done, and silently stranded the file.
+  // Existing settings win over the file, so re-running can never clobber a
+  // category that has since been corrected.
   async migrateMerchantMapFile() {
-    if (this.settings.merchantMap && Object.keys(this.settings.merchantMap).length) return;
+    if (this.settings.merchantMapMigrated) return;
     const path = normalizePath(this.settings.merchantMapPath || "");
     if (!path) return;
     const file = this.app.vault.getAbstractFileByPath(path);
-    if (!(file instanceof TFile)) return;
+    if (!(file instanceof TFile)) {
+      this.settings.merchantMapMigrated = true;
+      await this.saveSettings();
+      return;
+    }
     const content = await this.app.vault.cachedRead(file);
     const migrated = {};
     for (const rows of core.parseMarkdownTable(content)) {
@@ -4642,18 +4707,66 @@ class FinanceTrackerPlugin extends Plugin {
         if (merchant && category) migrated[merchant] = category;
       }
     }
-    if (Object.keys(migrated).length) {
-      this.settings.merchantMap = migrated;
-      await this.saveSettings();
-    }
+    this.settings.merchantMap = { ...migrated, ...(this.settings.merchantMap || {}) };
+    this.settings.merchantMapMigrated = true;
+    await this.saveSettings();
     await this.app.vault.delete(file);
   }
 
+  // Three passes, most deliberate first: an exact rule, then a rule whose
+  // merchant appears inside the descriptor, then whatever the daily notes say
+  // this merchant was last filed as. An explicit rule always beats history, so
+  // correcting the map is how you overrule a bad precedent.
   async guessCategoryForMerchant(merchant) {
     const key = core.normalizeMerchant(merchant);
     if (!key) return "";
-    const map = await this.loadMerchantMap();
-    return map.get(key) || "";
+    const ruled = lookupMerchantKey(key, await this.loadMerchantMap(), (category) => category);
+    if (ruled) return ruled;
+    if (this.settings.learnCategoriesFromHistory === false) return "";
+    // Best-effort enrichment only. History sits behind a full vault walk and a
+    // parse of every daily note, so it has far more ways to throw than the rule
+    // lookup above — and a throw here reaches handleCapture, which quarantines
+    // the transaction outright. An uncategorised capture that still lands beats
+    // one that silently goes to _failed because a note somewhere is malformed.
+    try {
+      return await this.guessCategoryFromHistory(key);
+    } catch (error) {
+      console.error("[finance-tracker] category history lookup failed", error);
+      return "";
+    }
+  }
+
+  // The notes are already a record of how every merchant was filed, so a
+  // hand-corrected tag is all the teaching the next capture needs — nothing to
+  // tick, nothing to maintain. Only merchants that recur ever get looked up, so
+  // one-offs cost nothing by sitting in here.
+  async guessCategoryFromHistory(key) {
+    return lookupMerchantKey(key, await this.loadMerchantHistory(), (info) => info.category);
+  }
+
+  // Most recent categorised sighting of each merchant. Built off the same
+  // per-file index the dashboards use, and dropped whenever a daily note
+  // changes, so a correction takes effect on the very next capture.
+  async loadMerchantHistory() {
+    if (this._merchantHistory) return this._merchantHistory;
+    const history = new Map();
+    for (const entry of await this.collectAllTransactions()) {
+      if (entry.entryType === "balance" || entry.isIncome || entry.isGoalContribution) continue;
+      // `entry.category` already has any trip prefix split off into holidayKey,
+      // so a Japan 7-Eleven teaches "food/groceries", not "26/japanmidyear/…",
+      // and the capture path re-applies the trip prefix only if a trip is on.
+      const category = core.normalizeCategoryPath(entry.category || "");
+      if (!category || category === "uncategorized") continue;
+      const merchant = String(entry.merchant || "").trim();
+      if (!merchant || /^skipped\b/i.test(merchant)) continue;
+      const merchantKey = core.normalizeMerchant(merchant);
+      if (!merchantKey) continue;
+      const date = String(entry.date || "");
+      const current = history.get(merchantKey);
+      if (!current || date >= current.date) history.set(merchantKey, { category, date });
+    }
+    this._merchantHistory = history;
+    return history;
   }
 
   // Suggestion data for quick-add autocomplete, derived from what has actually
@@ -5198,6 +5311,9 @@ class FinanceTrackerPlugin extends Plugin {
 
   invalidateIndexEntry(path) {
     if (this._txnIndex) this._txnIndex.delete(path);
+    // Merchant history is derived from the index, so any note that changes can
+    // change what the next capture learns.
+    this._merchantHistory = null;
   }
 
   async collectTransactionsForRange(range) {
@@ -8229,6 +8345,23 @@ class FinanceTrackerPlugin extends Plugin {
       lines.push(`- [ ] ${this.settings.spendingRootTag || "#log/spending"} 0`);
       headingIndex = lines.length - 2;
     }
+    // The daily template ships the heading already present but empty, so the
+    // branch above never runs on a real note and the root line never appeared.
+    // Without it recomputeSpendingTotals bails out (no total is ever written)
+    // and the tab-indented bullets below have no parent list item — markdown
+    // then renders them as an indented code block rather than a nested list.
+    const rootTag = this.settings.spendingRootTag || "#log/spending";
+    const rootRe = new RegExp(`^- \\[[^\\]]\\] ${rootTag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\\s|$)`, "i");
+    let hasRoot = false;
+    for (let index = headingIndex + 1; index < lines.length; index += 1) {
+      const trimmed = lines[index].trim();
+      if (/^#{1,6}\s+/.test(trimmed) || /^---\s*$/.test(trimmed)) break;
+      if (rootRe.test(trimmed)) {
+        hasRoot = true;
+        break;
+      }
+    }
+    if (!hasRoot) lines.splice(headingIndex + 1, 0, `- [ ] ${rootTag} 0`);
     let sectionEnd = lines.length;
     for (let index = headingIndex + 1; index < lines.length; index += 1) {
       const trimmed = lines[index].trim();
@@ -8384,6 +8517,13 @@ class FinanceTrackerPlugin extends Plugin {
       if (!replaced) lines.splice(insertAt, 0, row);
     }
     await _ftModify(this.app, file, lines.join("\n"));
+    // Every per-bill state change funnels through here — Push a week, Skip
+    // cycle, Pause, Edit, auto-log and advanceRecurringSchedule. The sidebar's
+    // due-bills card reads this registry but sits outside the block-local
+    // rerender(), and the vault modify hook ignores both self-writes and
+    // anything outside the daily-notes folder, so without this the card kept
+    // showing pre-change state (a pushed bill still reading "overdue since").
+    this.refreshDailyBudgetView();
   }
 
   async logRecurringItem(item, date, amountOverride) {
@@ -11820,8 +11960,21 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
 
     const merchantAdvanced = addAdvanced(
       "Advanced: merchant map",
-      "Learned merchant → category pairs, added by the \"Remember this merchant → category\" checkbox when editing a transaction. Remove one here if it guesses wrong."
+      "Merchant → category rules. A rule matches a capture's merchant exactly, or as a whole chunk inside it, so \"woolworths\" also covers \"Woolworths/cnr Brisbane H\". Add one with the \"Remember this merchant → category\" checkbox when editing a transaction; remove one here if it guesses wrong."
     );
+
+    new Setting(merchantAdvanced)
+      .setName("Learn categories from past notes")
+      .setDesc(
+        "When no rule above matches, file the capture the way the same merchant was filed last time in your daily notes. Categorising a merchant by hand once is then enough to catch every later capture from it, with nothing to remember to tick. Rules above always win over history."
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.learnCategoriesFromHistory !== false).onChange(async (value) => {
+          this.plugin.settings.learnCategoriesFromHistory = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
     this.renderMerchantMapList(merchantAdvanced.createDiv({ cls: "finance-tracker-goal-list" }));
 
     // Trips: the notes, plus trip mode, in one place. Trip mode used to be its

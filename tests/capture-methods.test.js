@@ -69,6 +69,9 @@ function makePlugin(overrides = {}) {
     vault: {
       getAbstractFileByPath: (p) => files.get(p) || null,
       getFiles: () => [...files.values()],
+      // Category guessing now falls back to what the daily notes already say a
+      // merchant was filed as, which walks the vault through getDailyNoteFiles.
+      getMarkdownFiles: () => [...files.values()].filter((file) => file.extension === "md"),
       cachedRead: async (file) => file.content,
       read: async (file) => file.content,
       modify: async (file, content) => {
