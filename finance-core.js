@@ -782,13 +782,29 @@ function buildTransactionBlock(expense, settings = {}) {
   return lines;
 }
 
+function findFinanceHeadingIndex(lines, preferred) {
+  const wanted = [];
+  for (const heading of [preferred, "## Finance", "## Spending"]) {
+    const normalized = normalizeWhitespace(heading || "").toLowerCase();
+    if (normalized && !wanted.includes(normalized)) wanted.push(normalized);
+  }
+  for (const heading of wanted) {
+    const index = lines.findIndex((line) => normalizeWhitespace(line).toLowerCase() === heading);
+    if (index >= 0) return index;
+  }
+  return -1;
+}
+
 function insertTransactionIntoDailyNote(content, expense, settings = {}) {
   const lines = splitLines(content);
   const noteDate = parseIsoDate(expense.date) || extractNoteDate(content, "") || todayIsoLocal();
   const spendingHeading = normalizeWhitespace(settings.spendingHeading || "## Spending");
   const rootTag = normalizeWhitespace(settings.spendingRootTag || "#log/spending");
   const rootLinePrefix = `- [ ] ${rootTag}`;
-  let headingIndex = lines.findIndex((line) => normalizeWhitespace(line).toLowerCase() === spendingHeading.toLowerCase());
+  // The configured heading first, then the one the vault used to use. Without
+  // the fallback, logging into an older note that still says "## Spending" added
+  // a second finance section rather than writing into the one already there.
+  let headingIndex = findFinanceHeadingIndex(lines, spendingHeading);
 
   if (headingIndex === -1) {
     if (lines.length && normalizeWhitespace(lines[lines.length - 1])) {
@@ -3350,6 +3366,255 @@ function buildGoalArchiveSummaryLines(goal, entries, referenceDate) {
   return lines;
 }
 
+// --- Note rewrites -------------------------------------------------------------
+// Every migration that edits the user's notes goes through here. The transform is
+// pure and planned over file contents first, so the preview someone confirms is
+// exactly what gets written, and running it twice is a no-op.
+
+function planNoteRewrite(files, transform) {
+  const changedFiles = [];
+  const warnings = [];
+  const samples = [];
+  let entries = 0;
+
+  for (const file of files || []) {
+    const path = file?.path || "";
+    const before = String(file?.content ?? "");
+    const outcome = transform(before, path) || {};
+    const after = String(outcome.content ?? before);
+    for (const warning of outcome.warnings || []) warnings.push({ path, ...warning });
+    for (const sample of outcome.samples || []) {
+      if (samples.length < 5) samples.push({ path, ...sample });
+    }
+    entries += Number(outcome.entries || 0);
+    if (after === before) continue;
+    changedFiles.push({ path, before, after, entries: Number(outcome.entries || 0) });
+  }
+
+  return {
+    files: changedFiles,
+    samples,
+    warnings,
+    totals: { files: changedFiles.length, entries, warnings: warnings.length },
+  };
+}
+
+// Reads the amount out of one side of a legacy two-amount line. The last number
+// wins, so an arithmetic aside ("$46.79/3 = $15.6") yields what was actually
+// paid.
+function lastAmountIn(text) {
+  const matches = Array.from(String(text || "").matchAll(/-?(?:\d[\d,]*(?:\.\d+)?|\.\d+)/g));
+  if (!matches.length) return null;
+  return Number(String(matches[matches.length - 1][0]).replace(/,/g, ""));
+}
+
+// The code may lead the number ("R$150"), follow it ("18BRL"), or stand alone
+// ("5.16 AUD"), so the boundary allows a digit on either side.
+const LEGACY_CURRENCY_MARKERS = [
+  [/(?:^|[\s(\d])(?:R\$|BRL)/i, "BRL"],
+  [/(?:^|[\s(\d])(?:US\$|USD)/i, "USD"],
+  [/(?:^|[\s(\d])(?:NZ\$|NZD)/i, "NZD"],
+  [/(?:^|[\s(\d])(?:¥|JPY|YEN)/i, "JPY"],
+  [/(?:^|[\s(\d])(?:€|EUR)/i, "EUR"],
+  [/(?:^|[\s(\d])(?:£|GBP)/i, "GBP"],
+];
+
+function detectLegacyCurrency(text) {
+  for (const [pattern, code] of LEGACY_CURRENCY_MARKERS) {
+    if (pattern.test(text)) return code;
+  }
+  return "";
+}
+
+const LEGACY_TRIP_TAG = /#log\/archive\/(\d{2}|\d{4})\/([^\s/#\]]+)\/spending\/([^\s#\]]+)/i;
+
+// Converts a trip that was filed under `#log/archive/<year>/<trip>/spending/…`
+// into the current form: a canonical trip tag, and the two-currency amount
+// written the way the plugin writes it now ("BRL 195.16 : $55.60 AUD"), so the
+// original currency is read back rather than being decoration.
+//
+// A line whose meaning cannot be preserved exactly — an arithmetic aside, or an
+// original amount with no currency marker at all — keeps its original text as a
+// child note and is reported as a warning, so nothing is quietly lost.
+function buildLegacyTripTagTransform(options = {}) {
+  const homeCurrency = normalizeCurrency(options.homeCurrency || "AUD");
+  const fallbackCurrency = normalizeCurrency(options.originalCurrency || "", "");
+  // Per-trip fallbacks, so a line that names no currency is read as whatever the
+  // rest of that trip was paid in rather than as a guess.
+  const tripCurrencies = options.tripCurrencies || {};
+  const categoryFixes = options.categoryFixes || {};
+  const heading = normalizeWhitespace(options.heading || "## Finance");
+
+  const fixCategory = (value) =>
+    normalizeCategoryPath(value)
+      .split("/")
+      .filter(Boolean)
+      .map((segment) => categoryFixes[segment] || segment)
+      .join("/");
+
+  return function transform(content) {
+    const lines = splitLines(content);
+    const out = [];
+    const samples = [];
+    const warnings = [];
+    let entries = 0;
+    let headingIndex = -1;
+
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index];
+
+      // A legacy note carries the old finance heading; the rest of the vault has
+      // moved on, and captures only look for the configured one. Recorded now,
+      // applied at the end — only if this note turned out to hold entries.
+      if (headingIndex < 0 && /^##\s+(?:spending|finance)\s*$/i.test(line.trim())) {
+        headingIndex = out.length;
+      }
+
+      const match = line.match(LEGACY_TRIP_TAG);
+      if (!match) {
+        out.push(line);
+        continue;
+      }
+
+      const indent = (line.match(/^\s*/) || [""])[0];
+      const tail = line.slice(line.indexOf(match[0]) + match[0].length).replace(/\s+$/, "");
+      // Markdown escapes ("R\$195.16") are display, not data.
+      const head = line
+        .slice(0, line.indexOf(match[0]))
+        .replace(/^\s*-\s*(?:\[[^\]]\]\s*)?/, "")
+        .replace(/\\(?=[$])/g, "")
+        .trim();
+
+      const tripKey = `${match[1]}/${normalizeCategoryPath(match[2])}`;
+      const category = fixCategory(match[3]) || "uncategorized";
+      const tag = buildCategoryTag(category, tripKey);
+
+      const sides = head.split(/\s+[-–—]\s+/);
+      const hasOriginal = sides.length > 1;
+      const originalSide = hasOriginal ? sides[0] : "";
+      const homeSide = hasOriginal ? sides.slice(1).join(" - ") : head;
+      const amount = lastAmountIn(homeSide);
+      const originalAmount = hasOriginal ? lastAmountIn(originalSide) : null;
+      const isCash = /\bcash\b/i.test(head);
+      let currency = hasOriginal ? detectLegacyCurrency(originalSide) : "";
+      let keepOriginalText = /[/=]/.test(homeSide);
+
+      if (hasOriginal && !currency) {
+        currency = normalizeCurrency(tripCurrencies[tripKey] || "", "") || fallbackCurrency;
+        keepOriginalText = true;
+        warnings.push({
+          line: line.trim(),
+          reason: currency
+            ? `No currency marker — read as ${currency}. The original line is kept as a note.`
+            : "No currency marker and no fallback currency — only the home amount is kept.",
+        });
+      } else if (keepOriginalText) {
+        warnings.push({ line: line.trim(), reason: "Amount included a calculation; the original line is kept as a note." });
+      }
+
+      if (!Number.isFinite(amount)) {
+        // Nothing reliable to rewrite: retag only, leave the text alone.
+        out.push(`${indent}- ${head} ${tag}${tail}`.replace(/\s+/g, " ").replace(/^ /, indent));
+        warnings.push({ line: line.trim(), reason: "No amount could be read; the tag was updated and the text left as it was." });
+        entries += 1;
+        continue;
+      }
+
+      const label =
+        Number.isFinite(originalAmount) && currency && currency !== homeCurrency
+          ? `${formatOriginalCurrencyLabel(originalAmount, { currency, isCash })} : ${formatCurrencyWithCode(amount, homeCurrency)}`
+          : formatCurrency(amount, homeCurrency);
+
+      const rewritten = `${indent}- ${label} ${tag}${tail}`;
+      out.push(rewritten);
+      entries += 1;
+      if (samples.length < 3) samples.push({ before: line, after: rewritten });
+
+      // Copy the entry's own child lines across untouched, then add the note
+      // after them — a note inserted first would be read as the merchant.
+      let cursor = index + 1;
+      while (cursor < lines.length) {
+        const child = lines[cursor];
+        if (!child.trim()) break;
+        const childIndent = (child.match(/^\s*/) || [""])[0];
+        if (childIndent.length <= indent.length || !/^\s*-\s/.test(child)) break;
+        out.push(child);
+        cursor += 1;
+      }
+      if (keepOriginalText) {
+        out.push(`${indent}\t- as written: ${head}`);
+      }
+      index = cursor - 1;
+    }
+
+    if (!entries) {
+      // Nothing from this migration is in this note, so it is left exactly as it
+      // is — including its heading and its running total.
+      return { content, entries: 0, samples: [], warnings: [] };
+    }
+
+    if (headingIndex >= 0 && normalizeWhitespace(out[headingIndex]) !== heading) {
+      out[headingIndex] = heading;
+    }
+
+    const rewritten = out.join("\n");
+    return {
+      content: recomputeSpendingTotals(rewritten, {
+        spendingHeading: heading,
+        spendingRootTag: options.spendingRootTag || "#log/spending",
+        defaultCurrency: homeCurrency,
+      }),
+      entries,
+      samples,
+      warnings,
+    };
+  };
+}
+
+
+// What legacy trip tags does this vault still hold? Drives the migration preview
+// ("25/brazil — 255 entries across 56 notes, mostly BRL") and supplies the
+// per-trip fallback currency the transform uses for lines that name none.
+function summarizeLegacyTripTags(files) {
+  const trips = new Map();
+  for (const file of files || []) {
+    const path = file?.path || "";
+    for (const line of splitLines(String(file?.content ?? ""))) {
+      const match = line.match(LEGACY_TRIP_TAG);
+      if (!match) continue;
+      const key = `${match[1]}/${normalizeCategoryPath(match[2])}`;
+      const trip = trips.get(key) || { key, entries: 0, files: new Set(), currencies: new Map(), firstDate: "", lastDate: "" };
+      trip.entries += 1;
+      trip.files.add(path);
+      // Strip the bullet prefix before splitting, or its own "- " is read as the
+      // separator between the two amounts and the first side comes back empty.
+      const head = line
+        .slice(0, line.indexOf(match[0]))
+        .replace(/^\s*-\s*(?:\[[^\]]\]\s*)?/, "")
+        .replace(/\\(?=[$])/g, "");
+      const currency = detectLegacyCurrency(head.split(/\s+[-\u2013\u2014]\s+/)[0] || "");
+      if (currency) trip.currencies.set(currency, (trip.currencies.get(currency) || 0) + 1);
+      const date = extractNoteDate("", path);
+      if (date) {
+        if (!trip.firstDate || date < trip.firstDate) trip.firstDate = date;
+        if (date > trip.lastDate) trip.lastDate = date;
+      }
+      trips.set(key, trip);
+    }
+  }
+
+  return Array.from(trips.values())
+    .map((trip) => ({
+      key: trip.key,
+      entries: trip.entries,
+      files: trip.files.size,
+      firstDate: trip.firstDate,
+      lastDate: trip.lastDate,
+      currency: Array.from(trip.currencies.entries()).sort((left, right) => right[1] - left[1])[0]?.[0] || "",
+    }))
+    .sort((left, right) => right.entries - left.entries);
+}
+
 module.exports = {
   RECURRING_CADENCES,
   RECURRING_REGISTRY_COLUMNS,
@@ -3424,6 +3689,10 @@ module.exports = {
   summarizeCaptureOverlap,
   buildGistRemainder,
   recomputeSpendingTotals,
+  planNoteRewrite,
+  buildLegacyTripTagTransform,
+  summarizeLegacyTripTags,
+  findFinanceHeadingIndex,
   computeBudgetPace,
   replaceTransactionBlock,
   removeTransactionBlock,

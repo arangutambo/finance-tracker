@@ -1941,3 +1941,135 @@ test("legacy archive trip tags read as trip spending", () => {
   // The whole point: a finished trip stops counting as spending at home.
   assert.equal(core.isSpendingEntry(entry), false);
 });
+
+// Every line below is a real one from the author's 2025 Brazil notes.
+const BRAZIL_NOTE = [
+  "---",
+  "date: 2025-10-04",
+  "---",
+  "",
+  "## Spending",
+  "- [ ] #log/spending ",
+  "\t- R\\$195.16 - AUD\\$55.60 #log/archive/25/Brazil/Spending/Accommadation ",
+  "\t\t- 1 Night [[_ Pousada La Luna]]",
+  "\t- 18BRL - 5.16 AUD #log/archive/25/Brazil/Spending/Food/Snacks ",
+  "\t\t- Açai Bowl",
+  "\t- R$150 - $50 Cash #log/archive/25/Brazil/Spending/Transport/Transfer ",
+  "\t- $12 #log/archive/25/Brazil/Spending/Cellular ",
+  "",
+].join("\n");
+
+const brazilOptions = {
+  categoryFixes: { accommadation: "accommodation" },
+  heading: "## Finance",
+  homeCurrency: "AUD",
+  originalCurrency: "BRL",
+};
+
+test("the legacy trip migration rewrites tags, amounts and the heading", () => {
+  const transform = core.buildLegacyTripTagTransform(brazilOptions);
+  const { content, entries } = transform(BRAZIL_NOTE);
+  const lines = content.split("\n");
+
+  assert.equal(entries, 4);
+  assert.ok(lines.includes("## Finance"), "the legacy heading is brought up to date");
+  assert.ok(!/#log\/archive\//.test(content), "no archive tags survive");
+  assert.ok(lines.includes("\t- BRL 195.16 : $55.60 AUD #log/spending/25/brazil/accommodation"));
+  assert.ok(lines.includes("\t- BRL 18.00 : $5.16 AUD #log/spending/25/brazil/food/snacks"));
+  assert.ok(lines.includes("\t- BRL 150.00 CASH : $50.00 AUD #log/spending/25/brazil/transport/transfer"));
+  // One amount only, so nothing is invented.
+  assert.ok(lines.includes("\t- $12.00 #log/spending/25/brazil/cellular"));
+  // The merchant child line stays where it was, directly under its entry.
+  assert.equal(lines[lines.indexOf("\t- BRL 195.16 : $55.60 AUD #log/spending/25/brazil/accommodation") + 1], "\t\t- 1 Night [[_ Pousada La Luna]]");
+  // The running total is healed from the converted entries.
+  assert.ok(lines.some((line) => line.startsWith("- [ ] #log/spending 122.76")), content);
+
+  const entriesBack = core.parseTransactionsFromNoteContent(content, "2025-10-04.md", {});
+  assert.equal(entriesBack.length, 4);
+  assert.equal(entriesBack[0].holidayKey, "25/brazil");
+  assert.equal(entriesBack[0].category, "accommodation");
+  assert.equal(entriesBack[0].amount, 55.6);
+  assert.equal(entriesBack[0].originalAmount, 195.16);
+  assert.equal(entriesBack[0].originalCurrency, "BRL");
+  assert.equal(entriesBack[2].originalRateKey, "BRL_CASH");
+  assert.equal(entriesBack.every((entry) => !core.isSpendingEntry(entry)), true);
+});
+
+test("the legacy trip migration is idempotent", () => {
+  const transform = core.buildLegacyTripTagTransform(brazilOptions);
+  const once = transform(BRAZIL_NOTE).content;
+  const twice = transform(once);
+  assert.equal(twice.content, once);
+  assert.equal(twice.entries, 0);
+});
+
+test("the legacy trip migration keeps what it cannot convert exactly", () => {
+  const transform = core.buildLegacyTripTagTransform(brazilOptions);
+  const note = [
+    "## Spending",
+    "- [ ] #log/spending ",
+    "\t- R$161.70 - $46.79/3 = $15.6 #log/archive/25/Brazil/Spending/Food/Restaurants ",
+    "\t- $31.82 - $9.1 #log/archive/25/Brazil/Spending/Accommadation ",
+    "",
+  ].join("\n");
+  const { content, warnings } = transform(note);
+  const lines = content.split("\n");
+
+  // What was actually paid is the amount; the working is kept as a note.
+  assert.ok(lines.includes("\t- BRL 161.70 : $15.60 AUD #log/spending/25/brazil/food/restaurants"));
+  assert.ok(lines.includes("\t\t- as written: R$161.70 - $46.79/3 = $15.6"));
+  // No currency marker at all: the fallback is used and the line is flagged.
+  assert.ok(lines.includes("\t- BRL 31.82 : $9.10 AUD #log/spending/25/brazil/accommodation"));
+  assert.equal(warnings.length, 2);
+  assert.match(warnings[1].reason, /No currency marker/);
+});
+
+test("planNoteRewrite reports only the files that change", () => {
+  const transform = core.buildLegacyTripTagTransform(brazilOptions);
+  const plan = core.planNoteRewrite(
+    [
+      { path: "2025-10-04.md", content: BRAZIL_NOTE },
+      { path: "2026-09-14.md", content: "## Finance\n- [ ] #log/spending 27.3\n\t- $27.30 #log/spending/food/takeaway\n" },
+    ],
+    transform
+  );
+  assert.equal(plan.totals.files, 1);
+  assert.equal(plan.totals.entries, 4);
+  assert.equal(plan.files[0].path, "2025-10-04.md");
+  assert.ok(plan.samples.length > 0 && plan.samples[0].before !== plan.samples[0].after);
+});
+
+test("a transaction logged into a note with the legacy heading joins that section", () => {
+  const note = ["---", "date: 2026-02-03", "---", "", "## Spending", "- [ ] #log/spending 10", "\t- $10.00 #log/spending/food/takeaway", ""].join("\n");
+  const next = core.insertTransactionIntoDailyNote(note, { amount: 5, category: "food/snacks", date: "2026-02-03" }, { spendingHeading: "## Finance", spendingRootTag: "#log/spending" });
+  assert.equal((next.match(/^## /gm) || []).length, 1, "no second finance section is created");
+  assert.ok(next.includes("- [ ] #log/spending 15"));
+  assert.equal(core.parseTransactionsFromNoteContent(next, "2026-02-03.md", {}).length, 2);
+});
+
+test("summarizeLegacyTripTags reports each trip and the currency it was paid in", () => {
+  const trips = core.summarizeLegacyTripTags([
+    { path: "Daily/2025/10/2025-10-04.md", content: BRAZIL_NOTE },
+    {
+      path: "Daily/2025/11/2025-11-27.md",
+      content: "## Spending\n- [ ] #log/spending\n\t- R$20 - $6 #log/archive/25/Brazil/Spending/Food/Snacks\n",
+    },
+  ]);
+  assert.equal(trips.length, 1);
+  assert.equal(trips[0].key, "25/brazil");
+  assert.equal(trips[0].entries, 5);
+  assert.equal(trips[0].files, 2);
+  assert.equal(trips[0].currency, "BRL");
+  assert.equal(trips[0].firstDate, "2025-10-04");
+  assert.equal(trips[0].lastDate, "2025-11-27");
+});
+
+test("a line with no currency marker falls back to the rest of its trip", () => {
+  const transform = core.buildLegacyTripTagTransform({
+    heading: "## Finance",
+    homeCurrency: "AUD",
+    tripCurrencies: { "25/brazil": "BRL" },
+  });
+  const { content } = transform("## Spending\n- [ ] #log/spending\n\t- $31.82 - $9.1 #log/archive/25/Brazil/Spending/Accommadation\n");
+  assert.ok(content.includes("BRL 31.82 : $9.10 AUD"), content);
+});
