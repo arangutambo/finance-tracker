@@ -632,3 +632,65 @@ test("a converted trip gets an archived note so its dashboard has something to r
   // Running it again must not create a second note for the same trip.
   assert.deepEqual(await plugin.ensureArchivedTripNotes(trips), []);
 });
+
+// --- Learning across a merchant's variants -------------------------------------------
+
+test("categorising one branch of a shop teaches the other branches", async () => {
+  const { plugin, app, files } = makePlugin();
+  delete plugin.invalidateIndexEntry;
+  await app.vault.create(
+    "Daily/2026-08-08.md",
+    "## Finance\n- [ ] #log/spending 6\n\t- $6.00 #log/spending/food/groceries\n\t\t- Woolworths/cnr Brisbane H\n"
+  );
+
+  // A different branch. Neither descriptor contains the other, which is exactly
+  // why this capture used to land uncategorised.
+  await plugin.handleCapture({ amount: "20.00", merchant: "Woolworths/8 Sherwood Roa", date: "2026-08-16", source: "anz" });
+
+  const logged = financeLines(files, "2026-08-16");
+  assert.equal(logged.length, 1);
+  assert.match(logged[0], /#log\/spending\/food\/groceries/, logged[0]);
+});
+
+test("a processor prefix does not stop a capture from being filed", async () => {
+  const { plugin, app, files } = makePlugin();
+  delete plugin.invalidateIndexEntry;
+  await app.vault.create(
+    "Daily/2026-08-15.md",
+    "## Finance\n- [ ] #log/spending 11.5\n\t- $11.50 #log/spending/food/takeaway\n\t\t- Rode Fresh\n"
+  );
+
+  await plugin.handleCapture({ amount: "10.00", merchant: "SQ * Rode Fresh", date: "2026-09-12", source: "anz" });
+
+  assert.match(financeLines(files, "2026-09-12")[0], /#log\/spending\/food\/takeaway/);
+});
+
+test("remembering a merchant stores its root, so the next descriptor matches", async () => {
+  const { plugin } = makePlugin();
+
+  await plugin.rememberMerchantCategory("SQ * Milk N Mochi Pty Ltd", "food/takeaway");
+
+  assert.deepEqual(Object.keys(plugin.settings.merchantMap), ["milknmochi"]);
+  assert.equal(await plugin.guessCategoryForMerchant("SQ * Milk N Mochi"), "food/takeaway");
+  assert.equal(await plugin.guessCategoryForMerchant("Milk N Mochi Pty Ltd"), "food/takeaway");
+});
+
+test("a suggestion says where it came from", async () => {
+  const { plugin, app } = makePlugin({ merchantMap: { danmurphys: "alcohol" } });
+  delete plugin.invalidateIndexEntry;
+  await app.vault.create(
+    "Daily/2026-08-08.md",
+    "## Finance\n- [ ] #log/spending 6\n\t- $6.00 #log/spending/food/groceries\n\t\t- Woolworths/cnr Brisbane H\n"
+  );
+
+  assert.deepEqual(await plugin.suggestCategoryForMerchant("Dan Murphy's/blunder Rd &"), {
+    category: "alcohol",
+    source: "rule",
+  });
+  // Neither branch contains the other, so only the root reaches this one.
+  assert.deepEqual(await plugin.suggestCategoryForMerchant("Woolworths/8 Sherwood Roa"), {
+    category: "food/groceries",
+    source: "history-root",
+  });
+  assert.equal(plugin.describeSuggestionSource("history-root"), "how you filed it last time");
+});

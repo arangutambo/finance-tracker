@@ -3618,6 +3618,151 @@ const core = (() => {
       .sort((left, right) => right.entries - left.entries);
   }
 
+  // Shortest merchant key allowed to match as a substring rather than in full.
+  // Bank feeds pad the merchant with branch and terminal noise ("Woolworths/cnr
+  // Brisbane H", "SQ * Taco De Birria"), so one rule has to cover every variant —
+  // but a two- or three-letter key ("iga") turns up inside unrelated names, so
+  // short keys stay exact-match only.
+  const MERCHANT_SUBSTRING_MIN = 4;
+
+  // Bank feeds also truncate to a fixed column width ("S & H Pharmacy Investm"),
+  // which containment cannot catch because there the stored name is the longer
+  // string. Truncation always keeps the prefix, so a prefix match recovers those
+  // — with a higher floor, since a short prefix is a far weaker signal than a
+  // whole name sitting inside a padded descriptor.
+  const MERCHANT_PREFIX_MIN = 8;
+
+  // Resolves a merchant key against a set of stored keys, in descending order of
+  // how sure the match makes us: the key itself, then the longest stored key
+  // sitting inside it, then an unambiguous truncation of a stored key.
+  function lookupMerchantKey(key, entries, read) {
+    if (!key) return "";
+
+    const exact = entries.get(key);
+    if (exact) {
+      const resolved = read(exact);
+      if (resolved) return resolved;
+    }
+
+    // Longest wins, so a specific rule ("costcogas") beats a general one
+    // ("costco") regardless of what order the map happens to be in.
+    let contained = "";
+    let containedLength = 0;
+    for (const [candidate, value] of entries) {
+      if (candidate.length < MERCHANT_SUBSTRING_MIN || candidate.length <= containedLength) continue;
+      if (candidate === key || !key.includes(candidate)) continue;
+      const resolved = read(value);
+      if (!resolved) continue;
+      contained = resolved;
+      containedLength = candidate.length;
+    }
+    if (contained) return contained;
+
+    // A truncated descriptor is a prefix of several stored merchants as often as
+    // one ("costco" prefixes both Costco rules), and there is no basis for
+    // picking between them. Only act when every candidate agrees on the category
+    // — a wrong guess here is worse than leaving it uncategorized.
+    if (key.length < MERCHANT_PREFIX_MIN) return "";
+    const agreed = new Set();
+    for (const [candidate, value] of entries) {
+      if (candidate === key || !candidate.startsWith(key)) continue;
+      const resolved = read(value);
+      if (resolved) agreed.add(resolved);
+    }
+    return agreed.size === 1 ? [...agreed][0] : "";
+  }
+
+
+  // Re-keys a merchant map by root, so one rule covers every branch and every
+  // descriptor variant. When two entries collapse to the same root the most
+  // recent wins, which is what "how did I file this last time" means.
+  function indexByMerchantRoot(entries) {
+    const byRoot = new Map();
+    const source = entries instanceof Map ? entries : new Map(Object.entries(entries || {}));
+    for (const [key, value] of source) {
+      // Prefer the merchant as it was written: a stored key has already lost its
+      // spaces and punctuation, so "thebagelboys" can no longer shed its "the".
+      const root = merchantRootKey((typeof value === "object" && value?.name) || key);
+      if (!root) continue;
+      const current = byRoot.get(root);
+      const date = typeof value === "object" && value ? String(value.date || "") : "";
+      const currentDate = typeof current === "object" && current ? String(current.date || "") : "";
+      if (!current || date >= currentDate) byRoot.set(root, value);
+    }
+    return byRoot;
+  }
+
+  // One place that decides what category a merchant should get, and says why it
+  // thinks so — the inbox shows that reason, because "because you filed Woolworths
+  // here last month" is the difference between a suggestion you can trust and one
+  // you have to check.
+  //
+  // Order runs from most deliberate to least: an explicit rule, a rule sitting
+  // inside the descriptor, a rule on the merchant root, then the same three
+  // against what the daily notes already say.
+  function suggestCategoryForMerchant(merchant, sources = {}) {
+    const asMap = (value) => (value instanceof Map ? value : new Map(Object.entries(value || {})));
+    const readCategory = (value) => (typeof value === "string" ? value : value?.category || "");
+    const rules = asMap(sources.rules);
+    const history = asMap(sources.history);
+    const rootRules = sources.rootRules ? asMap(sources.rootRules) : indexByMerchantRoot(rules);
+    const rootHistory = sources.rootHistory ? asMap(sources.rootHistory) : indexByMerchantRoot(history);
+    const key = normalizeMerchant(merchant);
+    const root = merchantRootKey(merchant);
+    if (!key && !root) return { category: "", source: "" };
+
+    const attempts = [
+      ["rule", () => readCategory(rules.get(key))],
+      ["rule", () => lookupMerchantKey(key, rules, readCategory)],
+      ["rule-root", () => readCategory(rootRules.get(root))],
+      ["history", () => readCategory(history.get(key))],
+      ["history", () => lookupMerchantKey(key, history, readCategory)],
+      ["history-root", () => readCategory(rootHistory.get(root))],
+    ];
+
+    for (const [source, attempt] of attempts) {
+      const category = normalizeCategoryPath(attempt() || "");
+      if (category && category !== "uncategorized") return { category, source };
+    }
+    return { category: "", source: "" };
+  }
+
+  // The inbox is grouped by merchant root rather than listed by date: twelve
+  // separate "SQ * Rode Fresh" rows are one decision, not twelve.
+  function groupEntriesByMerchantRoot(entries) {
+    const groups = new Map();
+    for (const entry of entries || []) {
+      const merchant = normalizeWhitespace(entry?.merchant || "");
+      const root = merchantRootKey(merchant);
+      const key = root || `\u0000${normalizeWhitespace(entry?.date || "")}|${entry?.amount ?? ""}`;
+      const group = groups.get(key) || {
+        key,
+        root,
+        label: cleanMerchantDisplay(merchant) || "(no merchant)",
+        entries: [],
+        total: 0,
+        firstDate: "",
+        lastDate: "",
+        merchants: new Set(),
+      };
+      group.entries.push(entry);
+      group.total = roundCurrencyAmount(group.total + Number(entry?.amount || 0));
+      const date = parseIsoDate(entry?.date) || "";
+      if (date) {
+        if (!group.firstDate || date < group.firstDate) group.firstDate = date;
+        if (date > group.lastDate) group.lastDate = date;
+        // The most recent spelling is the one worth showing.
+        if (merchant && date >= group.lastDate) group.label = cleanMerchantDisplay(merchant);
+      }
+      if (merchant) group.merchants.add(merchant);
+      groups.set(key, group);
+    }
+
+    return Array.from(groups.values())
+      .map((group) => ({ ...group, count: group.entries.length, merchants: Array.from(group.merchants) }))
+      .sort((left, right) => right.count - left.count || right.total - left.total);
+  }
+
   return {
     RECURRING_CADENCES,
     RECURRING_REGISTRY_COLUMNS,
@@ -3678,6 +3823,10 @@ const core = (() => {
     parseFlexibleDate,
     normalizeMerchant,
     merchantRootKey,
+    lookupMerchantKey,
+    indexByMerchantRoot,
+    suggestCategoryForMerchant,
+    groupEntriesByMerchantRoot,
     cleanMerchantDisplay,
     transactionFingerprint,
     CAPTURE_METHODS,
@@ -3758,60 +3907,6 @@ function _ftCreate(app, path, data) {
     setTimeout(() => _ftSelfWrites.delete(p), 1500);
   }
   return app.vault.create(path, data);
-}
-
-// Shortest merchant key allowed to match as a substring rather than in full.
-// Bank feeds pad the merchant with branch and terminal noise ("Woolworths/cnr
-// Brisbane H", "SQ * Taco De Birria"), so one rule has to cover every variant —
-// but a two- or three-letter key ("iga") turns up inside unrelated names, so
-// short keys stay exact-match only.
-const MERCHANT_SUBSTRING_MIN = 4;
-
-// Bank feeds also truncate to a fixed column width ("S & H Pharmacy Investm"),
-// which containment cannot catch because there the stored name is the longer
-// string. Truncation always keeps the prefix, so a prefix match recovers those
-// — with a higher floor, since a short prefix is a far weaker signal than a
-// whole name sitting inside a padded descriptor.
-const MERCHANT_PREFIX_MIN = 8;
-
-// Resolves a merchant key against a set of stored keys, in descending order of
-// how sure the match makes us: the key itself, then the longest stored key
-// sitting inside it, then an unambiguous truncation of a stored key.
-function lookupMerchantKey(key, entries, read) {
-  if (!key) return "";
-
-  const exact = entries.get(key);
-  if (exact) {
-    const resolved = read(exact);
-    if (resolved) return resolved;
-  }
-
-  // Longest wins, so a specific rule ("costcogas") beats a general one
-  // ("costco") regardless of what order the map happens to be in.
-  let contained = "";
-  let containedLength = 0;
-  for (const [candidate, value] of entries) {
-    if (candidate.length < MERCHANT_SUBSTRING_MIN || candidate.length <= containedLength) continue;
-    if (candidate === key || !key.includes(candidate)) continue;
-    const resolved = read(value);
-    if (!resolved) continue;
-    contained = resolved;
-    containedLength = candidate.length;
-  }
-  if (contained) return contained;
-
-  // A truncated descriptor is a prefix of several stored merchants as often as
-  // one ("costco" prefixes both Costco rules), and there is no basis for
-  // picking between them. Only act when every candidate agrees on the category
-  // — a wrong guess here is worse than leaving it uncategorized.
-  if (key.length < MERCHANT_PREFIX_MIN) return "";
-  const agreed = new Set();
-  for (const [candidate, value] of entries) {
-    if (candidate === key || !candidate.startsWith(key)) continue;
-    const resolved = read(value);
-    if (resolved) agreed.add(resolved);
-  }
-  return agreed.size === 1 ? [...agreed][0] : "";
 }
 
 const DEFAULT_SETTINGS = {
@@ -5072,6 +5167,7 @@ class FinanceTrackerPlugin extends Plugin {
     const before = Object.keys(this.settings.merchantMap || {}).length;
     this.settings.merchantMap = { ...imported, ...(this.settings.merchantMap || {}) };
     this.settings.merchantMapMigrated = true;
+    this._merchantSources = null;
     await this.saveSettings();
     const added = Object.keys(this.settings.merchantMap).length - before;
     if (added > 0 && options.notify !== false) {
@@ -5082,35 +5178,48 @@ class FinanceTrackerPlugin extends Plugin {
     return added;
   }
 
-  // Three passes, most deliberate first: an exact rule, then a rule whose
-  // merchant appears inside the descriptor, then whatever the daily notes say
-  // this merchant was last filed as. An explicit rule always beats history, so
-  // correcting the map is how you overrule a bad precedent.
-  async guessCategoryForMerchant(merchant) {
-    const key = core.normalizeMerchant(merchant);
-    if (!key) return "";
-    const ruled = lookupMerchantKey(key, await this.loadMerchantMap(), (category) => category);
-    if (ruled) return ruled;
-    if (this.settings.learnCategoriesFromHistory === false) return "";
-    // Best-effort enrichment only. History sits behind a full vault walk and a
-    // parse of every daily note, so it has far more ways to throw than the rule
-    // lookup above — and a throw here reaches handleCapture, which quarantines
-    // the transaction outright. An uncategorised capture that still lands beats
-    // one that silently goes to _failed because a note somewhere is malformed.
+  // Rules and history, plus both re-keyed by merchant root, in the shape
+  // core.suggestCategoryForMerchant expects. Built once and held until a note or
+  // a rule changes: a batched capture of twenty lines would otherwise rebuild
+  // the whole index twenty times.
+  async merchantSuggestionSources() {
+    if (this._merchantSources) return this._merchantSources;
+    const rules = await this.loadMerchantMap();
+    const history = this.settings.learnCategoriesFromHistory === false ? new Map() : await this.loadMerchantHistory();
+    this._merchantSources = {
+      rules,
+      history,
+      rootRules: core.indexByMerchantRoot(rules),
+      rootHistory: core.indexByMerchantRoot(history),
+    };
+    return this._merchantSources;
+  }
+
+  // What should this merchant be filed as, and why. The reason travels with the
+  // answer because the inbox shows it: "how you filed it last time" is the
+  // difference between a suggestion you can accept and one you have to check.
+  async suggestCategoryForMerchant(merchant) {
+    if (!core.normalizeMerchant(merchant)) return { category: "", source: "" };
     try {
-      return await this.guessCategoryFromHistory(key);
+      return core.suggestCategoryForMerchant(merchant, await this.merchantSuggestionSources());
     } catch (error) {
-      console.error("[finance-tracker] category history lookup failed", error);
-      return "";
+      // History sits behind a full vault walk, so it has far more ways to throw
+      // than a map lookup does — and a throw here reaches the capture path,
+      // which would quarantine the transaction. An uncategorised capture that
+      // still lands beats one lost because a note somewhere is malformed.
+      console.error("[finance-tracker] category suggestion failed", error);
+      return { category: "", source: "" };
     }
   }
 
-  // The notes are already a record of how every merchant was filed, so a
-  // hand-corrected tag is all the teaching the next capture needs — nothing to
-  // tick, nothing to maintain. Only merchants that recur ever get looked up, so
-  // one-offs cost nothing by sitting in here.
-  async guessCategoryFromHistory(key) {
-    return lookupMerchantKey(key, await this.loadMerchantHistory(), (info) => info.category);
+  async guessCategoryForMerchant(merchant) {
+    return (await this.suggestCategoryForMerchant(merchant)).category;
+  }
+
+  describeSuggestionSource(source) {
+    if (source === "rule" || source === "rule-root") return "from a merchant rule";
+    if (source === "history" || source === "history-root") return "how you filed it last time";
+    return "";
   }
 
   // Most recent categorised sighting of each merchant. Built off the same
@@ -5132,7 +5241,7 @@ class FinanceTrackerPlugin extends Plugin {
       if (!merchantKey) continue;
       const date = String(entry.date || "");
       const current = history.get(merchantKey);
-      if (!current || date >= current.date) history.set(merchantKey, { category, date });
+      if (!current || date >= current.date) history.set(merchantKey, { category, date, name: merchant });
     }
     this._merchantHistory = history;
     return history;
@@ -5308,12 +5417,18 @@ class FinanceTrackerPlugin extends Plugin {
     this.refreshDailyBudgetView();
   }
 
+  // Remembers the merchant *root*, not the exact descriptor. The bank sends a
+  // different branch, terminal or truncation next time, and the root is what
+  // those variants share — so one correction covers the lot. A root too short to
+  // match safely as a fragment falls back to the full key.
   async rememberMerchantCategory(merchant, category) {
-    const cleanMerchant = core.normalizeMerchant(merchant);
+    const root = core.merchantRootKey(merchant);
+    const key = root.length >= 4 ? root : core.normalizeMerchant(merchant);
     const cleanCategory = core.normalizeCategoryPath(category);
-    if (!cleanMerchant || !cleanCategory) return;
-    if (this.settings.merchantMap?.[cleanMerchant] === cleanCategory) return;
-    this.settings.merchantMap = { ...this.settings.merchantMap, [cleanMerchant]: cleanCategory };
+    if (!key || !cleanCategory) return;
+    if (this.settings.merchantMap?.[key] === cleanCategory) return;
+    this.settings.merchantMap = { ...this.settings.merchantMap, [key]: cleanCategory };
+    this._merchantSources = null;
     await this.saveSettings();
   }
 
@@ -5322,6 +5437,7 @@ class FinanceTrackerPlugin extends Plugin {
     const next = { ...this.settings.merchantMap };
     delete next[merchant];
     this.settings.merchantMap = next;
+    this._merchantSources = null;
     await this.saveSettings();
   }
 
@@ -5684,6 +5800,7 @@ class FinanceTrackerPlugin extends Plugin {
     // Merchant history is derived from the index, so any note that changes can
     // change what the next capture learns.
     this._merchantHistory = null;
+    this._merchantSources = null;
   }
 
   async collectTransactionsForRange(range) {

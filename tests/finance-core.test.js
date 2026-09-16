@@ -2073,3 +2073,90 @@ test("a line with no currency marker falls back to the rest of its trip", () => 
   const { content } = transform("## Spending\n- [ ] #log/spending\n\t- $31.82 - $9.1 #log/archive/25/Brazil/Spending/Accommadation\n");
   assert.ok(content.includes("BRL 31.82 : $9.10 AUD"), content);
 });
+
+test("suggestCategoryForMerchant prefers an explicit rule, then history, and says which", () => {
+  const sources = {
+    rules: { danmurphys: "alcohol", woolworths: "food/groceries" },
+    history: {
+      rodefresh: { category: "food/takeaway", date: "2026-08-15" },
+      bagelboys: { category: "food/takeaway/lunch", date: "2026-08-17" },
+    },
+  };
+
+  // An exact rule.
+  assert.deepEqual(core.suggestCategoryForMerchant("Dan Murphys", sources), { category: "alcohol", source: "rule" });
+  // A rule sitting inside a padded bank descriptor.
+  assert.deepEqual(core.suggestCategoryForMerchant("Woolworths/8 Sherwood Roa", sources), {
+    category: "food/groceries",
+    source: "rule",
+  });
+  // Containment already covers a rule sitting inside a longer descriptor.
+  assert.deepEqual(core.suggestCategoryForMerchant("Dan Murphy's/blunder Rd &", sources), {
+    category: "alcohol",
+    source: "rule",
+  });
+  // The root is for the case containment cannot reach: the feed truncated the
+  // descriptor, so the stored rule is the *longer* string.
+  assert.deepEqual(
+    core.suggestCategoryForMerchant("Costco Wholesale Austr", {
+      rules: { "costco wholesale australia": "food/groceries" },
+    }),
+    { category: "food/groceries", source: "rule-root" }
+  );
+  // A processor prefix is handled by containment: "sqrodefresh" holds "rodefresh".
+  assert.deepEqual(core.suggestCategoryForMerchant("SQ * Rode Fresh", sources), {
+    category: "food/takeaway",
+    source: "history",
+  });
+  // The case neither containment nor prefix can reach, and the one that actually
+  // occurs: two branches of the same shop, where neither string contains the
+  // other. Categorising one Woolworths now teaches the other.
+  assert.deepEqual(
+    core.suggestCategoryForMerchant("Woolworths/8 Sherwood Roa", {
+      history: {
+        woolworthscnrbrisbaneh: { category: "food/groceries", date: "2026-08-08", name: "Woolworths/cnr Brisbane H" },
+      },
+    }),
+    { category: "food/groceries", source: "history-root" }
+  );
+  // Nothing known.
+  assert.deepEqual(core.suggestCategoryForMerchant("SQ * Mebami", sources), { category: "", source: "" });
+});
+
+test("an explicit rule beats what the notes happen to say", () => {
+  const suggestion = core.suggestCategoryForMerchant("Bagel Boys", {
+    rules: { bagelboys: "food/takeaway" },
+    history: { bagelboys: { category: "food/takeaway/breakfast", date: "2026-09-01" } },
+  });
+  assert.deepEqual(suggestion, { category: "food/takeaway", source: "rule" });
+});
+
+test("indexByMerchantRoot keeps the most recent categorisation", () => {
+  const byRoot = core.indexByMerchantRoot({
+    bagelboys: { category: "food/takeaway/lunch", date: "2026-08-17", name: "Bagel Boys" },
+    thebagelboys: { category: "food/takeaway/breakfast", date: "2026-08-19", name: "The Bagel Boys" },
+  });
+  assert.equal(byRoot.get("bagelboys").category, "food/takeaway/breakfast");
+});
+
+test("groupEntriesByMerchantRoot turns repeat captures into one decision", () => {
+  const entry = (date, amount, merchant) => ({ date, amount, merchant, category: "uncategorized" });
+  const groups = core.groupEntriesByMerchantRoot([
+    entry("2026-08-15", 11.5, "SQ * Rode Fresh"),
+    entry("2026-09-12", 10, "SQ * Rode Fresh"),
+    entry("2026-09-12", 10, "Rode Fresh"),
+    entry("2026-09-14", 13.72, "Mebami"),
+    entry("2026-09-06", 28, ""),
+  ]);
+
+  assert.equal(groups[0].key, "rodefresh");
+  assert.equal(groups[0].count, 3);
+  assert.equal(groups[0].total, 31.5);
+  assert.equal(groups[0].label, "Rode Fresh", "the processor prefix is not part of the name");
+  assert.equal(groups[0].firstDate, "2026-08-15");
+  assert.equal(groups[0].lastDate, "2026-09-12");
+  assert.equal(groups[0].merchants.length, 2);
+  // An entry with no merchant cannot be grouped with anything else.
+  assert.equal(groups.filter((group) => group.label === "(no merchant)").length, 1);
+  assert.equal(groups.length, 3);
+});

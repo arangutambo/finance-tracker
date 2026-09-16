@@ -803,6 +803,7 @@ class FinanceTrackerPlugin extends Plugin {
     const before = Object.keys(this.settings.merchantMap || {}).length;
     this.settings.merchantMap = { ...imported, ...(this.settings.merchantMap || {}) };
     this.settings.merchantMapMigrated = true;
+    this._merchantSources = null;
     await this.saveSettings();
     const added = Object.keys(this.settings.merchantMap).length - before;
     if (added > 0 && options.notify !== false) {
@@ -813,35 +814,48 @@ class FinanceTrackerPlugin extends Plugin {
     return added;
   }
 
-  // Three passes, most deliberate first: an exact rule, then a rule whose
-  // merchant appears inside the descriptor, then whatever the daily notes say
-  // this merchant was last filed as. An explicit rule always beats history, so
-  // correcting the map is how you overrule a bad precedent.
-  async guessCategoryForMerchant(merchant) {
-    const key = core.normalizeMerchant(merchant);
-    if (!key) return "";
-    const ruled = lookupMerchantKey(key, await this.loadMerchantMap(), (category) => category);
-    if (ruled) return ruled;
-    if (this.settings.learnCategoriesFromHistory === false) return "";
-    // Best-effort enrichment only. History sits behind a full vault walk and a
-    // parse of every daily note, so it has far more ways to throw than the rule
-    // lookup above — and a throw here reaches handleCapture, which quarantines
-    // the transaction outright. An uncategorised capture that still lands beats
-    // one that silently goes to _failed because a note somewhere is malformed.
+  // Rules and history, plus both re-keyed by merchant root, in the shape
+  // core.suggestCategoryForMerchant expects. Built once and held until a note or
+  // a rule changes: a batched capture of twenty lines would otherwise rebuild
+  // the whole index twenty times.
+  async merchantSuggestionSources() {
+    if (this._merchantSources) return this._merchantSources;
+    const rules = await this.loadMerchantMap();
+    const history = this.settings.learnCategoriesFromHistory === false ? new Map() : await this.loadMerchantHistory();
+    this._merchantSources = {
+      rules,
+      history,
+      rootRules: core.indexByMerchantRoot(rules),
+      rootHistory: core.indexByMerchantRoot(history),
+    };
+    return this._merchantSources;
+  }
+
+  // What should this merchant be filed as, and why. The reason travels with the
+  // answer because the inbox shows it: "how you filed it last time" is the
+  // difference between a suggestion you can accept and one you have to check.
+  async suggestCategoryForMerchant(merchant) {
+    if (!core.normalizeMerchant(merchant)) return { category: "", source: "" };
     try {
-      return await this.guessCategoryFromHistory(key);
+      return core.suggestCategoryForMerchant(merchant, await this.merchantSuggestionSources());
     } catch (error) {
-      console.error("[finance-tracker] category history lookup failed", error);
-      return "";
+      // History sits behind a full vault walk, so it has far more ways to throw
+      // than a map lookup does — and a throw here reaches the capture path,
+      // which would quarantine the transaction. An uncategorised capture that
+      // still lands beats one lost because a note somewhere is malformed.
+      console.error("[finance-tracker] category suggestion failed", error);
+      return { category: "", source: "" };
     }
   }
 
-  // The notes are already a record of how every merchant was filed, so a
-  // hand-corrected tag is all the teaching the next capture needs — nothing to
-  // tick, nothing to maintain. Only merchants that recur ever get looked up, so
-  // one-offs cost nothing by sitting in here.
-  async guessCategoryFromHistory(key) {
-    return lookupMerchantKey(key, await this.loadMerchantHistory(), (info) => info.category);
+  async guessCategoryForMerchant(merchant) {
+    return (await this.suggestCategoryForMerchant(merchant)).category;
+  }
+
+  describeSuggestionSource(source) {
+    if (source === "rule" || source === "rule-root") return "from a merchant rule";
+    if (source === "history" || source === "history-root") return "how you filed it last time";
+    return "";
   }
 
   // Most recent categorised sighting of each merchant. Built off the same
@@ -863,7 +877,7 @@ class FinanceTrackerPlugin extends Plugin {
       if (!merchantKey) continue;
       const date = String(entry.date || "");
       const current = history.get(merchantKey);
-      if (!current || date >= current.date) history.set(merchantKey, { category, date });
+      if (!current || date >= current.date) history.set(merchantKey, { category, date, name: merchant });
     }
     this._merchantHistory = history;
     return history;
@@ -1039,12 +1053,18 @@ class FinanceTrackerPlugin extends Plugin {
     this.refreshDailyBudgetView();
   }
 
+  // Remembers the merchant *root*, not the exact descriptor. The bank sends a
+  // different branch, terminal or truncation next time, and the root is what
+  // those variants share — so one correction covers the lot. A root too short to
+  // match safely as a fragment falls back to the full key.
   async rememberMerchantCategory(merchant, category) {
-    const cleanMerchant = core.normalizeMerchant(merchant);
+    const root = core.merchantRootKey(merchant);
+    const key = root.length >= 4 ? root : core.normalizeMerchant(merchant);
     const cleanCategory = core.normalizeCategoryPath(category);
-    if (!cleanMerchant || !cleanCategory) return;
-    if (this.settings.merchantMap?.[cleanMerchant] === cleanCategory) return;
-    this.settings.merchantMap = { ...this.settings.merchantMap, [cleanMerchant]: cleanCategory };
+    if (!key || !cleanCategory) return;
+    if (this.settings.merchantMap?.[key] === cleanCategory) return;
+    this.settings.merchantMap = { ...this.settings.merchantMap, [key]: cleanCategory };
+    this._merchantSources = null;
     await this.saveSettings();
   }
 
@@ -1053,6 +1073,7 @@ class FinanceTrackerPlugin extends Plugin {
     const next = { ...this.settings.merchantMap };
     delete next[merchant];
     this.settings.merchantMap = next;
+    this._merchantSources = null;
     await this.saveSettings();
   }
 
@@ -1415,6 +1436,7 @@ class FinanceTrackerPlugin extends Plugin {
     // Merchant history is derived from the index, so any note that changes can
     // change what the next capture learns.
     this._merchantHistory = null;
+    this._merchantSources = null;
   }
 
   async collectTransactionsForRange(range) {

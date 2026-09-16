@@ -19,60 +19,6 @@ function _ftCreate(app, path, data) {
   return app.vault.create(path, data);
 }
 
-// Shortest merchant key allowed to match as a substring rather than in full.
-// Bank feeds pad the merchant with branch and terminal noise ("Woolworths/cnr
-// Brisbane H", "SQ * Taco De Birria"), so one rule has to cover every variant —
-// but a two- or three-letter key ("iga") turns up inside unrelated names, so
-// short keys stay exact-match only.
-const MERCHANT_SUBSTRING_MIN = 4;
-
-// Bank feeds also truncate to a fixed column width ("S & H Pharmacy Investm"),
-// which containment cannot catch because there the stored name is the longer
-// string. Truncation always keeps the prefix, so a prefix match recovers those
-// — with a higher floor, since a short prefix is a far weaker signal than a
-// whole name sitting inside a padded descriptor.
-const MERCHANT_PREFIX_MIN = 8;
-
-// Resolves a merchant key against a set of stored keys, in descending order of
-// how sure the match makes us: the key itself, then the longest stored key
-// sitting inside it, then an unambiguous truncation of a stored key.
-function lookupMerchantKey(key, entries, read) {
-  if (!key) return "";
-
-  const exact = entries.get(key);
-  if (exact) {
-    const resolved = read(exact);
-    if (resolved) return resolved;
-  }
-
-  // Longest wins, so a specific rule ("costcogas") beats a general one
-  // ("costco") regardless of what order the map happens to be in.
-  let contained = "";
-  let containedLength = 0;
-  for (const [candidate, value] of entries) {
-    if (candidate.length < MERCHANT_SUBSTRING_MIN || candidate.length <= containedLength) continue;
-    if (candidate === key || !key.includes(candidate)) continue;
-    const resolved = read(value);
-    if (!resolved) continue;
-    contained = resolved;
-    containedLength = candidate.length;
-  }
-  if (contained) return contained;
-
-  // A truncated descriptor is a prefix of several stored merchants as often as
-  // one ("costco" prefixes both Costco rules), and there is no basis for
-  // picking between them. Only act when every candidate agrees on the category
-  // — a wrong guess here is worse than leaving it uncategorized.
-  if (key.length < MERCHANT_PREFIX_MIN) return "";
-  const agreed = new Set();
-  for (const [candidate, value] of entries) {
-    if (candidate === key || !candidate.startsWith(key)) continue;
-    const resolved = read(value);
-    if (resolved) agreed.add(resolved);
-  }
-  return agreed.size === 1 ? [...agreed][0] : "";
-}
-
 const DEFAULT_SETTINGS = {
   dailyNotesFolder: "Journal/Periodics/1. Daily",
   spendingHeading: "## Finance",
