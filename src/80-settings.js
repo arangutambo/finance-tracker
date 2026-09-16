@@ -386,7 +386,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
         })
       );
 
-    this.renderMerchantMapList(merchantAdvanced.createDiv({ cls: "finance-tracker-goal-list" }));
+    this.renderMerchantMapList(merchantAdvanced.createDiv({ cls: "finance-tracker-goal-list" })).catch(() => {});
 
     // Trips: the notes, plus trip mode, in one place. Trip mode used to be its
     // own section further down, which read as a separate feature rather than a
@@ -588,24 +588,109 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
     }
   }
 
-  renderMerchantMapList(listEl) {
+  // The merchant map was remove-only, and its empty state said the checkbox was
+  // the only way in — which stopped being true when learning from history
+  // shipped. You can add and edit rules here, and ask what a given descriptor
+  // would be filed as before it arrives.
+  async renderMerchantMapList(listEl) {
     listEl.empty();
-    const entries = Object.entries(this.plugin.settings.merchantMap || {}).sort((left, right) =>
-      left[0].localeCompare(right[0])
+    const plugin = this.plugin;
+    const known = await plugin.collectKnownSuggestions();
+
+    const categoryItems = (query) => {
+      const needle = core.normalizeCategoryPath(query);
+      const out = known.categories
+        .filter((path) => !needle || path.startsWith(needle) || path.split("/").some((segment) => segment.startsWith(needle)))
+        .slice(0, 8)
+        .map((path) => ({ value: path, label: core.displayCategoryPath(path), kind: "category" }));
+      if (needle && !known.categories.includes(needle)) {
+        out.unshift({ value: needle, label: `New: ${core.displayCategoryPath(needle)}`, kind: "new" });
+      }
+      return out;
+    };
+
+    const addCard = listEl.createDiv({ cls: "finance-tracker-budget-card" });
+    addCard.createDiv({ cls: "finance-tracker-budget-title", text: "Add a rule" });
+    const merchantRow = addCard.createDiv({ cls: "finance-edit-row" });
+    merchantRow.createEl("label", { text: "Merchant" });
+    const merchantInput = merchantRow.createEl("input", { type: "text", attr: { placeholder: "Woolworths", "aria-label": "Merchant" } });
+    new FinanceSuggest(merchantInput, {
+      getItems: (query) => {
+        const needle = String(query || "").toLowerCase();
+        return known.merchants
+          .filter((merchant) => !needle || merchant.name.toLowerCase().includes(needle))
+          .slice(0, 8)
+          .map((merchant) => ({ value: merchant.name, label: merchant.name, kind: "merchant" }));
+      },
+    });
+    const categoryRow = addCard.createDiv({ cls: "finance-edit-row" });
+    categoryRow.createEl("label", { text: "Category" });
+    const categoryInput = categoryRow.createEl("input", { type: "text", attr: { placeholder: "food/groceries", "aria-label": "Rule category" } });
+    new FinanceSuggest(categoryInput, { getItems: categoryItems });
+    addAction(
+      addCard.createDiv({ cls: "finance-tracker-header-actions" }),
+      "Add rule",
+      async () => {
+        await plugin.rememberMerchantCategory(merchantInput.value, categoryInput.value);
+        await this.renderMerchantMapList(listEl);
+      },
+      { primary: true, errorPrefix: "Adding the rule" }
     );
+
+    const testCard = listEl.createDiv({ cls: "finance-tracker-budget-card" });
+    testCard.createDiv({ cls: "finance-tracker-budget-title", text: "What would this be filed as?" });
+    const testInput = testCard.createEl("input", {
+      type: "text",
+      attr: { placeholder: "SQ * Milk N Mochi Pty Ltd", "aria-label": "Test a merchant" },
+    });
+    const testResult = testCard.createDiv({ cls: "finance-tracker-budget-meta", text: "Paste a merchant exactly as your bank sends it." });
+    const runTest = async () => {
+      const value = testInput.value.trim();
+      if (!value) {
+        testResult.setText("Paste a merchant exactly as your bank sends it.");
+        return;
+      }
+      const suggestion = await plugin.suggestCategoryForMerchant(value);
+      const reason = plugin.describeSuggestionSource(suggestion.source);
+      testResult.setText(
+        suggestion.category
+          ? `${core.displayCategoryPath(suggestion.category)} — ${reason}. Grouped as "${core.merchantRootKey(value)}".`
+          : `Nothing matches, so it would be logged uncategorised. Grouped as "${core.merchantRootKey(value)}".`
+      );
+    };
+    testInput.addEventListener("input", () => runTest());
+    testInput.addEventListener("change", () => runTest());
+
+    const entries = Object.entries(plugin.settings.merchantMap || {}).sort((left, right) => left[0].localeCompare(right[0]));
     if (!entries.length) {
       listEl.createDiv({
         cls: "finance-tracker-empty",
-        text: "No merchants learned yet — tick \"Remember this merchant → category\" when editing a transaction.",
+        text: "No rules yet. Add one above, tick \"remember this merchant\" when filing an entry, or let the plugin follow how you filed a merchant last time.",
       });
       return;
     }
+
+    listEl.createEl("p", {
+      cls: "finance-tracker-settings-section-copy",
+      text: `${entries.length} rule${entries.length === 1 ? "" : "s"}. A rule beats what your notes say, so this is where you overrule a bad precedent.`,
+    });
+
     for (const [merchant, category] of entries) {
-      const setting = new Setting(listEl).setName(merchant).setDesc(core.displayCategoryPath(category));
+      const setting = new Setting(listEl).setName(merchant);
+      setting.addText((text) => {
+        text.setValue(category).onChange(async (value) => {
+          const next = core.normalizeCategoryPath(value);
+          if (!next) return;
+          plugin.settings.merchantMap = { ...plugin.settings.merchantMap, [merchant]: next };
+          plugin._merchantSources = null;
+          await plugin.saveSettings();
+        });
+        new FinanceSuggest(text.inputEl, { getItems: categoryItems });
+      });
       setting.addButton((button) =>
         button.setButtonText("Remove").onClick(async () => {
-          await this.plugin.forgetMerchantCategory(merchant);
-          this.renderMerchantMapList(listEl);
+          await plugin.forgetMerchantCategory(merchant);
+          await this.renderMerchantMapList(listEl);
         })
       );
     }

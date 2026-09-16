@@ -979,6 +979,8 @@ with **Finance Tracker:**.
 | **Sync capture gist now** | Polls the capture gist immediately instead of waiting for the next scheduled check. |
 | **Check capture methods for overlap** | Reports which pairs of capture methods have been logging the same transactions, so you can switch off one you don't need. |
 | **Reconcile a bank CSV** | Paste a bank or Wise CSV export; matches rows by date+amount and can send unmatched charges to the capture inbox. |
+| **Open categorisation inbox** | Every uncategorised entry, whatever its date, grouped by merchant with a suggested category and one-tap filing. Also lists captures that failed, with retry. |
+| **Rename or split a category** | Rename a category everywhere — daily notes, the budgets table, merchant rules — or split it by merchant (bare `transport` into public transport, rideshare and scooter). Preview first. |
 | **Convert legacy trip tags** | Converts trips filed under the older `#log/archive/<year>/<trip>/spending/…` tags to the current trip format, rewriting two-currency amounts so the original currency is read back. Shows a full preview first. |
 | **Import merchant map note** | Re-reads `Merchant Map.md` into the merchant map in settings. |
 | **Repair daily note totals** | Recomputes the `#log/spending` running total on every daily note in one pass. Individual notes heal when opened; this fixes a whole backlog at once. |

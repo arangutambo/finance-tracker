@@ -1630,3 +1630,8 @@
 @media (max-width: 720px) {
   .finance-inbox-group .finance-tracker-header-actions { flex-wrap: wrap; }
 }
+
+/* ---- Rename or split a category ---- */
+.finance-recategorise-body { max-height: 45vh; overflow-y: auto; margin: 10px 0; }
+.finance-recategorise-input { margin-top: 6px; position: relative; }
+.finance-recategorise-input input { width: 100%; }

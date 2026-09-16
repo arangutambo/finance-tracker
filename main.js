@@ -3777,6 +3777,65 @@ const core = (() => {
       .sort((left, right) => right.count - left.count || right.total - left.total);
   }
 
+  // A category path also lives in markdown tables — the budgets table, and a
+  // trip's planned and allocated expenses. A rename that skipped those would leave
+  // a budget pointing at a category nothing is filed under any more.
+  //
+  // Only the Category column of a real table is touched: a "Name" cell reading
+  // "Groceries" is a label, not a path, and rewriting it would be wrong.
+  function buildCategoryTableRenameTransform(renames) {
+    const list = (renames || [])
+      .map((rename) => ({ from: normalizeCategoryPath(rename?.from), to: normalizeCategoryPath(rename?.to) }))
+      .filter((rename) => rename.from && rename.to && rename.from !== rename.to);
+
+    return function transform(content) {
+      if (!list.length) return { content, entries: 0, samples: [] };
+      const lines = splitLines(content);
+      const samples = [];
+      let entries = 0;
+      let categoryColumn = -1;
+      let inTable = false;
+
+      for (let index = 0; index < lines.length; index += 1) {
+        const line = lines[index];
+        if (!/^\s*\|/.test(line)) {
+          inTable = false;
+          categoryColumn = -1;
+          continue;
+        }
+        const next = lines[index + 1];
+        if (!inTable && next && /^\s*\|?[\s:-]+\|/.test(next)) {
+          const headers = line.split("|").slice(1, -1).map((cell) => normalizeWhitespace(cell).toLowerCase());
+          categoryColumn = headers.findIndex((header) => header === "category" || header === "tag");
+          inTable = true;
+          continue;
+        }
+        if (!inTable || categoryColumn < 0) continue;
+
+        const cells = line.split("|");
+        const cellIndex = categoryColumn + 1;
+        const cell = cells[cellIndex];
+        if (cell === undefined) continue;
+        const value = normalizeCategoryPath(cell);
+        if (!value) continue;
+
+        for (const rename of list) {
+          const matches = value === rename.from || value.startsWith(`${rename.from}/`);
+          if (!matches) continue;
+          const replacement = value === rename.from ? rename.to : `${rename.to}/${value.slice(rename.from.length + 1)}`;
+          cells[cellIndex] = cell.replace(normalizeWhitespace(cell), replacement);
+          const rewritten = cells.join("|");
+          if (samples.length < 2) samples.push({ before: line.trim(), after: rewritten.trim() });
+          lines[index] = rewritten;
+          entries += 1;
+          break;
+        }
+      }
+
+      return { content: lines.join("\n"), entries, samples };
+    };
+  }
+
   return {
     RECURRING_CADENCES,
     RECURRING_REGISTRY_COLUMNS,
@@ -3857,6 +3916,7 @@ const core = (() => {
     recomputeSpendingTotals,
     planNoteRewrite,
     buildLegacyTripTagTransform,
+    buildCategoryTableRenameTransform,
     summarizeLegacyTripTags,
     findFinanceHeadingIndex,
     findTransactionLineIndex,
@@ -4703,12 +4763,12 @@ class FinanceTrackerPlugin extends Plugin {
     this.registerView(FINANCE_INBOX_VIEW, (leaf) => new FinanceInboxView(leaf, this));
 
     this.addRibbonIcon("coins", "Daily budget", () => this.activateDailyBudgetView());
-    this.addRibbonIcon("circle-plus", "Quick add transaction", () => new QuickAddTransactionModal(this.app, this).open());
+    this.addRibbonIcon("circle-plus", "Quick add transaction", () => this.openQuickAdd());
 
     this._statusBarItem = this.addStatusBarItem();
     this._statusBarItem.addClass("finance-status-bar");
     this._statusBarItem.setText("💸 …");
-    this._statusBarItem.addEventListener("click", () => new QuickAddTransactionModal(this.app, this).open());
+    this._statusBarItem.addEventListener("click", () => this.openQuickAdd());
 
     this.addCommand({
       id: "finance-tracker-open-daily-budget",
@@ -4725,7 +4785,7 @@ class FinanceTrackerPlugin extends Plugin {
     this.addCommand({
       id: "finance-tracker-quick-add",
       name: "Quick add transaction",
-      callback: () => new QuickAddTransactionModal(this.app, this).open(),
+      callback: () => this.openQuickAdd(),
     });
 
     this.addCommand({
@@ -4810,6 +4870,12 @@ class FinanceTrackerPlugin extends Plugin {
       id: "finance-tracker-repair-totals",
       name: "Repair daily note totals",
       callback: () => this.repairAllDailyNoteTotals(),
+    });
+
+    this.addCommand({
+      id: "finance-tracker-recategorise",
+      name: "Rename or split a category",
+      callback: () => this.openRecategorise(),
     });
 
     this.addCommand({
@@ -5676,6 +5742,12 @@ class FinanceTrackerPlugin extends Plugin {
 
   // One place that opens the edit modal, so every caller gets the same options
   // and a test can hold on to the instance.
+  openQuickAdd(options = {}) {
+    const modal = new QuickAddTransactionModal(this.app, this, options);
+    modal.open();
+    return modal;
+  }
+
   openEditTransaction(entry, options = {}) {
     const modal = new EditTransactionModal(this.app, this, entry, options);
     modal.open();
@@ -9089,7 +9161,7 @@ class FinanceTrackerPlugin extends Plugin {
     const header = wrapper.createDiv({ cls: "finance-tracker-header" });
     header.createEl("h3", { text: "Daily budget" });
     const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
-    addAction(headerActions, "Add", () => new QuickAddTransactionModal(this.app, this).open(), {
+    addAction(headerActions, "Add", () => this.openQuickAdd(), {
       primary: true,
       opensModal: true,
       tooltip: "Quick add a transaction",
@@ -9641,6 +9713,124 @@ class FinanceTrackerPlugin extends Plugin {
     this.refreshDailyBudgetView();
     this.refreshInboxView();
     return updated;
+  }
+
+  openRecategorise(category = "") {
+    const modal = new RecategoriseModal(this.app, this, { category });
+    modal.open();
+    return modal;
+  }
+
+  // --- Recategorising ---------------------------------------------------------
+
+  // Everything filed under a category, grouped by merchant. A category rarely
+  // needs renaming wholesale: bare "transport" in the author's vault is six
+  // Translink trips, five rideshares, three Lime scooters and a car park, and
+  // the merchant is what says which is which.
+  async buildCategoryBreakdown(category) {
+    const target = core.normalizeCategoryPath(category);
+    if (!target) return { entries: [], groups: [] };
+    const entries = (await this.collectAllTransactions()).filter(
+      (entry) => core.isSpendingEntry(entry) && (entry.category === target || entry.category.startsWith(`${target}/`))
+    );
+    return { entries, groups: core.groupEntriesByMerchantRoot(entries) };
+  }
+
+  // Plans a set of per-entry category changes, plus the table cells that point at
+  // the old path. Nothing is written: this is what the preview shows.
+  async planCategoryAssignments(assignments, options = {}) {
+    const byPath = new Map();
+    for (const assignment of assignments || []) {
+      const category = core.normalizeCategoryPath(assignment?.category);
+      if (!category) continue;
+      for (const entry of assignment.entries || []) {
+        if (entry.category === category) continue;
+        const list = byPath.get(entry.filePath) || [];
+        list.push({ entry, category });
+        byPath.set(entry.filePath, list);
+      }
+    }
+
+    const files = [];
+    for (const path of byPath.keys()) {
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (!(file instanceof TFile)) continue;
+      files.push({ path, content: await this.app.vault.cachedRead(file) });
+    }
+
+    const settings = this.settings;
+    const plan = core.planNoteRewrite(files, (content, path) => {
+      // Bottom-up, so rewriting one entry cannot shift the line another sits at.
+      const changes = (byPath.get(path) || [])
+        .slice()
+        .sort((left, right) => (right.entry.lineIndex ?? -1) - (left.entry.lineIndex ?? -1));
+      let next = content;
+      let entries = 0;
+      const samples = [];
+      for (const { entry, category } of changes) {
+        const expense = { ...entry, category };
+        const replaced = core.replaceTransactionBlock(next, entry.rawLine, expense, settings, { lineIndex: entry.lineIndex });
+        if (replaced == null) continue;
+        if (samples.length < 3) {
+          samples.push({ before: entry.rawLine.trim(), after: core.buildTransactionBlock(expense, settings)[0].trim() });
+        }
+        next = replaced;
+        entries += 1;
+      }
+      return { content: next, entries, samples };
+    });
+
+    const tableRenames = options.tableRenames || [];
+    if (!tableRenames.length) return plan;
+
+    const tableFiles = [];
+    for (const file of this.categoryReferenceFiles()) {
+      tableFiles.push({ path: file.path, content: await this.app.vault.cachedRead(file) });
+    }
+    const tablePlan = core.planNoteRewrite(tableFiles, core.buildCategoryTableRenameTransform(tableRenames));
+
+    return {
+      files: [...plan.files, ...tablePlan.files],
+      samples: [...plan.samples, ...tablePlan.samples].slice(0, 5),
+      warnings: [...plan.warnings, ...tablePlan.warnings],
+      totals: {
+        files: plan.totals.files + tablePlan.totals.files,
+        entries: plan.totals.entries + tablePlan.totals.entries,
+        warnings: plan.totals.warnings + tablePlan.totals.warnings,
+      },
+    };
+  }
+
+  // Notes that mention categories outside the daily notes: the budgets table and
+  // every goal or trip note with planned and allocated tables.
+  categoryReferenceFiles() {
+    const budgetsPrefix = normalizePath(`${this.settings.budgetsFolderPath}/`);
+    return this.app.vault.getMarkdownFiles().filter((file) => file.path.startsWith(budgetsPrefix));
+  }
+
+  // Merchant rules point at categories too.
+  async renameCategoryInMerchantMap(renames) {
+    const map = { ...(this.settings.merchantMap || {}) };
+    let changed = 0;
+    for (const [merchant, category] of Object.entries(map)) {
+      for (const { from, to } of renames || []) {
+        const cleanFrom = core.normalizeCategoryPath(from);
+        const cleanTo = core.normalizeCategoryPath(to);
+        if (!cleanFrom || !cleanTo) continue;
+        if (category === cleanFrom) {
+          map[merchant] = cleanTo;
+          changed += 1;
+        } else if (category.startsWith(`${cleanFrom}/`)) {
+          map[merchant] = `${cleanTo}/${category.slice(cleanFrom.length + 1)}`;
+          changed += 1;
+        }
+      }
+    }
+    if (!changed) return 0;
+    this.settings.merchantMap = map;
+    this._merchantSources = null;
+    await this.saveSettings();
+    return changed;
   }
 
   // --- Failed captures ------------------------------------------------------------
@@ -11338,6 +11528,19 @@ class QuickAddTransactionModal extends Modal {
     keepOpenLabel.appendText(" Keep open for next entry");
     const submit = buttons.createEl("button", { text: "Add", cls: "mod-cta" });
 
+    // The preview used to say "Uncategorized" while the capture path went on to
+    // fill in a learned category a moment later — so the one screen that could
+    // have shown the guess was the one place that denied there was one.
+    let suggestedFor = null;
+    let suggestion = { category: "", source: "" };
+    const ensureSuggestion = async (merchant) => {
+      const key = String(merchant || "").trim().toLowerCase();
+      if (key === suggestedFor) return;
+      suggestedFor = key;
+      suggestion = key ? await this.plugin.suggestCategoryForMerchant(merchant) : { category: "", source: "" };
+      update();
+    };
+
     const parseCurrent = () => {
       const parsed = core.parseQuickAddInput(input.value, known.categories, { defaultCurrency: this.plugin.settings.defaultCurrency });
       let date = this.date;
@@ -11373,7 +11576,9 @@ class QuickAddTransactionModal extends Modal {
         return;
       }
 
-      const category = parsed.category || "uncategorized";
+      if (!parsed.category) ensureSuggestion(parsed.merchant);
+      const guessed = !parsed.category && suggestion.category ? suggestion.category : "";
+      const category = parsed.category || guessed || "uncategorized";
       const bits = [core.formatCurrency(parsed.amount, home)];
       if (parsed.originalCurrency) {
         bits.push(
@@ -11382,7 +11587,11 @@ class QuickAddTransactionModal extends Modal {
           }`
         );
       }
-      bits.push(core.displayCategoryPath(category));
+      bits.push(
+        guessed
+          ? `${core.displayCategoryPath(category)} (${this.plugin.describeSuggestionSource(suggestion.source)})`
+          : core.displayCategoryPath(category)
+      );
       if (parsed.merchant) bits.push(parsed.merchant);
       const owedPreview = core.buildOwedSharesFromTokens(parsed.amount, parsed.splitCount, parsed.owedTokens || []);
       if (owedPreview.length) {
@@ -11653,6 +11862,184 @@ class EditTransactionModal extends Modal {
 
   onClose() {
     for (const component of this._suggests || []) component.destroy?.();
+    this.contentEl.empty();
+  }
+}
+
+// Renaming a category is rarely the whole story. Bare "transport" in a real
+// vault turns out to be six Translink trips, five rideshares, three scooter
+// hires and one car park — one name covering four things, and the merchant is
+// what tells them apart. So this asks per merchant, with an "everything" row for
+// the plain rename case.
+class RecategoriseModal extends Modal {
+  constructor(app, plugin, options = {}) {
+    super(app);
+    this.plugin = plugin;
+    this.category = core.normalizeCategoryPath(options.category || "");
+    this.rows = [];
+  }
+
+  categoryInput(host, value, onDirty) {
+    const wrapper = host.createDiv({ cls: "finance-recategorise-input" });
+    const input = wrapper.createEl("input", { type: "text", attr: { placeholder: "food/takeaway", "aria-label": "New category" } });
+    input.value = value;
+    new FinanceSuggest(input, {
+      getItems: (query) => {
+        const needle = core.normalizeCategoryPath(query);
+        const out = this.known.categories
+          .filter((path) => !needle || path.startsWith(needle) || path.split("/").some((segment) => segment.startsWith(needle)))
+          .slice(0, 8)
+          .map((path) => ({ value: path, label: core.displayCategoryPath(path), kind: "category" }));
+        if (needle && !this.known.categories.includes(needle)) {
+          out.unshift({ value: needle, label: `New: ${core.displayCategoryPath(needle)}`, kind: "new" });
+        }
+        return out;
+      },
+      onChoose: () => onDirty?.(),
+    });
+    input.addEventListener("change", () => onDirty?.());
+    return input;
+  }
+
+  async onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("finance-edit finance-recategorise");
+    contentEl.createEl("h3", { text: "Rename or split a category" });
+    this.known = await this.plugin.collectKnownSuggestions();
+
+    const row = contentEl.createDiv({ cls: "finance-edit-row" });
+    row.createEl("label", { text: "Category" });
+    const input = row.createEl("input", { type: "text", attr: { placeholder: "transport", "aria-label": "Category to change" } });
+    input.value = this.category;
+    new FinanceSuggest(input, {
+      getItems: (query) => {
+        const needle = core.normalizeCategoryPath(query);
+        return this.known.categories
+          .filter((path) => !needle || path.startsWith(needle) || path.split("/").some((segment) => segment.startsWith(needle)))
+          .slice(0, 8)
+          .map((path) => ({ value: path, label: core.displayCategoryPath(path), kind: "category" }));
+      },
+      onChoose: (item) => {
+        this.category = item.value;
+        this.renderBreakdown();
+      },
+    });
+    input.addEventListener("change", () => {
+      this.category = core.normalizeCategoryPath(input.value);
+      this.renderBreakdown();
+    });
+
+    this.body = contentEl.createDiv({ cls: "finance-recategorise-body" });
+    this.footer = contentEl.createDiv({ cls: "finance-edit-buttons" });
+    if (this.category) await this.renderBreakdown();
+  }
+
+  async renderBreakdown() {
+    this.body.empty();
+    this.footer.empty();
+    this.rows = [];
+    if (!this.category) return;
+
+    const currency = core.normalizeCurrency(this.plugin.settings.defaultCurrency);
+    const { entries, groups } = await this.plugin.buildCategoryBreakdown(this.category);
+    if (!entries.length) {
+      this.body.createDiv({
+        cls: "finance-tracker-empty",
+        text: `Nothing is filed under ${core.displayCategoryPath(this.category)}.`,
+      });
+      return;
+    }
+
+    const total = core.roundCurrencyAmount(entries.reduce((sum, entry) => sum + core.entrySpendAmount(entry), 0));
+    this.body.createEl("p", {
+      cls: "finance-edit-hint",
+      text: `${entries.length} entr${entries.length === 1 ? "y" : "ies"} · ${core.formatCurrency(total, currency)} · ${groups.length} merchant${groups.length === 1 ? "" : "s"}. Change the top row to rename the lot, or a single row to split that merchant off.`,
+    });
+
+    const everything = this.body.createDiv({ cls: "finance-tracker-budget-card" });
+    renderRowTitle(everything, "Everything", core.formatCurrency(total, currency));
+    this.allInput = this.categoryInput(everything, this.category, () => {
+      // Rows the user has not touched follow the top row.
+      for (const entry of this.rows) {
+        if (!entry.dirty) entry.input.value = this.allInput.value;
+      }
+    });
+
+    for (const group of groups) {
+      const card = this.body.createDiv({ cls: "finance-tracker-budget-card" });
+      renderRowTitle(card, group.label, core.formatCurrency(group.total, currency));
+      const current = Array.from(new Set(group.entries.map((entry) => entry.category)));
+      card.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: `${group.count} entr${group.count === 1 ? "y" : "ies"} · now ${current.map((path) => core.displayCategoryPath(path)).join(", ")}`,
+      });
+      const state = { group, dirty: false, input: null };
+      state.input = this.categoryInput(card, this.category, () => {
+        state.dirty = true;
+      });
+      this.rows.push(state);
+    }
+
+    const preview = this.footer.createEl("button", { text: "Preview changes", cls: "mod-cta" });
+    preview.addEventListener("click", async () => {
+      preview.disabled = true;
+      try {
+        await this.preview();
+      } catch (error) {
+        new Notice(`Could not work out the changes: ${error.message}`);
+        preview.disabled = false;
+      }
+    });
+  }
+
+  async preview() {
+    const assignments = this.rows
+      .map((row) => ({ entries: row.group.entries, category: core.normalizeCategoryPath(row.input.value) }))
+      .filter((assignment) => assignment.category);
+
+    // A rename only counts as a rename — and so only then follows into the
+    // budgets table and the merchant rules — when every row moves together.
+    const everything = core.normalizeCategoryPath(this.allInput.value);
+    const isWholeRename =
+      everything &&
+      everything !== this.category &&
+      this.rows.every((row) => core.normalizeCategoryPath(row.input.value) === everything);
+    const tableRenames = isWholeRename ? [{ from: this.category, to: everything }] : [];
+
+    const plan = await this.plugin.planCategoryAssignments(assignments, { tableRenames });
+    const summary = Array.from(
+      new Set(assignments.filter((a) => a.category !== this.category).map((a) => core.displayCategoryPath(a.category)))
+    );
+
+    this.close();
+    new RewritePreviewModal(this.app, this.plugin, {
+      title: isWholeRename ? "Rename a category" : "Split a category",
+      intro: summary.length
+        ? `${core.displayCategoryPath(this.category)} → ${summary.join(", ")}.${
+            isWholeRename ? " The budgets table and any merchant rules follow it." : ""
+          }`
+        : "Nothing would change.",
+      plan,
+      emptyText: "Nothing to change — those entries are already filed that way.",
+      applyLabel: `Update ${plan.totals.files} note${plan.totals.files === 1 ? "" : "s"}`,
+      onApply: async (approved) => {
+        const { written, skipped } = await this.plugin.applyNoteRewritePlan(approved);
+        const rules = tableRenames.length ? await this.plugin.renameCategoryInMerchantMap(tableRenames) : 0;
+        new Notice(
+          [
+            `Updated ${written} note${written === 1 ? "" : "s"}`,
+            rules ? `${rules} merchant rule${rules === 1 ? "" : "s"}` : "",
+            skipped.length ? `${skipped.length} changed since the preview and were left alone` : "",
+          ]
+            .filter(Boolean)
+            .join(", ") + "."
+        );
+      },
+    }).open();
+  }
+
+  onClose() {
     this.contentEl.empty();
   }
 }
@@ -13499,7 +13886,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
         })
       );
 
-    this.renderMerchantMapList(merchantAdvanced.createDiv({ cls: "finance-tracker-goal-list" }));
+    this.renderMerchantMapList(merchantAdvanced.createDiv({ cls: "finance-tracker-goal-list" })).catch(() => {});
 
     // Trips: the notes, plus trip mode, in one place. Trip mode used to be its
     // own section further down, which read as a separate feature rather than a
@@ -13701,24 +14088,109 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
     }
   }
 
-  renderMerchantMapList(listEl) {
+  // The merchant map was remove-only, and its empty state said the checkbox was
+  // the only way in — which stopped being true when learning from history
+  // shipped. You can add and edit rules here, and ask what a given descriptor
+  // would be filed as before it arrives.
+  async renderMerchantMapList(listEl) {
     listEl.empty();
-    const entries = Object.entries(this.plugin.settings.merchantMap || {}).sort((left, right) =>
-      left[0].localeCompare(right[0])
+    const plugin = this.plugin;
+    const known = await plugin.collectKnownSuggestions();
+
+    const categoryItems = (query) => {
+      const needle = core.normalizeCategoryPath(query);
+      const out = known.categories
+        .filter((path) => !needle || path.startsWith(needle) || path.split("/").some((segment) => segment.startsWith(needle)))
+        .slice(0, 8)
+        .map((path) => ({ value: path, label: core.displayCategoryPath(path), kind: "category" }));
+      if (needle && !known.categories.includes(needle)) {
+        out.unshift({ value: needle, label: `New: ${core.displayCategoryPath(needle)}`, kind: "new" });
+      }
+      return out;
+    };
+
+    const addCard = listEl.createDiv({ cls: "finance-tracker-budget-card" });
+    addCard.createDiv({ cls: "finance-tracker-budget-title", text: "Add a rule" });
+    const merchantRow = addCard.createDiv({ cls: "finance-edit-row" });
+    merchantRow.createEl("label", { text: "Merchant" });
+    const merchantInput = merchantRow.createEl("input", { type: "text", attr: { placeholder: "Woolworths", "aria-label": "Merchant" } });
+    new FinanceSuggest(merchantInput, {
+      getItems: (query) => {
+        const needle = String(query || "").toLowerCase();
+        return known.merchants
+          .filter((merchant) => !needle || merchant.name.toLowerCase().includes(needle))
+          .slice(0, 8)
+          .map((merchant) => ({ value: merchant.name, label: merchant.name, kind: "merchant" }));
+      },
+    });
+    const categoryRow = addCard.createDiv({ cls: "finance-edit-row" });
+    categoryRow.createEl("label", { text: "Category" });
+    const categoryInput = categoryRow.createEl("input", { type: "text", attr: { placeholder: "food/groceries", "aria-label": "Rule category" } });
+    new FinanceSuggest(categoryInput, { getItems: categoryItems });
+    addAction(
+      addCard.createDiv({ cls: "finance-tracker-header-actions" }),
+      "Add rule",
+      async () => {
+        await plugin.rememberMerchantCategory(merchantInput.value, categoryInput.value);
+        await this.renderMerchantMapList(listEl);
+      },
+      { primary: true, errorPrefix: "Adding the rule" }
     );
+
+    const testCard = listEl.createDiv({ cls: "finance-tracker-budget-card" });
+    testCard.createDiv({ cls: "finance-tracker-budget-title", text: "What would this be filed as?" });
+    const testInput = testCard.createEl("input", {
+      type: "text",
+      attr: { placeholder: "SQ * Milk N Mochi Pty Ltd", "aria-label": "Test a merchant" },
+    });
+    const testResult = testCard.createDiv({ cls: "finance-tracker-budget-meta", text: "Paste a merchant exactly as your bank sends it." });
+    const runTest = async () => {
+      const value = testInput.value.trim();
+      if (!value) {
+        testResult.setText("Paste a merchant exactly as your bank sends it.");
+        return;
+      }
+      const suggestion = await plugin.suggestCategoryForMerchant(value);
+      const reason = plugin.describeSuggestionSource(suggestion.source);
+      testResult.setText(
+        suggestion.category
+          ? `${core.displayCategoryPath(suggestion.category)} — ${reason}. Grouped as "${core.merchantRootKey(value)}".`
+          : `Nothing matches, so it would be logged uncategorised. Grouped as "${core.merchantRootKey(value)}".`
+      );
+    };
+    testInput.addEventListener("input", () => runTest());
+    testInput.addEventListener("change", () => runTest());
+
+    const entries = Object.entries(plugin.settings.merchantMap || {}).sort((left, right) => left[0].localeCompare(right[0]));
     if (!entries.length) {
       listEl.createDiv({
         cls: "finance-tracker-empty",
-        text: "No merchants learned yet — tick \"Remember this merchant → category\" when editing a transaction.",
+        text: "No rules yet. Add one above, tick \"remember this merchant\" when filing an entry, or let the plugin follow how you filed a merchant last time.",
       });
       return;
     }
+
+    listEl.createEl("p", {
+      cls: "finance-tracker-settings-section-copy",
+      text: `${entries.length} rule${entries.length === 1 ? "" : "s"}. A rule beats what your notes say, so this is where you overrule a bad precedent.`,
+    });
+
     for (const [merchant, category] of entries) {
-      const setting = new Setting(listEl).setName(merchant).setDesc(core.displayCategoryPath(category));
+      const setting = new Setting(listEl).setName(merchant);
+      setting.addText((text) => {
+        text.setValue(category).onChange(async (value) => {
+          const next = core.normalizeCategoryPath(value);
+          if (!next) return;
+          plugin.settings.merchantMap = { ...plugin.settings.merchantMap, [merchant]: next };
+          plugin._merchantSources = null;
+          await plugin.saveSettings();
+        });
+        new FinanceSuggest(text.inputEl, { getItems: categoryItems });
+      });
       setting.addButton((button) =>
         button.setButtonText("Remove").onClick(async () => {
-          await this.plugin.forgetMerchantCategory(merchant);
-          this.renderMerchantMapList(listEl);
+          await plugin.forgetMerchantCategory(merchant);
+          await this.renderMerchantMapList(listEl);
         })
       );
     }

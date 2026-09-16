@@ -94,12 +94,12 @@ class FinanceTrackerPlugin extends Plugin {
     this.registerView(FINANCE_INBOX_VIEW, (leaf) => new FinanceInboxView(leaf, this));
 
     this.addRibbonIcon("coins", "Daily budget", () => this.activateDailyBudgetView());
-    this.addRibbonIcon("circle-plus", "Quick add transaction", () => new QuickAddTransactionModal(this.app, this).open());
+    this.addRibbonIcon("circle-plus", "Quick add transaction", () => this.openQuickAdd());
 
     this._statusBarItem = this.addStatusBarItem();
     this._statusBarItem.addClass("finance-status-bar");
     this._statusBarItem.setText("💸 …");
-    this._statusBarItem.addEventListener("click", () => new QuickAddTransactionModal(this.app, this).open());
+    this._statusBarItem.addEventListener("click", () => this.openQuickAdd());
 
     this.addCommand({
       id: "finance-tracker-open-daily-budget",
@@ -116,7 +116,7 @@ class FinanceTrackerPlugin extends Plugin {
     this.addCommand({
       id: "finance-tracker-quick-add",
       name: "Quick add transaction",
-      callback: () => new QuickAddTransactionModal(this.app, this).open(),
+      callback: () => this.openQuickAdd(),
     });
 
     this.addCommand({
@@ -201,6 +201,12 @@ class FinanceTrackerPlugin extends Plugin {
       id: "finance-tracker-repair-totals",
       name: "Repair daily note totals",
       callback: () => this.repairAllDailyNoteTotals(),
+    });
+
+    this.addCommand({
+      id: "finance-tracker-recategorise",
+      name: "Rename or split a category",
+      callback: () => this.openRecategorise(),
     });
 
     this.addCommand({
@@ -1067,6 +1073,12 @@ class FinanceTrackerPlugin extends Plugin {
 
   // One place that opens the edit modal, so every caller gets the same options
   // and a test can hold on to the instance.
+  openQuickAdd(options = {}) {
+    const modal = new QuickAddTransactionModal(this.app, this, options);
+    modal.open();
+    return modal;
+  }
+
   openEditTransaction(entry, options = {}) {
     const modal = new EditTransactionModal(this.app, this, entry, options);
     modal.open();
@@ -4480,7 +4492,7 @@ class FinanceTrackerPlugin extends Plugin {
     const header = wrapper.createDiv({ cls: "finance-tracker-header" });
     header.createEl("h3", { text: "Daily budget" });
     const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
-    addAction(headerActions, "Add", () => new QuickAddTransactionModal(this.app, this).open(), {
+    addAction(headerActions, "Add", () => this.openQuickAdd(), {
       primary: true,
       opensModal: true,
       tooltip: "Quick add a transaction",
@@ -5032,6 +5044,124 @@ class FinanceTrackerPlugin extends Plugin {
     this.refreshDailyBudgetView();
     this.refreshInboxView();
     return updated;
+  }
+
+  openRecategorise(category = "") {
+    const modal = new RecategoriseModal(this.app, this, { category });
+    modal.open();
+    return modal;
+  }
+
+  // --- Recategorising ---------------------------------------------------------
+
+  // Everything filed under a category, grouped by merchant. A category rarely
+  // needs renaming wholesale: bare "transport" in the author's vault is six
+  // Translink trips, five rideshares, three Lime scooters and a car park, and
+  // the merchant is what says which is which.
+  async buildCategoryBreakdown(category) {
+    const target = core.normalizeCategoryPath(category);
+    if (!target) return { entries: [], groups: [] };
+    const entries = (await this.collectAllTransactions()).filter(
+      (entry) => core.isSpendingEntry(entry) && (entry.category === target || entry.category.startsWith(`${target}/`))
+    );
+    return { entries, groups: core.groupEntriesByMerchantRoot(entries) };
+  }
+
+  // Plans a set of per-entry category changes, plus the table cells that point at
+  // the old path. Nothing is written: this is what the preview shows.
+  async planCategoryAssignments(assignments, options = {}) {
+    const byPath = new Map();
+    for (const assignment of assignments || []) {
+      const category = core.normalizeCategoryPath(assignment?.category);
+      if (!category) continue;
+      for (const entry of assignment.entries || []) {
+        if (entry.category === category) continue;
+        const list = byPath.get(entry.filePath) || [];
+        list.push({ entry, category });
+        byPath.set(entry.filePath, list);
+      }
+    }
+
+    const files = [];
+    for (const path of byPath.keys()) {
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (!(file instanceof TFile)) continue;
+      files.push({ path, content: await this.app.vault.cachedRead(file) });
+    }
+
+    const settings = this.settings;
+    const plan = core.planNoteRewrite(files, (content, path) => {
+      // Bottom-up, so rewriting one entry cannot shift the line another sits at.
+      const changes = (byPath.get(path) || [])
+        .slice()
+        .sort((left, right) => (right.entry.lineIndex ?? -1) - (left.entry.lineIndex ?? -1));
+      let next = content;
+      let entries = 0;
+      const samples = [];
+      for (const { entry, category } of changes) {
+        const expense = { ...entry, category };
+        const replaced = core.replaceTransactionBlock(next, entry.rawLine, expense, settings, { lineIndex: entry.lineIndex });
+        if (replaced == null) continue;
+        if (samples.length < 3) {
+          samples.push({ before: entry.rawLine.trim(), after: core.buildTransactionBlock(expense, settings)[0].trim() });
+        }
+        next = replaced;
+        entries += 1;
+      }
+      return { content: next, entries, samples };
+    });
+
+    const tableRenames = options.tableRenames || [];
+    if (!tableRenames.length) return plan;
+
+    const tableFiles = [];
+    for (const file of this.categoryReferenceFiles()) {
+      tableFiles.push({ path: file.path, content: await this.app.vault.cachedRead(file) });
+    }
+    const tablePlan = core.planNoteRewrite(tableFiles, core.buildCategoryTableRenameTransform(tableRenames));
+
+    return {
+      files: [...plan.files, ...tablePlan.files],
+      samples: [...plan.samples, ...tablePlan.samples].slice(0, 5),
+      warnings: [...plan.warnings, ...tablePlan.warnings],
+      totals: {
+        files: plan.totals.files + tablePlan.totals.files,
+        entries: plan.totals.entries + tablePlan.totals.entries,
+        warnings: plan.totals.warnings + tablePlan.totals.warnings,
+      },
+    };
+  }
+
+  // Notes that mention categories outside the daily notes: the budgets table and
+  // every goal or trip note with planned and allocated tables.
+  categoryReferenceFiles() {
+    const budgetsPrefix = normalizePath(`${this.settings.budgetsFolderPath}/`);
+    return this.app.vault.getMarkdownFiles().filter((file) => file.path.startsWith(budgetsPrefix));
+  }
+
+  // Merchant rules point at categories too.
+  async renameCategoryInMerchantMap(renames) {
+    const map = { ...(this.settings.merchantMap || {}) };
+    let changed = 0;
+    for (const [merchant, category] of Object.entries(map)) {
+      for (const { from, to } of renames || []) {
+        const cleanFrom = core.normalizeCategoryPath(from);
+        const cleanTo = core.normalizeCategoryPath(to);
+        if (!cleanFrom || !cleanTo) continue;
+        if (category === cleanFrom) {
+          map[merchant] = cleanTo;
+          changed += 1;
+        } else if (category.startsWith(`${cleanFrom}/`)) {
+          map[merchant] = `${cleanTo}/${category.slice(cleanFrom.length + 1)}`;
+          changed += 1;
+        }
+      }
+    }
+    if (!changed) return 0;
+    this.settings.merchantMap = map;
+    this._merchantSources = null;
+    await this.saveSettings();
+    return changed;
   }
 
   // --- Failed captures ------------------------------------------------------------

@@ -172,6 +172,19 @@ class QuickAddTransactionModal extends Modal {
     keepOpenLabel.appendText(" Keep open for next entry");
     const submit = buttons.createEl("button", { text: "Add", cls: "mod-cta" });
 
+    // The preview used to say "Uncategorized" while the capture path went on to
+    // fill in a learned category a moment later — so the one screen that could
+    // have shown the guess was the one place that denied there was one.
+    let suggestedFor = null;
+    let suggestion = { category: "", source: "" };
+    const ensureSuggestion = async (merchant) => {
+      const key = String(merchant || "").trim().toLowerCase();
+      if (key === suggestedFor) return;
+      suggestedFor = key;
+      suggestion = key ? await this.plugin.suggestCategoryForMerchant(merchant) : { category: "", source: "" };
+      update();
+    };
+
     const parseCurrent = () => {
       const parsed = core.parseQuickAddInput(input.value, known.categories, { defaultCurrency: this.plugin.settings.defaultCurrency });
       let date = this.date;
@@ -207,7 +220,9 @@ class QuickAddTransactionModal extends Modal {
         return;
       }
 
-      const category = parsed.category || "uncategorized";
+      if (!parsed.category) ensureSuggestion(parsed.merchant);
+      const guessed = !parsed.category && suggestion.category ? suggestion.category : "";
+      const category = parsed.category || guessed || "uncategorized";
       const bits = [core.formatCurrency(parsed.amount, home)];
       if (parsed.originalCurrency) {
         bits.push(
@@ -216,7 +231,11 @@ class QuickAddTransactionModal extends Modal {
           }`
         );
       }
-      bits.push(core.displayCategoryPath(category));
+      bits.push(
+        guessed
+          ? `${core.displayCategoryPath(category)} (${this.plugin.describeSuggestionSource(suggestion.source)})`
+          : core.displayCategoryPath(category)
+      );
       if (parsed.merchant) bits.push(parsed.merchant);
       const owedPreview = core.buildOwedSharesFromTokens(parsed.amount, parsed.splitCount, parsed.owedTokens || []);
       if (owedPreview.length) {

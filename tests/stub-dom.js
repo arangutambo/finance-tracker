@@ -62,7 +62,16 @@ class StubEl {
   removeEventListener(type, handler) {
     this.listeners.set(type, (this.listeners.get(type) || []).filter((entry) => entry !== handler));
   }
-  dispatchEvent() { return true; }
+  dispatchEvent(event) {
+    this.fire(event?.type || "change");
+    return true;
+  }
+
+  async fire(type, event = {}) {
+    for (const handler of this.listeners.get(type) || []) {
+      await handler({ preventDefault() {}, stopPropagation() {}, ...event });
+    }
+  }
   show() { this.hidden = false; }
   hide() { this.hidden = true; }
   focus() {}

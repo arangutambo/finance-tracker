@@ -24,6 +24,15 @@ class StubTFile {
 
 const notices = [];
 
+// The plugin reaches for window.setTimeout in a few places (focusing an input,
+// scheduling the gist poll). Node has the timers but not the window.
+global.window = global.window || {
+  setTimeout: (...args) => setTimeout(...args),
+  clearTimeout: (...args) => clearTimeout(...args),
+  setInterval: (...args) => setInterval(...args),
+  clearInterval: (...args) => clearInterval(...args),
+};
+
 let requestUrlHandler = async () => ({ status: 404, json: null, text: "" });
 
 const obsidianStub = {
@@ -891,4 +900,119 @@ test("the remember box is unticked when a shop has been filed two ways", async (
   const modal = plugin.openEditTransaction(entry);
   await modal.ready;
   assert.match(modal.contentEl.allText(), /you have filed it more than one way/);
+});
+
+// --- Renaming and splitting categories -------------------------------------------------
+
+async function vaultWithTransport() {
+  const made = makePlugin({ budgetsFolderPath: "Utility/Budgets", merchantMap: { translink: "transport" } });
+  delete made.plugin.invalidateIndexEntry;
+  await made.app.vault.create(
+    "Daily/2026-05-20.md",
+    [
+      "## Finance",
+      "- [ ] #log/spending 23.4",
+      "\t- $4.80 #log/spending/transport",
+      "\t\t- Translink",
+      "\t- $12.60 #log/spending/transport",
+      "\t\t- Uber to Home from Airport",
+      "\t- $6.00 #log/spending/transport",
+      "\t\t- lime",
+      "",
+    ].join("\n")
+  );
+  await made.app.vault.create(
+    "Utility/Budgets/Budgets.md",
+    ["| Name | Category | Limit | Period |", "| --- | --- | ---: | --- |", "| Transport | transport | 60 | week |", "| Groceries | food/groceries | 140 | week |", ""].join("\n")
+  );
+  return made;
+}
+
+test("a category can be split by merchant in one pass", async () => {
+  const { plugin, files } = await vaultWithTransport();
+  const { groups } = await plugin.buildCategoryBreakdown("transport");
+
+  const target = (label, category) => ({
+    entries: groups.find((group) => group.label.toLowerCase().includes(label)).entries,
+    category,
+  });
+  const plan = await plugin.planCategoryAssignments([
+    target("translink", "transport/public-transport"),
+    target("uber", "transport/rideshare"),
+    target("lime", "transport/scooter"),
+  ]);
+
+  assert.equal(plan.totals.files, 1);
+  assert.equal(plan.totals.entries, 3);
+  await plugin.applyNoteRewritePlan(plan);
+
+  const content = files.get("Daily/2026-05-20.md").content;
+  assert.match(content, /\$4\.80 #log\/spending\/transport\/public-transport/);
+  assert.match(content, /\$12\.60 #log\/spending\/transport\/rideshare/);
+  assert.match(content, /\$6\.00 #log\/spending\/transport\/scooter/);
+  assert.match(content, /- \[ \] #log\/spending 23\.4/, "the total is unchanged — nothing moved in or out");
+  assert.match(content, /\t\t- Uber to Home from Airport/, "merchant lines stay with their entries");
+  // A split is not a rename, so the budget row is left pointing where it did.
+  assert.match(files.get("Utility/Budgets/Budgets.md").content, /\| Transport \| transport \| 60 \| week \|/);
+});
+
+test("a whole rename follows into the budgets table and the merchant rules", async () => {
+  const { plugin, files } = await vaultWithTransport();
+  const { entries } = await plugin.buildCategoryBreakdown("transport");
+
+  const plan = await plugin.planCategoryAssignments([{ entries, category: "travel" }], {
+    tableRenames: [{ from: "transport", to: "travel" }],
+  });
+  await plugin.applyNoteRewritePlan(plan);
+  const rules = await plugin.renameCategoryInMerchantMap([{ from: "transport", to: "travel" }]);
+
+  assert.equal((files.get("Daily/2026-05-20.md").content.match(/#log\/spending\/travel/g) || []).length, 3);
+  assert.match(files.get("Utility/Budgets/Budgets.md").content, /\| Transport \| travel \| 60 \| week \|/);
+  assert.match(files.get("Utility/Budgets/Budgets.md").content, /\| Groceries \| food\/groceries \| 140 \| week \|/, "other rows untouched");
+  assert.equal(rules, 1);
+  assert.equal(plugin.settings.merchantMap.translink, "travel");
+});
+
+test("the rename modal lists every merchant in the category", async () => {
+  const { plugin } = await vaultWithTransport();
+
+  const modal = plugin.openRecategorise("transport");
+  await modal.ready;
+
+  const text = modal.contentEl.allText();
+  assert.match(text, /Rename or split a category/);
+  assert.match(text, /3 entries · \$23\.40 · 3 merchants/);
+  assert.match(text, /Everything/);
+  assert.match(text, /Translink/);
+  assert.match(text, /Uber to Home from Airport/);
+  assert.match(text, /now Transport/);
+});
+
+test("quick add previews the category the capture will actually use", async () => {
+  const { plugin, app } = makePlugin();
+  delete plugin.invalidateIndexEntry;
+  await app.vault.create(
+    "Daily/2026-08-15.md",
+    "## Finance\n- [ ] #log/spending 11.5\n\t- $11.50 #log/spending/food/takeaway\n\t\t- Rode Fresh\n"
+  );
+
+  const modal = plugin.openQuickAdd();
+  await modal.ready;
+  const input = modal.contentEl.find((node) => node.tag === "input" && node.classList.has("finance-quick-add-input"));
+  const preview = modal.contentEl.find((node) => node.classList.has("finance-quick-add-preview"));
+
+  input.value = "10 rode fresh";
+  await input.fire("input");
+  // The suggestion is looked up asynchronously, then the preview redraws.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.match(preview.text, /\$10\.00/);
+  assert.match(preview.text, /Food \/ Takeaway \(how you filed it last time\)/, preview.text);
+
+  // A category typed by hand still wins.
+  input.value = "10 rode fresh #food/groceries";
+  await input.fire("input");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.match(preview.text, /Food \/ Groceries/);
+  assert.doesNotMatch(preview.text, /how you filed it/);
 });

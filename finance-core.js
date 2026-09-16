@@ -3774,6 +3774,65 @@ function groupEntriesByMerchantRoot(entries) {
     .sort((left, right) => right.count - left.count || right.total - left.total);
 }
 
+// A category path also lives in markdown tables — the budgets table, and a
+// trip's planned and allocated expenses. A rename that skipped those would leave
+// a budget pointing at a category nothing is filed under any more.
+//
+// Only the Category column of a real table is touched: a "Name" cell reading
+// "Groceries" is a label, not a path, and rewriting it would be wrong.
+function buildCategoryTableRenameTransform(renames) {
+  const list = (renames || [])
+    .map((rename) => ({ from: normalizeCategoryPath(rename?.from), to: normalizeCategoryPath(rename?.to) }))
+    .filter((rename) => rename.from && rename.to && rename.from !== rename.to);
+
+  return function transform(content) {
+    if (!list.length) return { content, entries: 0, samples: [] };
+    const lines = splitLines(content);
+    const samples = [];
+    let entries = 0;
+    let categoryColumn = -1;
+    let inTable = false;
+
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index];
+      if (!/^\s*\|/.test(line)) {
+        inTable = false;
+        categoryColumn = -1;
+        continue;
+      }
+      const next = lines[index + 1];
+      if (!inTable && next && /^\s*\|?[\s:-]+\|/.test(next)) {
+        const headers = line.split("|").slice(1, -1).map((cell) => normalizeWhitespace(cell).toLowerCase());
+        categoryColumn = headers.findIndex((header) => header === "category" || header === "tag");
+        inTable = true;
+        continue;
+      }
+      if (!inTable || categoryColumn < 0) continue;
+
+      const cells = line.split("|");
+      const cellIndex = categoryColumn + 1;
+      const cell = cells[cellIndex];
+      if (cell === undefined) continue;
+      const value = normalizeCategoryPath(cell);
+      if (!value) continue;
+
+      for (const rename of list) {
+        const matches = value === rename.from || value.startsWith(`${rename.from}/`);
+        if (!matches) continue;
+        const replacement = value === rename.from ? rename.to : `${rename.to}/${value.slice(rename.from.length + 1)}`;
+        cells[cellIndex] = cell.replace(normalizeWhitespace(cell), replacement);
+        const rewritten = cells.join("|");
+        if (samples.length < 2) samples.push({ before: line.trim(), after: rewritten.trim() });
+        lines[index] = rewritten;
+        entries += 1;
+        break;
+      }
+    }
+
+    return { content: lines.join("\n"), entries, samples };
+  };
+}
+
 module.exports = {
   RECURRING_CADENCES,
   RECURRING_REGISTRY_COLUMNS,
@@ -3854,6 +3913,7 @@ module.exports = {
   recomputeSpendingTotals,
   planNoteRewrite,
   buildLegacyTripTagTransform,
+  buildCategoryTableRenameTransform,
   summarizeLegacyTripTags,
   findFinanceHeadingIndex,
   findTransactionLineIndex,
