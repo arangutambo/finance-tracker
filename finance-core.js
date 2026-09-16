@@ -1868,9 +1868,9 @@ function recomputeSpendingTotals(content, settings = {}) {
   const noteDate = extractNoteDate(content, "");
   const spendingHeading = normalizeWhitespace(settings.spendingHeading || "## Spending");
   const rootTag = normalizeWhitespace(settings.spendingRootTag || "#log/spending");
-  const headingIndex = lines.findIndex(
-    (line) => normalizeWhitespace(line).toLowerCase() === spendingHeading.toLowerCase()
-  );
+  // Same fallback as the insert path: a note that still uses the older heading
+  // gets its total healed rather than silently skipped.
+  const headingIndex = findFinanceHeadingIndex(lines, spendingHeading);
   if (headingIndex === -1) return content;
 
   let sectionEnd = lines.length;

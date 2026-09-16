@@ -453,3 +453,115 @@ test("a gist of nothing but per-capture drops keeps a placeholder file", async (
   // GitHub rejects a gist left with no files, so the queue file is recreated.
   assert.match(patched["finance-capture.txt"].content, /^# drained /);
 });
+
+// --- Merchant map import ---------------------------------------------------------
+
+test("the merchant map note is imported even on an already-migrated install", async () => {
+  const { plugin, app, files } = makePlugin({
+    merchantMapPath: "Utility/Finance/Merchant Map.md",
+    merchantMapMigrated: false,
+    merchantMap: {},
+  });
+  await app.vault.create(
+    "Utility/Finance/Merchant Map.md",
+    ["| Merchant | Category |", "| --- | --- |", "| Woolworths | food/groceries |", "| Dan Murphys | alcohol |"].join("\n")
+  );
+
+  const added = await plugin.migrateMerchantMapFile();
+
+  assert.equal(added, 2);
+  assert.equal(plugin.settings.merchantMap.woolworths, "food/groceries");
+  assert.equal(plugin.settings.merchantMap.danmurphys, "alcohol");
+  // The note is the user's; importing it is not a reason to delete it.
+  assert.ok(files.has("Utility/Finance/Merchant Map.md"), "the merchant map note must survive the import");
+  assert.match(notices.join(" "), /imported 2 merchant rules/i);
+
+  // Second run is a no-op.
+  assert.equal(await plugin.migrateMerchantMapFile(), 0);
+});
+
+test("importing the merchant map never overwrites a category you have corrected", async () => {
+  const { plugin, app } = makePlugin({
+    merchantMapPath: "Utility/Finance/Merchant Map.md",
+    merchantMapMigrated: false,
+    merchantMap: { woolworths: "food/groceries/woolworths" },
+  });
+  await app.vault.create("Utility/Finance/Merchant Map.md", ["| Merchant | Category |", "| --- | --- |", "| Woolworths | food/groceries |"].join("\n"));
+
+  await plugin.migrateMerchantMapFile();
+
+  assert.equal(plugin.settings.merchantMap.woolworths, "food/groceries/woolworths");
+});
+
+// --- Legacy trip tag migration -----------------------------------------------------
+
+const LEGACY_NOTE = [
+  "---",
+  "date: 2025-10-04",
+  "---",
+  "",
+  "## Spending",
+  "- [ ] #log/spending ",
+  "\t- R$195.16 - $55.60 #log/archive/25/Brazil/Spending/Accommadation ",
+  "\t\t- 1 Night Pousada La Luna",
+  "\t- 18BRL - 5.16 AUD #log/archive/25/Brazil/Spending/Food/Snacks ",
+  "",
+].join("\n");
+
+test("legacy trip tags are planned, previewed and applied", async () => {
+  const { plugin, app, files } = makePlugin();
+  await app.vault.create("Daily/2025-10-04.md", LEGACY_NOTE);
+  await app.vault.create("Daily/2026-09-14.md", "## Finance\n- [ ] #log/spending 27.3\n\t- $27.30 #log/spending/food/takeaway\n");
+
+  const { plan, trips } = await plugin.planLegacyTripTagMigration();
+
+  assert.equal(trips.length, 1);
+  assert.equal(trips[0].key, "25/brazil");
+  assert.equal(trips[0].currency, "BRL", "the fallback currency is read from the trip's own lines");
+  assert.equal(plan.totals.files, 1, "only the note holding legacy tags is touched");
+  assert.equal(plan.totals.entries, 2);
+
+  const { written, skipped } = await plugin.applyNoteRewritePlan(plan);
+
+  assert.equal(written, 1);
+  assert.equal(skipped.length, 0);
+  const after = files.get("Daily/2025-10-04.md").content;
+  assert.ok(!after.includes("#log/archive/"), "no archive tags survive");
+  assert.ok(after.includes("## Finance"), "the heading is brought up to date");
+  assert.ok(after.includes("BRL 195.16 : $55.60 AUD #log/spending/25/brazil/accommodation"), after);
+  assert.ok(after.includes("BRL 18.00 : $5.16 AUD #log/spending/25/brazil/food/snacks"), after);
+  assert.ok(after.includes("\t\t- 1 Night Pousada La Luna"), "the merchant child line stays with its entry");
+  // The untouched note is exactly as it was.
+  assert.equal(files.get("Daily/2026-09-14.md").content, "## Finance\n- [ ] #log/spending 27.3\n\t- $27.30 #log/spending/food/takeaway\n");
+
+  // Running it again finds nothing left to do.
+  const second = await plugin.planLegacyTripTagMigration();
+  assert.equal(second.plan.totals.files, 0);
+});
+
+test("a note edited since the preview is skipped, not overwritten", async () => {
+  const { plugin, app, files } = makePlugin();
+  await app.vault.create("Daily/2025-10-04.md", LEGACY_NOTE);
+
+  const { plan } = await plugin.planLegacyTripTagMigration();
+  // Someone edits the note while the preview is open.
+  const edited = `${LEGACY_NOTE}\t- $9.00 #log/spending/food/snacks\n`;
+  files.get("Daily/2025-10-04.md").content = edited;
+
+  const { written, skipped } = await plugin.applyNoteRewritePlan(plan);
+
+  assert.equal(written, 0);
+  assert.deepEqual(skipped, ["Daily/2025-10-04.md"]);
+  assert.equal(files.get("Daily/2025-10-04.md").content, edited, "the newer content must survive");
+});
+
+test("appending finance lines joins a note's existing legacy heading", async () => {
+  const { plugin, app, files } = makePlugin();
+  await app.vault.create("Daily/2026-02-03.md", "## Spending\n- [ ] #log/spending 10\n\t- $10.00 #log/spending/food/takeaway\n");
+
+  await plugin.appendFinanceLines("2026-02-03", ["\t- $5.00 #log/spending/food/snacks"]);
+
+  const content = files.get("Daily/2026-02-03.md").content;
+  assert.equal((content.match(/^## /gm) || []).length, 1, "a second finance section must not appear");
+  assert.ok(content.includes("- [ ] #log/spending 15"), content);
+});

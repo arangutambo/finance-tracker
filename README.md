@@ -20,7 +20,9 @@ in plain text, in notes you can grep, link and edit by hand.
 That is the whole data format. Everything below is built from it.
 
 - Runs on **desktop and mobile** (Obsidian 1.0+).
-- **No network requests**, no telemetry, no bank connections.
+- **Network use is opt-in and named**: only the GitHub gist capture method talks
+  to the internet, and only when you switch it on and supply your own gist and
+  token. No telemetry, no bank connections, nothing phoning home.
 - MIT licensed — see [LICENSE](LICENSE).
 - Recent changes: [CHANGELOG.md](CHANGELOG.md).
 
@@ -942,9 +944,11 @@ lists every learned merchant with a **Remove** button. Future captures from a
 known merchant auto-categorise using this map (see
 [Deferred categorisation](#deferred-categorisation)).
 
-If you're upgrading from an older version, any existing `Merchant Map.md` note
-is read once, folded into settings, and then deleted automatically — no action
-needed.
+If you have a `Merchant Map.md` note — from an older version, or written by hand
+as an import batch — it is read once and folded into settings. Your own entries
+win over the file, so importing can never undo a category you have corrected.
+The note is left where it is; delete it when you're ready. **Import merchant map
+note** re-runs the import.
 
 ## Reconciling against the bank
 
@@ -975,6 +979,8 @@ with **Finance Tracker:**.
 | **Sync capture gist now** | Polls the capture gist immediately instead of waiting for the next scheduled check. |
 | **Check capture methods for overlap** | Reports which pairs of capture methods have been logging the same transactions, so you can switch off one you don't need. |
 | **Reconcile a bank CSV** | Paste a bank or Wise CSV export; matches rows by date+amount and can send unmatched charges to the capture inbox. |
+| **Convert legacy trip tags** | Converts trips filed under the older `#log/archive/<year>/<trip>/spending/…` tags to the current trip format, rewriting two-currency amounts so the original currency is read back. Shows a full preview first. |
+| **Import merchant map note** | Re-reads `Merchant Map.md` into the merchant map in settings. |
 | **Repair daily note totals** | Recomputes the `#log/spending` running total on every daily note in one pass. Individual notes heal when opened; this fixes a whole backlog at once. |
 | **Export transactions to CSV** | Exports every transaction ever logged (all time, all categories) to a CSV file. |
 | **Open budgets note** | Opens (creating if needed) the default `💸 Budgets.md` note. |

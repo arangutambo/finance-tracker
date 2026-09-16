@@ -343,6 +343,15 @@ function updateFrontmatterValue(content, key, value) {
   return text.replace(frontmatterMatch[0], `---\n${nextLines.join("\n")}\n---`);
 }
 
+// Spelling slips in old tags, which would otherwise become permanent categories
+// of their own. Applied per segment by the legacy-trip migration.
+const LEGACY_CATEGORY_FIXES = {
+  accommadation: "accommodation",
+  accomodation: "accommodation",
+  resturants: "restaurants",
+  transporation: "transportation",
+};
+
 const DEFAULT_HOLIDAY_PLANNED_EXPENSES = [
   { item: "Flights", category: "flights" },
   { item: "Accommodation", category: "accommodation" },

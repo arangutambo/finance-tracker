@@ -197,6 +197,25 @@ class FinanceTrackerPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: "finance-tracker-convert-legacy-trip-tags",
+      name: "Convert legacy trip tags",
+      callback: () => this.openLegacyTripTagMigration(),
+    });
+
+    this.addCommand({
+      id: "finance-tracker-import-merchant-map",
+      name: "Import merchant map note",
+      callback: async () => {
+        const added = await this.migrateMerchantMapFile({ force: true, notify: false });
+        new Notice(
+          added > 0
+            ? `Finance: imported ${added} merchant rule${added === 1 ? "" : "s"}.`
+            : "Finance: no new merchant rules to import."
+        );
+      },
+    });
+
+    this.addCommand({
       id: "finance-tracker-snapshot-balances",
       name: "Snapshot balances",
       callback: () => new BalanceSnapshotModal(this.app, this).open(),
@@ -323,9 +342,7 @@ class FinanceTrackerPlugin extends Plugin {
     this.settings.merchantMap = this.settings.merchantMap || {};
     // Only pre-versioning installs can still have a markdown merchant map to
     // fold in; skipping it otherwise saves a vault read on every single load.
-    if (this._settingsMigratedFrom < 1) {
-      await this.migrateMerchantMapFile();
-    }
+    await this.migrateMerchantMapFile();
   }
 
   async saveSettings() {
@@ -753,36 +770,47 @@ class FinanceTrackerPlugin extends Plugin {
     return new Map(Object.entries(this.settings.merchantMap || {}));
   }
 
-  // One-time upgrade from the old markdown-file merchant map: reads whatever
-  // is there, folds it into settings, and removes the now-redundant file.
-  // Whether this has run is its own flag rather than "is the settings map
-  // empty?" — the moment a single merchant was remembered the old guard
-  // decided the upgrade was already done, and silently stranded the file.
-  // Existing settings win over the file, so re-running can never clobber a
+  // Imports the markdown merchant map into settings. This used to run only for
+  // installs that predated settings versioning, which meant a file written after
+  // that point was never read at all — 30 rules sat in the author's vault being
+  // ignored for a month. It now runs whenever the file is present and has not
+  // been imported yet.
+  //
+  // It no longer deletes the note. Removing something the user wrote is not this
+  // function's call to make, and the note is a useful record of where the rules
+  // came from. Existing settings win, so importing twice can never clobber a
   // category that has since been corrected.
-  async migrateMerchantMapFile() {
-    if (this.settings.merchantMapMigrated) return;
+  async migrateMerchantMapFile(options = {}) {
+    if (this.settings.merchantMapMigrated && !options.force) return 0;
     const path = normalizePath(this.settings.merchantMapPath || "");
-    if (!path) return;
-    const file = this.app.vault.getAbstractFileByPath(path);
+    const file = path ? this.app.vault.getAbstractFileByPath(path) : null;
     if (!(file instanceof TFile)) {
       this.settings.merchantMapMigrated = true;
       await this.saveSettings();
-      return;
+      return 0;
     }
+
     const content = await this.app.vault.cachedRead(file);
-    const migrated = {};
+    const imported = {};
     for (const rows of core.parseMarkdownTable(content)) {
       for (const row of rows) {
         const merchant = core.normalizeMerchant(row.merchant || row.payee || row.name || "");
         const category = core.normalizeCategoryPath(row.category || row.cat || "");
-        if (merchant && category) migrated[merchant] = category;
+        if (merchant && category) imported[merchant] = category;
       }
     }
-    this.settings.merchantMap = { ...migrated, ...(this.settings.merchantMap || {}) };
+
+    const before = Object.keys(this.settings.merchantMap || {}).length;
+    this.settings.merchantMap = { ...imported, ...(this.settings.merchantMap || {}) };
     this.settings.merchantMapMigrated = true;
     await this.saveSettings();
-    await this.app.vault.delete(file);
+    const added = Object.keys(this.settings.merchantMap).length - before;
+    if (added > 0 && options.notify !== false) {
+      new Notice(
+        `Finance: imported ${added} merchant rule${added === 1 ? "" : "s"} from ${file.basename}. They live in settings now, so that note can go whenever you like.`
+      );
+    }
+    return added;
   }
 
   // Three passes, most deliberate first: an exact rule, then a rule whose
@@ -1476,6 +1504,79 @@ class FinanceTrackerPlugin extends Plugin {
     if (next !== content) {
       await _ftModify(this.app,file, next);
     }
+  }
+
+  // --- Note migrations ---------------------------------------------------------
+
+  // Reads every daily note once and plans the legacy-trip-tag conversion over
+  // it. Nothing is written here: the plan is what the preview shows and what
+  // apply later consumes.
+  async planLegacyTripTagMigration() {
+    const payload = [];
+    for (const file of this.getDailyNoteFiles()) {
+      payload.push({ path: file.path, content: await this.app.vault.cachedRead(file) });
+    }
+    const trips = core.summarizeLegacyTripTags(payload);
+    const transform = core.buildLegacyTripTagTransform({
+      categoryFixes: LEGACY_CATEGORY_FIXES,
+      heading: this.settings.spendingHeading || "## Finance",
+      homeCurrency: this.settings.defaultCurrency,
+      spendingRootTag: this.settings.spendingRootTag,
+      tripCurrencies: Object.fromEntries(trips.map((trip) => [trip.key, trip.currency])),
+    });
+    return { plan: core.planNoteRewrite(payload, transform), trips };
+  }
+
+  // Writes an approved plan. A note that has changed since the preview is
+  // skipped and reported, never overwritten with stale content.
+  async applyNoteRewritePlan(plan) {
+    const skipped = [];
+    let written = 0;
+    for (const change of plan?.files || []) {
+      const file = this.app.vault.getAbstractFileByPath(change.path);
+      if (!(file instanceof TFile)) {
+        skipped.push(change.path);
+        continue;
+      }
+      const current = await this.app.vault.cachedRead(file);
+      if (current !== change.before) {
+        skipped.push(change.path);
+        continue;
+      }
+      await _ftModify(this.app, file, change.after);
+      this.invalidateIndexEntry(file.path);
+      written += 1;
+    }
+    this._scheduleStatusBarUpdate();
+    this.refreshDailyBudgetView();
+    return { written, skipped };
+  }
+
+  async openLegacyTripTagMigration() {
+    const { plan, trips } = await this.planLegacyTripTagMigration();
+    const intro = trips
+      .map((trip) => {
+        const dates = trip.firstDate ? `, ${trip.firstDate} to ${trip.lastDate}` : "";
+        const currency = trip.currency ? `, mostly ${trip.currency}` : "";
+        return `${trip.key} — ${trip.entries} entries across ${trip.files} note${trip.files === 1 ? "" : "s"}${currency}${dates}`;
+      })
+      .join("; ");
+    new RewritePreviewModal(this.app, this, {
+      title: "Convert legacy trip tags",
+      intro: intro
+        ? `${intro}. They become ordinary trip spending, which keeps them out of your home budgets and lets the trip dashboards read them.`
+        : "",
+      plan,
+      emptyText: "No legacy trip tags found, so there is nothing to convert.",
+      onApply: async (approved) => {
+        const { written, skipped } = await this.applyNoteRewritePlan(approved);
+        new Notice(
+          `Converted ${written} note${written === 1 ? "" : "s"}${
+            skipped.length ? `. ${skipped.length} changed since the preview and were left alone` : ""
+          }.`
+        );
+      },
+    }).open();
   }
 
   async collectTransactionsForHoliday(holidayKey, range = {}) {
@@ -4409,8 +4510,10 @@ class FinanceTrackerPlugin extends Plugin {
     const file = existing instanceof TFile ? existing : await this.createDailyNoteFromTemplate(notePath, date);
     const content = await this.app.vault.cachedRead(file);
     const lines = String(content).replace(/\r\n/g, "\n").split("\n");
-    const heading = (this.settings.spendingHeading || "## Finance").trim().toLowerCase();
-    let headingIndex = lines.findIndex((line) => line.trim().toLowerCase() === heading);
+    // The configured heading first, then whatever this note already uses, so a
+    // note still headed "## Spending" gains lines in that section rather than a
+    // second one below it.
+    let headingIndex = core.findFinanceHeadingIndex(lines, this.settings.spendingHeading || "## Finance");
     if (headingIndex === -1) {
       if (lines.length && lines[lines.length - 1].trim()) lines.push("");
       lines.push(this.settings.spendingHeading || "## Finance");

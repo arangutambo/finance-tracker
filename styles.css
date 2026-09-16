@@ -1526,3 +1526,31 @@
 .finance-quick-add-duplicate.is-hidden {
   display: none;
 }
+
+/* ---- Migration preview ---- */
+.finance-rewrite-preview .finance-rewrite-sample {
+  display: grid;
+  gap: 2px;
+  margin-bottom: 10px;
+}
+
+.finance-rewrite-sample-line {
+  font-family: var(--font-monospace);
+  font-size: 0.82em;
+  padding: 4px 8px;
+  border-radius: 4px;
+  border-left: 3px solid var(--background-modifier-border);
+  overflow-wrap: anywhere;
+}
+
+.finance-rewrite-sample-line.is-before {
+  color: var(--text-muted);
+  text-decoration: line-through;
+  text-decoration-color: var(--background-modifier-border);
+}
+
+.finance-rewrite-sample-line.is-after {
+  color: var(--text-normal);
+  border-left-color: var(--interactive-accent);
+  background: var(--background-secondary);
+}
