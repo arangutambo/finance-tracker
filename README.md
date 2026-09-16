@@ -1033,26 +1033,38 @@ Worth knowing before you install:
 ## Development
 
 ```bash
-npm test     # checks the core mirror, then runs node --test over tests/*.test.js
-npm run mirror   # regenerate main.js's core IIFE from finance-core.js
+npm test          # checks main.js is in sync with its sources, then runs node --test
+npm run build:main   # regenerate main.js from finance-core.js + src/
 ```
 
-Shared logic lives in **`finance-core.js`** — the single source of truth, and the
-only file the tests import. Obsidian loads `main.js` directly (no bundler), so
-that same logic also has to exist inside `main.js` as the `core` IIFE.
+`main.js` is the file Obsidian loads: one file, no bundler, committed and attested
+by the release workflow. **It is generated — do not edit it by hand.** Two sources
+feed it:
 
-**Do not edit the IIFE by hand.** Edit `finance-core.js`, then run
-`npm run mirror`. `scripts/mirror-core.js` derives the IIFE by a deterministic
-transform (drop `"use strict"`, indent by two, turn `module.exports = {` into
-`return {`), and `npm test` fails if the two have diverged. This used to be a
-convention maintained by hand, and by 0.6.0 it had quietly drifted in four
-places — including a default that differed between the tested code and the
-shipped code.
+- **`finance-core.js`** — the pure logic, and the only file the unit tests import.
+  It becomes the `core` IIFE at the top of `main.js`.
+- **`src/*.js`** — the plugin itself (settings, commands, views, modals, the
+  settings tab), concatenated in file-name order. Fragments are copied verbatim,
+  so each one is ordinary readable JavaScript.
 
-Tests are in two files:
+`scripts/build-main.js` performs both steps, and `npm test` fails if `main.js` has
+drifted from its sources. The core transform is deliberately dumb: drop the
+leading `"use strict"`, indent by two, turn `module.exports = {` into `return {`,
+and wrap it in the IIFE that replaces the `//@@CORE@@` placeholder in
+`src/00-header.js`.
+
+This started as a convention maintained by hand. By 0.6.0 it had quietly drifted
+in four places — including a default that differed between the tested code and
+the shipped code — so now a script owns it.
+
+Tests are in three files:
 
 - `tests/finance-core.test.js` — unit tests for individual core functions.
 - `tests/integrity.test.js` — invariants across the whole write→read cycle:
   everything written parses back unchanged, and the running total on a note's
   root line always equals the entries beneath it. These guard the paths where a
   bug silently corrupts a user's notes rather than just showing a wrong number.
+- `tests/capture-methods.test.js` — a functional harness that loads the real
+  `main.js` against a stubbed `obsidian` module and a stub vault, so plugin-side
+  wiring is actually executed. It catches the classic failure where a core
+  function lands but its caller never calls it.

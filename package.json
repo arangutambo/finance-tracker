@@ -14,9 +14,11 @@
     "apple-shortcuts"
   ],
   "scripts": {
-    "mirror": "node scripts/mirror-core.js --write",
-    "check:mirror": "node scripts/mirror-core.js --check",
-    "test": "npm run check:mirror && node --test tests/*.test.js",
-    "build": "npm run check:mirror && node -e \"['main.js','manifest.json','styles.css'].forEach(f=>require('fs').accessSync(f))\" && echo 'No bundler: main.js is authored directly (see README#Development). Verified release files are present.'"
+    "build:main": "node scripts/build-main.js --write",
+    "check:build": "node scripts/build-main.js --check",
+    "mirror": "npm run build:main",
+    "check:mirror": "npm run check:build",
+    "test": "npm run check:build && node --test tests/*.test.js",
+    "build": "npm run check:build && node -e \"['main.js','manifest.json','styles.css'].forEach(f=>require('fs').accessSync(f))\" && echo 'No bundler: main.js is generated from finance-core.js + src/ (see README#Development). Verified release files are present.'"
   }
 }
