@@ -91,6 +91,7 @@ class FinanceTrackerPlugin extends Plugin {
     });
 
     this.registerView(DAILY_BUDGET_VIEW, (leaf) => new DailyBudgetView(leaf, this));
+    this.registerView(FINANCE_INBOX_VIEW, (leaf) => new FinanceInboxView(leaf, this));
 
     this.addRibbonIcon("coins", "Daily budget", () => this.activateDailyBudgetView());
     this.addRibbonIcon("circle-plus", "Quick add transaction", () => new QuickAddTransactionModal(this.app, this).open());
@@ -104,6 +105,12 @@ class FinanceTrackerPlugin extends Plugin {
       id: "finance-tracker-open-daily-budget",
       name: "Open daily budget",
       callback: () => this.activateDailyBudgetView(),
+    });
+
+    this.addCommand({
+      id: "finance-tracker-open-inbox",
+      name: "Open categorisation inbox",
+      callback: () => this.activateInboxView(),
     });
 
     this.addCommand({
@@ -273,6 +280,23 @@ class FinanceTrackerPlugin extends Plugin {
       console.warn("[finance-tracker] initial gist sync failed", error)
     );
     this.scheduleGistSync();
+  }
+
+  refreshInboxView() {
+    for (const leaf of this.app.workspace.getLeavesOfType(FINANCE_INBOX_VIEW)) {
+      if (typeof leaf.view?.refresh === "function") leaf.view.refresh();
+    }
+  }
+
+  async activateInboxView() {
+    const existing = this.app.workspace.getLeavesOfType(FINANCE_INBOX_VIEW);
+    if (existing.length) {
+      this.app.workspace.revealLeaf(existing[0]);
+      return;
+    }
+    const leaf = this.app.workspace.getLeaf(true);
+    await leaf.setViewState({ type: FINANCE_INBOX_VIEW, active: true });
+    this.app.workspace.revealLeaf(leaf);
   }
 
   async activateDailyBudgetView() {
@@ -1033,7 +1057,7 @@ class FinanceTrackerPlugin extends Plugin {
       originalCurrency: entry.originalCurrency,
       originalRateKey: entry.originalRateKey,
     };
-    const next = core.replaceTransactionBlock(content, entry.rawLine, newExpense, this.settings);
+    const next = core.replaceTransactionBlock(content, entry.rawLine, newExpense, this.settings, { lineIndex: entry.lineIndex });
     if (next == null) throw new Error("Could not locate that entry (the note may have changed).");
     await _ftModify(this.app,file, next);
     this.invalidateIndexEntry(file.path);
@@ -1041,11 +1065,73 @@ class FinanceTrackerPlugin extends Plugin {
     this.refreshDailyBudgetView();
   }
 
+  // One place that opens the edit modal, so every caller gets the same options
+  // and a test can hold on to the instance.
+  openEditTransaction(entry, options = {}) {
+    const modal = new EditTransactionModal(this.app, this, entry, options);
+    modal.open();
+    return modal;
+  }
+
+  // Moving an entry to another day means moving the bullet: it is removed from
+  // one note and inserted into the other, and both running totals are rewritten
+  // from what is left. The date on a capture is wrong often enough — a late-night
+  // tap landing on tomorrow, a backfill typed into the wrong note — that editing
+  // it by hand across two files was the most common reason to give up and leave
+  // it wrong.
+  async moveTransactionEntry(entry, newDate, patch = {}) {
+    const date = core.parseIsoDate(newDate);
+    if (!date) throw new Error("That date could not be read.");
+    const sourceFile = this.app.vault.getAbstractFileByPath(entry.filePath);
+    if (!(sourceFile instanceof TFile)) throw new Error("Could not find the note this entry is in.");
+
+    const sourceContent = await this.app.vault.cachedRead(sourceFile);
+    const without = core.removeTransactionBlock(sourceContent, entry.rawLine, this.settings, { lineIndex: entry.lineIndex });
+    if (without == null) throw new Error("Could not locate that entry (the note may have changed).");
+
+    const targetPath = this.getDailyNotePath(date);
+    const existing = this.app.vault.getAbstractFileByPath(targetPath);
+    const targetFile = existing instanceof TFile ? existing : await this.createDailyNoteFromTemplate(targetPath, date);
+    const expense = { ...entry, ...patch, date };
+
+    if (targetFile.path === sourceFile.path) {
+      // Same note after all (two date formats can land on one file): insert into
+      // the content the entry was just removed from, and write once.
+      await _ftModify(this.app, sourceFile, core.insertTransactionIntoDailyNote(without, expense, this.settings));
+    } else {
+      const targetContent = await this.app.vault.cachedRead(targetFile);
+      await _ftModify(this.app, targetFile, core.insertTransactionIntoDailyNote(targetContent, expense, this.settings));
+      await _ftModify(this.app, sourceFile, without);
+      this.invalidateIndexEntry(targetFile.path);
+    }
+
+    this.invalidateIndexEntry(sourceFile.path);
+    this._scheduleStatusBarUpdate();
+    this.refreshDailyBudgetView();
+    this.refreshInboxView();
+    return targetFile;
+  }
+
+  // Other uncategorised entries from the same shop, so one correction can settle
+  // them all without opening the inbox.
+  async findSiblingUncategorised(entry) {
+    const root = core.merchantRootKey(entry?.merchant || "");
+    if (!root) return [];
+    const entries = await this.collectAllTransactions();
+    return entries.filter(
+      (other) =>
+        core.isSpendingEntry(other) &&
+        (!other.category || other.category === "uncategorized") &&
+        !(other.filePath === entry.filePath && other.lineIndex === entry.lineIndex) &&
+        core.merchantRootKey(other.merchant || "") === root
+    );
+  }
+
   async deleteTransactionEntry(entry) {
     const file = this.app.vault.getAbstractFileByPath(entry.filePath);
     if (!(file instanceof TFile)) throw new Error("Could not find the note for this entry.");
     const content = await this.app.vault.cachedRead(file);
-    const next = core.removeTransactionBlock(content, entry.rawLine, this.settings);
+    const next = core.removeTransactionBlock(content, entry.rawLine, this.settings, { lineIndex: entry.lineIndex });
     if (next == null) throw new Error("Could not locate that entry in the note.");
     await _ftModify(this.app,file, next);
     this.invalidateIndexEntry(file.path);
@@ -4569,16 +4655,32 @@ class FinanceTrackerPlugin extends Plugin {
       }
     }
 
-    // Triage: period entries still needing a category (tap to fix).
-    const needsCategory = spendEntries.filter((entry) => !entry.category || entry.category === "uncategorized");
-    if (needsCategory.length) {
+    // Triage. The count is the whole backlog, not just this period: an entry
+    // from three weeks ago needs a category exactly as much as today's does, and
+    // a list capped at the current fortnight hid 20 of the author's 24.
+    const inboxGroups = await this.buildCategorisationInbox();
+    const backlog = inboxGroups.reduce((sum, group) => sum + group.count, 0);
+    if (backlog) {
       const triage = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-tracker-triage" });
-      triage.createEl("h4", { text: `Needs a category (${needsCategory.length})` });
-      for (const entry of needsCategory.slice(0, 12)) {
+      triage.createEl("h4", { text: `Needs a category (${backlog})` });
+      const thisPeriod = spendEntries.filter((entry) => !entry.category || entry.category === "uncategorized");
+      for (const entry of thisPeriod.slice(0, 6)) {
         const row = triage.createDiv({ cls: "finance-tracker-budget-card is-clickable is-uncategorized" });
         renderRowTitle(row, entry.merchant || entry.date || "Untitled", core.formatCurrency(entry.amount, currency));
-        row.addEventListener("click", () => new EditTransactionModal(this.app, this, entry).open());
+        row.addEventListener("click", () => this.openEditTransaction(entry));
       }
+      if (backlog > thisPeriod.length) {
+        triage.createDiv({
+          cls: "finance-tracker-budget-meta",
+          text: `${backlog - thisPeriod.length} more from earlier, across ${inboxGroups.length} merchant${inboxGroups.length === 1 ? "" : "s"}.`,
+        });
+      }
+      addAction(
+        triage.createDiv({ cls: "finance-tracker-header-actions" }),
+        "Open inbox",
+        () => this.activateInboxView(),
+        { primary: true, opensModal: true, errorPrefix: "Opening the inbox" }
+      );
     }
 
   }
@@ -4591,6 +4693,188 @@ class FinanceTrackerPlugin extends Plugin {
   //
   // Callers treat the result as read-only: collectTransactionsForRange builds a
   // fresh array each time, and nothing sorts or pushes into what it returns.
+  // One card per merchant, not one row per entry: the decision is "what is this
+  // shop", and answering it once should settle every capture from it — the ones
+  // already logged and the ones still to come.
+  async renderCategorisationInboxInto(el, options = {}) {
+    el.empty();
+    const currency = core.normalizeCurrency(this.settings.defaultCurrency);
+    const wrapper = el.createDiv({ cls: "finance-tracker-dashboard finance-inbox" });
+    const header = wrapper.createDiv({ cls: "finance-tracker-header" });
+    header.createEl("h3", { text: options.title || "Categorisation inbox" });
+    const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
+    const rerender = () => this.renderCategorisationInboxInto(el, options);
+    addAction(headerActions, "Refresh", () => rerender(), { errorPrefix: "Refreshing the inbox" });
+
+    const groups = await this.buildCategorisationInbox();
+    const known = await this.collectKnownSuggestions();
+    const failed = this.failedCaptureFiles();
+    const entryCount = groups.reduce((sum, group) => sum + group.count, 0);
+    const suggested = groups.filter((group) => group.suggestion.category);
+
+    if (!groups.length && !failed.length) {
+      wrapper.createDiv({
+        cls: "finance-tracker-empty",
+        text: "Nothing waiting — everything logged has a category.",
+      });
+      return;
+    }
+
+    renderStatCards(wrapper, [
+      { label: "Entries", value: String(entryCount) },
+      { label: "Merchants", value: String(groups.length) },
+      {
+        label: "Suggested",
+        value: String(suggested.length),
+        hint: suggested.length ? "one tap each" : "",
+      },
+      ...(failed.length ? [{ label: "Failed captures", value: String(failed.length), cls: "is-over" }] : []),
+    ]);
+
+    if (groups.length) {
+      const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
+      section.createEl("h4", { text: "Needs a category" });
+      for (const group of groups) {
+        this.renderInboxGroup(section, group, { currency, known, rerender });
+      }
+    }
+
+    if (failed.length) await this.renderFailedCaptures(wrapper, failed, rerender);
+  }
+
+  renderInboxGroup(host, group, context) {
+    const { currency, known, rerender } = context;
+    const card = host.createDiv({ cls: "finance-tracker-budget-card finance-inbox-group" });
+    renderRowTitle(card, group.label, core.formatCurrency(group.total, currency));
+
+    const dates = group.firstDate === group.lastDate ? group.firstDate : `${group.firstDate} to ${group.lastDate}`;
+    card.createDiv({
+      cls: "finance-tracker-budget-meta",
+      text: `${group.count} entr${group.count === 1 ? "y" : "ies"} · ${dates}`,
+    });
+    // The variants are worth showing: they are why these did not group before.
+    if (group.merchants.length > 1) {
+      card.createDiv({ cls: "finance-tracker-budget-meta", text: `as written: ${group.merchants.join(" · ")}` });
+    }
+
+    const remember = { value: !group.conflicted };
+    const apply = async (category) => {
+      const updated = await this.applyCategoryToEntries(group.entries, category, {
+        remember: remember.value,
+        merchant: group.merchant,
+      });
+      new Notice(`Filed ${updated} entr${updated === 1 ? "y" : "ies"} as ${core.displayCategoryPath(category)}.`);
+      await rerender();
+    };
+
+    if (group.suggestion.category) {
+      const reason = this.describeSuggestionSource(group.suggestion.source);
+      card.createDiv({
+        cls: "finance-tracker-budget-meta is-suggestion",
+        text: `Suggested: ${core.displayCategoryPath(group.suggestion.category)}${reason ? ` — ${reason}` : ""}`,
+      });
+    }
+
+    const actions = card.createDiv({ cls: "finance-tracker-header-actions" });
+    if (group.suggestion.category) {
+      addAction(
+        actions,
+        `File ${group.count} as ${core.displayCategoryPath(group.suggestion.category)}`,
+        () => apply(group.suggestion.category),
+        { primary: true, errorPrefix: "Filing" }
+      );
+    }
+
+    const pickerHost = card.createDiv({ cls: "finance-inbox-picker is-hidden" });
+    let picker = null;
+    addAction(
+      actions,
+      group.suggestion.category ? "Choose another" : "Choose a category",
+      () => {
+        pickerHost.toggleClass("is-hidden", !pickerHost.hasClass("is-hidden"));
+        if (picker) return;
+        picker = new CategoryPicker(pickerHost, {
+          categories: known.categories,
+          value: group.suggestion.category,
+        });
+        const pickerActions = pickerHost.createDiv({ cls: "finance-tracker-header-actions" });
+        addAction(pickerActions, `File ${group.count}`, () => apply(picker.getValue()), {
+          primary: true,
+          errorPrefix: "Filing",
+        });
+      },
+      { opensModal: true }
+    );
+
+    addToggleAction(
+      card,
+      group.conflicted ? "Remember (this shop has been filed two ways)" : "Remember this merchant",
+      remember.value,
+      (checked) => {
+        remember.value = checked;
+      }
+    );
+
+    const details = card.createEl("details", { cls: "finance-inbox-entries" });
+    details.createEl("summary", { text: `Show ${group.count} entr${group.count === 1 ? "y" : "ies"}` });
+    const sorted = group.entries.slice().sort((left, right) => String(right.date).localeCompare(String(left.date)));
+    for (const entry of sorted) {
+      const row = details.createDiv({ cls: "finance-tracker-budget-meta is-clickable" });
+      row.setText(`${entry.date} · ${core.formatCurrency(entry.amount, currency)} · ${entry.merchant || "(no merchant)"}`);
+      row.addEventListener("click", () => this.openEditTransaction(entry));
+    }
+  }
+
+  // Captures that never became entries. They used to be invisible: a notice at
+  // the time, then a file in a folder nobody opens.
+  async renderFailedCaptures(wrapper, files, rerender) {
+    const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
+    section.createEl("h4", { text: `Captures that failed (${files.length})` });
+    section.createDiv({
+      cls: "finance-tracker-budget-meta",
+      text: "These never became entries. Fix whatever sent them, then retry — or dismiss one for good.",
+    });
+
+    for (const file of files) {
+      const { reason, body } = await this.readFailedCapture(file);
+      const card = section.createDiv({ cls: "finance-tracker-budget-card" });
+      card.createDiv({ cls: "finance-tracker-budget-title", text: body || file.name });
+      card.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: [reason || "No reason recorded", file.name].join(" · "),
+      });
+      const actions = card.createDiv({ cls: "finance-tracker-header-actions" });
+      addAction(
+        actions,
+        "Retry",
+        async () => {
+          const result = await this.retryFailedCapture(file);
+          new Notice(result.logged ? "Logged." : `Still failing: ${result.reason}`);
+          await rerender();
+        },
+        { primary: true, errorPrefix: "Retrying" }
+      );
+      let armed = false;
+      const dismiss = addAction(
+        actions,
+        "Dismiss",
+        async () => {
+          // Deleting is final, so the button asks once rather than relying on a
+          // modal nobody reads.
+          if (!armed) {
+            armed = true;
+            dismiss.setText("Delete this capture?");
+            dismiss.disabled = false;
+            return;
+          }
+          await this.app.vault.delete(file);
+          await rerender();
+        },
+        { warning: true, errorPrefix: "Dismissing" }
+      );
+    }
+  }
+
   async collectAllTransactions() {
     if (this._allTransactions) return this._allTransactions;
     const entries = await this.collectTransactionsForRange({ period: "all", start: "1900-01-01", end: "2999-12-31" });
@@ -4650,6 +4934,138 @@ class FinanceTrackerPlugin extends Plugin {
     this.invalidateIndexEntry(file.path);
     this._scheduleStatusBarUpdate();
     return file;
+  }
+
+  // --- Categorisation inbox -----------------------------------------------------
+
+  // Everything still uncategorised, grouped by merchant root and carrying a
+  // suggestion. Grouping is the point: twelve rows of "SQ * Rode Fresh" are one
+  // decision, and the sidebar's date-limited list could never show them anyway.
+  async buildCategorisationInbox() {
+    const entries = (await this.collectAllTransactions()).filter(
+      (entry) => core.isSpendingEntry(entry) && (!entry.category || entry.category === "uncategorized")
+    );
+    const sources = await this.merchantSuggestionSources();
+    const conflicts = this.merchantRootConflicts(sources.history);
+
+    return core.groupEntriesByMerchantRoot(entries).map((group) => {
+      // The most recent spelling is the one to ask about.
+      const latest = group.entries.reduce(
+        (newest, entry) => (String(entry.date || "") >= String(newest.date || "") ? entry : newest),
+        group.entries[0] || {}
+      );
+      const merchant = latest.merchant || group.merchants[0] || "";
+      return {
+        ...group,
+        merchant,
+        suggestion: core.suggestCategoryForMerchant(merchant, sources),
+        // Where the same shop has been filed two different ways, remembering a
+        // rule would overrule a distinction you drew on purpose.
+        conflicted: (conflicts.get(group.key)?.size || 0) > 1,
+      };
+    });
+  }
+
+  // Has this shop been filed more than one way? Used for the "remember" default:
+  // where you have drawn a distinction on purpose (Bagel Boys as breakfast and
+  // as lunch), a rule would quietly overrule it.
+  async merchantHasConflictingHistory(merchant) {
+    const root = core.merchantRootKey(merchant || "");
+    if (!root) return false;
+    const sources = await this.merchantSuggestionSources();
+    return (this.merchantRootConflicts(sources.history).get(root)?.size || 0) > 1;
+  }
+
+  merchantRootConflicts(history) {
+    const byRoot = new Map();
+    for (const [key, info] of history || []) {
+      const root = core.merchantRootKey(info?.name || key);
+      if (!root) continue;
+      const seen = byRoot.get(root) || new Set();
+      seen.add(info?.category || "");
+      byRoot.set(root, seen);
+    }
+    return byRoot;
+  }
+
+  // Writes one category across a set of entries, note by note. Entries are found
+  // by their exact raw line, so an edit elsewhere in the note cannot shift them,
+  // and each note is written once however many of its lines changed.
+  async applyCategoryToEntries(entries, category, options = {}) {
+    const cleanCategory = core.normalizeCategoryPath(category);
+    if (!cleanCategory) throw new Error("Pick a category first.");
+
+    const byFile = new Map();
+    for (const entry of entries || []) {
+      const list = byFile.get(entry.filePath) || [];
+      list.push(entry);
+      byFile.set(entry.filePath, list);
+    }
+
+    let updated = 0;
+    for (const [path, list] of byFile) {
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (!(file instanceof TFile)) continue;
+      let content = await this.app.vault.cachedRead(file);
+      // Bottom-up, so replacing one entry cannot shift the line another is at.
+      const ordered = list.slice().sort((left, right) => (right.lineIndex ?? -1) - (left.lineIndex ?? -1));
+      for (const entry of ordered) {
+        const next = core.replaceTransactionBlock(
+          content,
+          entry.rawLine,
+          { ...entry, category: cleanCategory },
+          this.settings,
+          { lineIndex: entry.lineIndex }
+        );
+        if (next == null) continue;
+        content = next;
+        updated += 1;
+      }
+      await _ftModify(this.app, file, content);
+      this.invalidateIndexEntry(path);
+    }
+
+    if (options.remember && options.merchant) {
+      await this.rememberMerchantCategory(options.merchant, cleanCategory);
+    }
+    this._scheduleStatusBarUpdate();
+    this.refreshDailyBudgetView();
+    this.refreshInboxView();
+    return updated;
+  }
+
+  // --- Failed captures ------------------------------------------------------------
+
+  failedCaptureFiles() {
+    const folder = normalizePath(`${this.settings.captureInboxFolder || ""}/_failed`);
+    if (!folder) return [];
+    const prefix = `${folder}/`;
+    return this.app.vault.getFiles().filter((file) => file.path.startsWith(prefix));
+  }
+
+  async readFailedCapture(file) {
+    const raw = await this.app.vault.cachedRead(file);
+    const lines = String(raw).split("\n");
+    const reason = (lines[0].match(/finance-capture error:\s*(.*?)\s*-->/) || [])[1] || "";
+    return { file, reason, body: lines.slice(1).join("\n").trim() };
+  }
+
+  // Retries a quarantined capture without re-quarantining it: a line that still
+  // will not parse stays exactly where it is, with its original reason.
+  async retryFailedCapture(file) {
+    const { body } = await this.readFailedCapture(file);
+    const params = core.parseInboxLine(body);
+    if (!params) return { logged: 0, reason: "Still nothing to parse in this line." };
+    try {
+      const expense = this.parseCaptureParams(params);
+      const result = await this.handleCaptureExpense(expense, { notify: false, method: "inbox" });
+      if (result.skipped) return { logged: 0, reason: this.describeSkippedCapture(result) };
+      await this.app.vault.delete(file);
+      this.refreshInboxView();
+      return { logged: 1, reason: "" };
+    } catch (error) {
+      return { logged: 0, reason: error?.message || String(error) };
+    }
   }
 
   // --- Recurring payments -----------------------------------------------------

@@ -9,6 +9,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const Module = require("node:module");
 const path = require("node:path");
+const { StubEl } = require("./stub-dom.js");
 
 // --- Obsidian stub ------------------------------------------------------------
 
@@ -30,6 +31,17 @@ const obsidianStub = {
   Modal: class {
     constructor(app) {
       this.app = app;
+      this.contentEl = new StubEl();
+      this.ready = null;
+      this.closed = false;
+    }
+    open() {
+      this.ready = Promise.resolve(this.onOpen?.());
+      return this.ready;
+    }
+    close() {
+      this.closed = true;
+      this.onClose?.();
     }
   },
   Notice: class {
@@ -693,4 +705,190 @@ test("a suggestion says where it came from", async () => {
     source: "history-root",
   });
   assert.equal(plugin.describeSuggestionSource("history-root"), "how you filed it last time");
+});
+
+// --- Categorisation inbox -----------------------------------------------------------
+
+async function inboxWithBacklog(overrides = {}) {
+  const made = makePlugin(overrides);
+  delete made.plugin.invalidateIndexEntry;
+  // Three captures from one shop, spelled three ways, across two notes.
+  await made.app.vault.create(
+    "Daily/2026-08-15.md",
+    "## Finance\n- [ ] #log/spending 11.5\n\t- $11.50 #log/spending/uncategorized\n\t\t- SQ * Rode Fresh\n"
+  );
+  await made.app.vault.create(
+    "Daily/2026-09-12.md",
+    [
+      "## Finance",
+      "- [ ] #log/spending 33.72",
+      "\t- $10.00 #log/spending/uncategorized",
+      "\t\t- SQ * Rode Fresh",
+      "\t- $10.00 #log/spending/uncategorized",
+      "\t\t- Rode Fresh",
+      "\t- $13.72 #log/spending/uncategorized",
+      "\t\t- Mebami",
+      "",
+    ].join("\n")
+  );
+  return made;
+}
+
+test("the inbox groups a shop's spellings into one decision", async () => {
+  const { plugin } = await inboxWithBacklog();
+
+  const groups = await plugin.buildCategorisationInbox();
+
+  assert.equal(groups.length, 2);
+  assert.equal(groups[0].key, "rodefresh");
+  assert.equal(groups[0].count, 3, "three captures, one decision");
+  assert.equal(groups[0].total, 31.5);
+  assert.equal(groups[0].label, "Rode Fresh");
+  assert.equal(groups[0].merchants.length, 2);
+  assert.equal(groups[1].label, "Mebami");
+});
+
+test("filing a group categorises every entry in it and remembers the merchant", async () => {
+  const { plugin, files } = await inboxWithBacklog();
+  const [group] = await plugin.buildCategorisationInbox();
+
+  const updated = await plugin.applyCategoryToEntries(group.entries, "food/takeaway", {
+    remember: true,
+    merchant: group.merchant,
+  });
+
+  assert.equal(updated, 3);
+  assert.ok(!files.get("Daily/2026-08-15.md").content.includes("uncategorized"));
+  const september = files.get("Daily/2026-09-12.md").content;
+  assert.equal((september.match(/#log\/spending\/food\/takeaway/g) || []).length, 2);
+  assert.ok(september.includes("#log/spending/uncategorized"), "the unrelated shop is untouched");
+  // Totals are rewritten from the entries, so they cannot drift.
+  assert.ok(september.includes("- [ ] #log/spending 33.72"), september);
+  assert.equal(plugin.settings.merchantMap.rodefresh, "food/takeaway");
+
+  // And the next capture from that shop files itself.
+  await plugin.handleCapture({ amount: "9.00", merchant: "SQ * Rode Fresh Pty Ltd", date: "2026-09-15", source: "anz" });
+  assert.match(financeLines(files, "2026-09-15")[0], /food\/takeaway/);
+});
+
+test("the inbox renders its groups, suggestions and actions", async () => {
+  const { plugin, files } = await inboxWithBacklog();
+  // A rule, so one group arrives with a suggestion.
+  plugin.settings.merchantMap = { mebami: "food/takeaway/lunch" };
+  plugin._merchantSources = null;
+
+  const el = new StubEl();
+  await plugin.renderCategorisationInboxInto(el);
+
+  const text = el.allText();
+  assert.match(text, /Categorisation inbox/);
+  assert.match(text, /Rode Fresh/);
+  assert.match(text, /3 entries · 2026-08-15 to 2026-09-12/);
+  assert.match(text, /as written: SQ \* Rode Fresh · Rode Fresh/);
+  assert.match(text, /Suggested: Food \/ Takeaway \/ Lunch — from a merchant rule/);
+
+  // The suggested group can be filed in one click.
+  await el.click("File 1 as Food / Takeaway / Lunch");
+  assert.match(files.get("Daily/2026-09-12.md").content, /#log\/spending\/food\/takeaway\/lunch/);
+});
+
+test("a failed capture can be retried from the inbox", async () => {
+  const { plugin, app, files } = makePlugin();
+  delete plugin.invalidateIndexEntry;
+  await app.vault.create(
+    "Utility/Finance/Inbox/_failed/2026-08-27.txt",
+    "<!-- finance-capture error: Could not parse a transaction from this line -->\namount=| merchant=| date= 2026-08-27| source=anz"
+  );
+
+  const el = new StubEl();
+  await plugin.renderCategorisationInboxInto(el);
+  assert.match(el.allText(), /Captures that failed \(1\)/);
+  assert.match(el.allText(), /Could not parse a transaction/);
+
+  // Retrying a line that still cannot parse leaves it exactly where it is.
+  await el.click("Retry");
+  assert.ok(files.has("Utility/Finance/Inbox/_failed/2026-08-27.txt"));
+  assert.match(notices.join(" "), /Still failing/);
+
+  // One that can parse is logged and the quarantine file goes away.
+  files.get("Utility/Finance/Inbox/_failed/2026-08-27.txt").content =
+    "<!-- finance-capture error: whatever -->\namount=12.50 | merchant=Coles | date=2026-08-27 | source=anz";
+  const retried = new StubEl();
+  await plugin.renderCategorisationInboxInto(retried);
+  await retried.click("Retry");
+  assert.ok(!files.has("Utility/Finance/Inbox/_failed/2026-08-27.txt"));
+  assert.equal(financeLines(files, "2026-08-27").length, 1);
+});
+
+// --- Editing one entry ---------------------------------------------------------------
+
+test("moving an entry to another day moves the bullet and fixes both totals", async () => {
+  const { plugin, app, files } = makePlugin();
+  delete plugin.invalidateIndexEntry;
+  await app.vault.create(
+    "Daily/2026-09-14.md",
+    "## Finance\n- [ ] #log/spending 40.72\n\t- $27.00 #log/spending/food/takeaway\n\t\t- Riser\n\t- $13.72 #log/spending/food/snacks\n\t\t- Mebami\n"
+  );
+  await app.vault.create("Daily/2026-09-13.md", "## Finance\n- [ ] #log/spending 0\n");
+
+  const entry = (await plugin.collectAllTransactions()).find((item) => item.merchant === "Riser");
+  await plugin.moveTransactionEntry(entry, "2026-09-13");
+
+  const from = files.get("Daily/2026-09-14.md").content;
+  const to = files.get("Daily/2026-09-13.md").content;
+  assert.ok(!from.includes("Riser"), "the bullet leaves the old note");
+  assert.ok(from.includes("- [ ] #log/spending 13.72"), from);
+  assert.ok(to.includes("$27.00 #log/spending/food/takeaway"), to);
+  assert.ok(to.includes("\t\t- Riser"), "the merchant line travels with it");
+  assert.ok(to.includes("- [ ] #log/spending 27"), to);
+});
+
+test("the edit modal files the entry, its siblings and the rule in one save", async () => {
+  const { plugin, files } = await inboxWithBacklog();
+  const entry = (await plugin.collectAllTransactions()).find((item) => item.merchant === "SQ * Rode Fresh" && item.date === "2026-09-12");
+
+  const modal = plugin.openEditTransaction(entry);
+  await modal.ready;
+
+  const text = modal.contentEl.allText();
+  assert.match(text, /Apply to 2 other uncategorised entries from this merchant/);
+  assert.match(text, /Remember this merchant/);
+
+  // Choose a category the way a person would, then save.
+  const categoryInput = modal.contentEl.find((node) => node.tag === "input" && node.attrs["aria-label"] === "Category");
+  categoryInput.value = "food/takeaway";
+  await modal.contentEl.click("Save");
+
+  assert.equal(modal.closed, true);
+  const september = files.get("Daily/2026-09-12.md").content;
+  assert.equal((september.match(/#log\/spending\/food\/takeaway/g) || []).length, 2, september);
+  assert.match(files.get("Daily/2026-08-15.md").content, /#log\/spending\/food\/takeaway/);
+  assert.equal(plugin.settings.merchantMap.rodefresh, "food/takeaway");
+});
+
+test("the remember box is unticked when a shop has been filed two ways", async () => {
+  const { plugin, app } = makePlugin();
+  delete plugin.invalidateIndexEntry;
+  await app.vault.create(
+    "Daily/2026-08-17.md",
+    [
+      "## Finance",
+      "- [ ] #log/spending 10.47",
+      "\t- $4.98 #log/spending/food/takeaway/lunch",
+      "\t\t- Bagel Boys",
+      "\t- $5.49 #log/spending/food/takeaway/breakfast",
+      "\t\t- The Bagel Boys",
+      "\t- $0.00 #log/spending/uncategorized",
+      "\t\t- Bagel Boys",
+      "",
+    ].join("\n")
+  );
+
+  assert.equal(await plugin.merchantHasConflictingHistory("Bagel Boys"), true);
+  assert.equal(await plugin.merchantHasConflictingHistory("Mebami"), false);
+
+  const entry = (await plugin.collectAllTransactions()).find((item) => item.category === "uncategorized");
+  const modal = plugin.openEditTransaction(entry);
+  await modal.ready;
+  assert.match(modal.contentEl.allText(), /you have filed it more than one way/);
 });

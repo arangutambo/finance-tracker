@@ -2160,3 +2160,45 @@ test("groupEntriesByMerchantRoot turns repeat captures into one decision", () =>
   assert.equal(groups.filter((group) => group.label === "(no merchant)").length, 1);
   assert.equal(groups.length, 3);
 });
+
+test("two entries sharing a line are edited independently", () => {
+  // Same amount, same category, different merchant: the entry line is identical,
+  // so only the position tells them apart.
+  const note = [
+    "## Finance",
+    "- [ ] #log/spending 20",
+    "\t- $10.00 #log/spending/uncategorized",
+    "\t\t- SQ * Rode Fresh",
+    "\t- $10.00 #log/spending/uncategorized",
+    "\t\t- Rode Fresh",
+    "",
+  ].join("\n");
+  const entries = core.parseTransactionsFromNoteContent(note, "2026-09-12.md", {});
+  assert.equal(entries.length, 2);
+  assert.equal(entries[0].lineIndex, 2);
+  assert.equal(entries[1].lineIndex, 4);
+
+  const second = entries[1];
+  const next = core.replaceTransactionBlock(
+    note,
+    second.rawLine,
+    { ...second, category: "food/takeaway" },
+    {},
+    { lineIndex: second.lineIndex }
+  );
+  const after = core.parseTransactionsFromNoteContent(next, "2026-09-12.md", {});
+
+  assert.equal(after[0].category, "uncategorized", "the first entry is untouched");
+  assert.equal(after[0].merchant, "SQ * Rode Fresh");
+  assert.equal(after[1].category, "food/takeaway");
+  assert.equal(after[1].merchant, "Rode Fresh", "its own merchant line stays with it");
+});
+
+test("an entry whose note moved on falls back to matching by text", () => {
+  const note = ["## Finance", "- [ ] #log/spending 10", "", "\t- $10.00 #log/spending/food/snacks", "\t\t- Mebami", ""].join("\n");
+  const [entry] = core.parseTransactionsFromNoteContent(note, "2026-09-14.md", {});
+  // A line was added above since parsing, so the recorded index is stale.
+  const shifted = note.replace("## Finance", "## Finance\n\t- $2.00 #log/spending/food/snacks");
+  const next = core.removeTransactionBlock(shifted, entry.rawLine, {}, { lineIndex: entry.lineIndex });
+  assert.ok(next != null && !next.includes("Mebami"), next);
+});

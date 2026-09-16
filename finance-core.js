@@ -572,7 +572,7 @@ function extractPlannedLineDates(line = "") {
   };
 }
 
-function parseTransactionLine(line, noteDate, filePath, options = {}, childLines = []) {
+function parseTransactionLine(line, noteDate, filePath, options = {}, childLines = [], lineIndex = -1) {
   const text = String(line || "");
   if (!text.trimStart().startsWith("-")) return null;
   if (/^\s*-\s*\[[^\]]\]\s*#log\/spending\b/i.test(text)) return null;
@@ -611,6 +611,10 @@ function parseTransactionLine(line, noteDate, filePath, options = {}, childLines
 
   const roundedAmount = Number(Number(amount).toFixed(2));
   return {
+    // Where this entry sits in its note. Two entries can share a line — same
+    // amount, same category, different merchant on the child line — so the text
+    // alone cannot say which one an edit meant.
+    lineIndex,
     accountKey: financeContext.accountKey || "",
     amount: roundedAmount,
     card: "",
@@ -718,7 +722,7 @@ function parseTransactionsFromNoteContent(content, filePath, options = {}) {
       break;
     }
 
-    const parsed = parseTransactionLine(line, noteDate, filePath, options, childLines);
+    const parsed = parseTransactionLine(line, noteDate, filePath, options, childLines, index);
     if (parsed) {
       transactions.push(parsed);
     }
@@ -1965,10 +1969,20 @@ function computeBudgetPace(input = {}) {
 // Replaces a single logged transaction (its entry line plus any merchant/note
 // child lines) with a freshly built block from `newExpense`, then recomputes the
 // section total. Returns null if the original line is not found.
-function replaceTransactionBlock(content, oldRawLine, newExpense, settings = {}) {
+// Finds the line an edit refers to. The raw text is the identifier, but where
+// two entries share it, a recorded line index says which one — verified against
+// the text, so a note edited since the entry was parsed falls back to the search
+// rather than writing to the wrong place.
+function findTransactionLineIndex(lines, target, options = {}) {
+  const index = options.lineIndex;
+  if (Number.isInteger(index) && index >= 0 && index < lines.length && lines[index] === target) return index;
+  return lines.findIndex((line) => line === target);
+}
+
+function replaceTransactionBlock(content, oldRawLine, newExpense, settings = {}, options = {}) {
   const lines = splitLines(content);
   const target = String(oldRawLine);
-  const index = lines.findIndex((line) => line === target);
+  const index = findTransactionLineIndex(lines, target, options);
   if (index < 0) return null;
 
   const indent = (target.match(/^\s*/) || [""])[0].length;
@@ -1992,10 +2006,10 @@ function replaceTransactionBlock(content, oldRawLine, newExpense, settings = {})
 
 // Removes a logged transaction (entry line + child lines) and recomputes the
 // section total. Returns null if the original line is not found.
-function removeTransactionBlock(content, oldRawLine, settings = {}) {
+function removeTransactionBlock(content, oldRawLine, settings = {}, options = {}) {
   const lines = splitLines(content);
   const target = String(oldRawLine);
-  const index = lines.findIndex((line) => line === target);
+  const index = findTransactionLineIndex(lines, target, options);
   if (index < 0) return null;
 
   const indent = (target.match(/^\s*/) || [""])[0].length;
@@ -3842,6 +3856,7 @@ module.exports = {
   buildLegacyTripTagTransform,
   summarizeLegacyTripTags,
   findFinanceHeadingIndex,
+  findTransactionLineIndex,
   computeBudgetPace,
   replaceTransactionBlock,
   removeTransactionBlock,

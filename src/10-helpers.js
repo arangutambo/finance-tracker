@@ -121,6 +121,7 @@ const QUERY_BLOCK = "finance-query";
 const GOALS_BLOCK = "finance-goals";
 const RUNWAY_BLOCK = "finance-runway";
 const DAILY_BUDGET_VIEW = "finance-tracker-daily";
+const FINANCE_INBOX_VIEW = "finance-tracker-inbox";
 // Cadence display names live in core.RECURRING_CADENCES alongside the maths;
 // this reads them from there rather than keeping a second copy in sync.
 function cadenceLabel(cadence) {

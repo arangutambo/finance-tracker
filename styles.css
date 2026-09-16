@@ -1554,3 +1554,79 @@
   border-left-color: var(--interactive-accent);
   background: var(--background-secondary);
 }
+
+/* ---- Shared autocomplete ---- */
+.finance-suggest-host { position: relative; }
+
+.finance-suggest-popup {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 100%;
+  z-index: 30;
+  max-height: 240px;
+  overflow-y: auto;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+}
+
+.finance-suggest-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+
+.finance-suggest-item.is-highlighted { background: var(--background-modifier-hover); }
+.finance-suggest-kind {
+  font-size: 0.72em;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+}
+.finance-suggest-hint { color: var(--text-muted); font-size: 0.85em; }
+
+/* ---- Category picker ---- */
+.finance-category-picker { margin: 8px 0; }
+.finance-category-picker-input input { width: 100%; }
+
+.finance-category-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.finance-category-chip {
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  font-size: 0.85em;
+  cursor: pointer;
+}
+
+.finance-category-chip.is-active {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  border-color: var(--interactive-accent);
+}
+
+.finance-category-chip.is-sub { font-size: 0.8em; }
+
+/* ---- Categorisation inbox ---- */
+.finance-inbox-group { margin-bottom: 14px; }
+.finance-inbox-group .is-suggestion { color: var(--text-accent); }
+.finance-inbox-picker { margin-top: 8px; }
+.finance-inbox-picker.is-hidden { display: none; }
+.finance-inbox-entries { margin-top: 8px; }
+.finance-inbox-entries summary { cursor: pointer; font-size: 0.85em; color: var(--text-muted); }
+.finance-inbox-entries .is-clickable { cursor: pointer; padding: 2px 0; }
+.finance-inbox-entries .is-clickable:hover { color: var(--text-normal); }
+
+@media (max-width: 720px) {
+  .finance-inbox-group .finance-tracker-header-actions { flex-wrap: wrap; }
+}

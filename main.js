@@ -575,7 +575,7 @@ const core = (() => {
     };
   }
 
-  function parseTransactionLine(line, noteDate, filePath, options = {}, childLines = []) {
+  function parseTransactionLine(line, noteDate, filePath, options = {}, childLines = [], lineIndex = -1) {
     const text = String(line || "");
     if (!text.trimStart().startsWith("-")) return null;
     if (/^\s*-\s*\[[^\]]\]\s*#log\/spending\b/i.test(text)) return null;
@@ -614,6 +614,10 @@ const core = (() => {
 
     const roundedAmount = Number(Number(amount).toFixed(2));
     return {
+      // Where this entry sits in its note. Two entries can share a line — same
+      // amount, same category, different merchant on the child line — so the text
+      // alone cannot say which one an edit meant.
+      lineIndex,
       accountKey: financeContext.accountKey || "",
       amount: roundedAmount,
       card: "",
@@ -721,7 +725,7 @@ const core = (() => {
         break;
       }
 
-      const parsed = parseTransactionLine(line, noteDate, filePath, options, childLines);
+      const parsed = parseTransactionLine(line, noteDate, filePath, options, childLines, index);
       if (parsed) {
         transactions.push(parsed);
       }
@@ -1968,10 +1972,20 @@ const core = (() => {
   // Replaces a single logged transaction (its entry line plus any merchant/note
   // child lines) with a freshly built block from `newExpense`, then recomputes the
   // section total. Returns null if the original line is not found.
-  function replaceTransactionBlock(content, oldRawLine, newExpense, settings = {}) {
+  // Finds the line an edit refers to. The raw text is the identifier, but where
+  // two entries share it, a recorded line index says which one — verified against
+  // the text, so a note edited since the entry was parsed falls back to the search
+  // rather than writing to the wrong place.
+  function findTransactionLineIndex(lines, target, options = {}) {
+    const index = options.lineIndex;
+    if (Number.isInteger(index) && index >= 0 && index < lines.length && lines[index] === target) return index;
+    return lines.findIndex((line) => line === target);
+  }
+
+  function replaceTransactionBlock(content, oldRawLine, newExpense, settings = {}, options = {}) {
     const lines = splitLines(content);
     const target = String(oldRawLine);
-    const index = lines.findIndex((line) => line === target);
+    const index = findTransactionLineIndex(lines, target, options);
     if (index < 0) return null;
 
     const indent = (target.match(/^\s*/) || [""])[0].length;
@@ -1995,10 +2009,10 @@ const core = (() => {
 
   // Removes a logged transaction (entry line + child lines) and recomputes the
   // section total. Returns null if the original line is not found.
-  function removeTransactionBlock(content, oldRawLine, settings = {}) {
+  function removeTransactionBlock(content, oldRawLine, settings = {}, options = {}) {
     const lines = splitLines(content);
     const target = String(oldRawLine);
-    const index = lines.findIndex((line) => line === target);
+    const index = findTransactionLineIndex(lines, target, options);
     if (index < 0) return null;
 
     const indent = (target.match(/^\s*/) || [""])[0].length;
@@ -3845,6 +3859,7 @@ const core = (() => {
     buildLegacyTripTagTransform,
     summarizeLegacyTripTags,
     findFinanceHeadingIndex,
+    findTransactionLineIndex,
     computeBudgetPace,
     replaceTransactionBlock,
     removeTransactionBlock,
@@ -4011,6 +4026,7 @@ const QUERY_BLOCK = "finance-query";
 const GOALS_BLOCK = "finance-goals";
 const RUNWAY_BLOCK = "finance-runway";
 const DAILY_BUDGET_VIEW = "finance-tracker-daily";
+const FINANCE_INBOX_VIEW = "finance-tracker-inbox";
 // Cadence display names live in core.RECURRING_CADENCES alongside the maths;
 // this reads them from there rather than keeping a second copy in sync.
 function cadenceLabel(cadence) {
@@ -4362,6 +4378,235 @@ function describeAnnularSlice(centerX, centerY, innerRadius, outerRadius, startA
   ].join(" ");
 }
 
+// --- Shared input components ---------------------------------------------------
+// Quick add had the only autocomplete in the plugin. Every other input — the
+// edit modal's category, the merchant map, goal keys, trip tags, account names —
+// was a plain text box you had to spell exactly right, against values the plugin
+// already knows. These two are that popup, generalised.
+
+// Deliberately hand-rolled rather than Obsidian's AbstractInputSuggest, which
+// would raise minAppVersion from 1.0.0 to 1.4.10. The keyboard behaviour is the
+// one quick add established: arrows move, Tab or Enter accepts while the popup
+// is open, Esc closes it, and once it is closed Enter belongs to the form again.
+class FinanceSuggest {
+  constructor(input, options = {}) {
+    this.input = input;
+    this.getItems = options.getItems || (() => []);
+    this.onChoose = options.onChoose || (() => {});
+    this.limit = Number.isFinite(options.limit) ? options.limit : 8;
+    this.items = [];
+    this.highlighted = 0;
+
+    const host = input.parentElement;
+    if (host) host.addClass("finance-suggest-host");
+    this.popup = (host || input).createDiv({ cls: "finance-suggest-popup" });
+    this.popup.hide();
+
+    this._onInput = () => this.refresh();
+    this._onFocus = () => this.refresh();
+    this._onBlur = () => window.setTimeout(() => this.close(), 150);
+    this._onKeyDown = (event) => this.handleKey(event);
+    input.addEventListener("input", this._onInput);
+    input.addEventListener("focus", this._onFocus);
+    input.addEventListener("blur", this._onBlur);
+    input.addEventListener("keydown", this._onKeyDown);
+  }
+
+  refresh() {
+    const query = String(this.input.value || "");
+    let items = [];
+    try {
+      items = this.getItems(query) || [];
+    } catch (error) {
+      console.error("[finance-tracker] suggestion source failed", error);
+    }
+    this.items = items.slice(0, this.limit);
+    this.highlighted = 0;
+    this.render();
+  }
+
+  render() {
+    this.popup.empty();
+    if (!this.items.length) {
+      this.popup.hide();
+      return;
+    }
+    this.popup.show();
+    this.items.forEach((item, index) => {
+      const row = this.popup.createDiv({
+        cls: `finance-suggest-item${index === this.highlighted ? " is-highlighted" : ""}`,
+      });
+      if (item.kind) row.createSpan({ cls: "finance-suggest-kind", text: item.kind });
+      row.createSpan({ cls: "finance-suggest-label", text: item.label ?? item.value });
+      if (item.hint) row.createSpan({ cls: "finance-suggest-hint", text: item.hint });
+      // mousedown, not click: blur would close the popup before a click landed.
+      row.addEventListener("mousedown", (event) => {
+        event.preventDefault();
+        this.choose(item);
+      });
+    });
+  }
+
+  handleKey(event) {
+    if (!this.items.length) return;
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      this.highlighted = (this.highlighted + 1) % this.items.length;
+      this.render();
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      this.highlighted = (this.highlighted - 1 + this.items.length) % this.items.length;
+      this.render();
+      return;
+    }
+    if (event.key === "Tab" || event.key === "Enter") {
+      event.preventDefault();
+      this.choose(this.items[this.highlighted]);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      this.close();
+    }
+  }
+
+  choose(item) {
+    if (!item) return;
+    this.input.value = item.value;
+    this.close();
+    this.onChoose(item);
+    this.input.dispatchEvent(new Event("change"));
+  }
+
+  close() {
+    this.items = [];
+    this.popup.empty();
+    this.popup.hide();
+  }
+
+  destroy() {
+    this.close();
+    this.input.removeEventListener("input", this._onInput);
+    this.input.removeEventListener("focus", this._onFocus);
+    this.input.removeEventListener("blur", this._onBlur);
+    this.input.removeEventListener("keydown", this._onKeyDown);
+    this.popup.remove();
+  }
+}
+
+// Picking a category is two decisions — which group, then which kind — and a
+// single text box makes you spell out both from memory. This is a search box for
+// people who know what they want, chips for people who would rather recognise
+// than recall, and anything typed that matches nothing is simply a new category.
+class CategoryPicker {
+  constructor(host, options = {}) {
+    this.categories = options.categories || [];
+    this.onChange = options.onChange || (() => {});
+    this.value = core.normalizeCategoryPath(options.value || "");
+
+    this.el = host.createDiv({ cls: "finance-category-picker" });
+    const inputRow = this.el.createDiv({ cls: "finance-category-picker-input" });
+    this.input = inputRow.createEl("input", {
+      type: "text",
+      attr: { placeholder: options.placeholder || "food/takeaway", "aria-label": "Category" },
+    });
+    this.input.value = this.value;
+    this.suggest = new FinanceSuggest(this.input, {
+      getItems: (query) => this.matches(query),
+      onChoose: (item) => this.setValue(item.value),
+    });
+    this.input.addEventListener("change", () => this.setValue(this.input.value, { silentInput: true }));
+
+    this.majorRow = this.el.createDiv({ cls: "finance-category-chips" });
+    this.subRow = this.el.createDiv({ cls: "finance-category-chips is-sub" });
+    this.renderChips();
+  }
+
+  matches(query) {
+    const needle = core.normalizeCategoryPath(query);
+    const seen = new Set();
+    const out = [];
+    for (const category of this.categories) {
+      const path = core.normalizeCategoryPath(category.path || category);
+      if (!path || seen.has(path)) continue;
+      const hit = !needle || path.startsWith(needle) || path.split("/").some((segment) => segment.startsWith(needle));
+      if (!hit) continue;
+      seen.add(path);
+      out.push({ value: path, label: core.displayCategoryPath(path), kind: "category" });
+    }
+    // Anything typed that matches nothing is a new category, not a mistake.
+    if (needle && !seen.has(needle)) {
+      out.unshift({ value: needle, label: `New: ${core.displayCategoryPath(needle)}`, kind: "new" });
+    }
+    return out;
+  }
+
+  majors() {
+    const counts = new Map();
+    for (const category of this.categories) {
+      const path = core.normalizeCategoryPath(category.path || category);
+      if (!path) continue;
+      const major = path.split("/")[0];
+      counts.set(major, (counts.get(major) || 0) + Number(category.count || 1));
+    }
+    return Array.from(counts.entries())
+      .sort((left, right) => right[1] - left[1])
+      .slice(0, 8)
+      .map(([major]) => major);
+  }
+
+  children(major) {
+    const seen = new Set();
+    for (const category of this.categories) {
+      const path = core.normalizeCategoryPath(category.path || category);
+      if (!path.startsWith(`${major}/`)) continue;
+      seen.add(path.split("/").slice(0, 2).join("/"));
+    }
+    return Array.from(seen).sort();
+  }
+
+  renderChips() {
+    this.majorRow.empty();
+    this.subRow.empty();
+    const active = this.value.split("/")[0];
+    for (const major of this.majors()) {
+      const chip = this.majorRow.createEl("button", {
+        cls: `finance-category-chip${major === active ? " is-active" : ""}`,
+        text: core.titleCaseSegment(major),
+        attr: { type: "button" },
+      });
+      chip.addEventListener("click", () => this.setValue(major));
+    }
+    if (!active) return;
+    for (const child of this.children(active)) {
+      const chip = this.subRow.createEl("button", {
+        cls: `finance-category-chip is-sub${child === this.value ? " is-active" : ""}`,
+        text: core.titleCaseSegment(child.split("/").pop()),
+        attr: { type: "button" },
+      });
+      chip.addEventListener("click", () => this.setValue(child));
+    }
+  }
+
+  setValue(value, options = {}) {
+    this.value = core.normalizeCategoryPath(value);
+    if (!options.silentInput) this.input.value = this.value;
+    this.renderChips();
+    this.onChange(this.value);
+  }
+
+  getValue() {
+    return core.normalizeCategoryPath(this.input.value || this.value);
+  }
+
+  destroy() {
+    this.suggest?.destroy();
+  }
+}
+
 class FinanceTrackerPlugin extends Plugin {
   async onload() {
     await this.loadSettings();
@@ -4455,6 +4700,7 @@ class FinanceTrackerPlugin extends Plugin {
     });
 
     this.registerView(DAILY_BUDGET_VIEW, (leaf) => new DailyBudgetView(leaf, this));
+    this.registerView(FINANCE_INBOX_VIEW, (leaf) => new FinanceInboxView(leaf, this));
 
     this.addRibbonIcon("coins", "Daily budget", () => this.activateDailyBudgetView());
     this.addRibbonIcon("circle-plus", "Quick add transaction", () => new QuickAddTransactionModal(this.app, this).open());
@@ -4468,6 +4714,12 @@ class FinanceTrackerPlugin extends Plugin {
       id: "finance-tracker-open-daily-budget",
       name: "Open daily budget",
       callback: () => this.activateDailyBudgetView(),
+    });
+
+    this.addCommand({
+      id: "finance-tracker-open-inbox",
+      name: "Open categorisation inbox",
+      callback: () => this.activateInboxView(),
     });
 
     this.addCommand({
@@ -4637,6 +4889,23 @@ class FinanceTrackerPlugin extends Plugin {
       console.warn("[finance-tracker] initial gist sync failed", error)
     );
     this.scheduleGistSync();
+  }
+
+  refreshInboxView() {
+    for (const leaf of this.app.workspace.getLeavesOfType(FINANCE_INBOX_VIEW)) {
+      if (typeof leaf.view?.refresh === "function") leaf.view.refresh();
+    }
+  }
+
+  async activateInboxView() {
+    const existing = this.app.workspace.getLeavesOfType(FINANCE_INBOX_VIEW);
+    if (existing.length) {
+      this.app.workspace.revealLeaf(existing[0]);
+      return;
+    }
+    const leaf = this.app.workspace.getLeaf(true);
+    await leaf.setViewState({ type: FINANCE_INBOX_VIEW, active: true });
+    this.app.workspace.revealLeaf(leaf);
   }
 
   async activateDailyBudgetView() {
@@ -5397,7 +5666,7 @@ class FinanceTrackerPlugin extends Plugin {
       originalCurrency: entry.originalCurrency,
       originalRateKey: entry.originalRateKey,
     };
-    const next = core.replaceTransactionBlock(content, entry.rawLine, newExpense, this.settings);
+    const next = core.replaceTransactionBlock(content, entry.rawLine, newExpense, this.settings, { lineIndex: entry.lineIndex });
     if (next == null) throw new Error("Could not locate that entry (the note may have changed).");
     await _ftModify(this.app,file, next);
     this.invalidateIndexEntry(file.path);
@@ -5405,11 +5674,73 @@ class FinanceTrackerPlugin extends Plugin {
     this.refreshDailyBudgetView();
   }
 
+  // One place that opens the edit modal, so every caller gets the same options
+  // and a test can hold on to the instance.
+  openEditTransaction(entry, options = {}) {
+    const modal = new EditTransactionModal(this.app, this, entry, options);
+    modal.open();
+    return modal;
+  }
+
+  // Moving an entry to another day means moving the bullet: it is removed from
+  // one note and inserted into the other, and both running totals are rewritten
+  // from what is left. The date on a capture is wrong often enough — a late-night
+  // tap landing on tomorrow, a backfill typed into the wrong note — that editing
+  // it by hand across two files was the most common reason to give up and leave
+  // it wrong.
+  async moveTransactionEntry(entry, newDate, patch = {}) {
+    const date = core.parseIsoDate(newDate);
+    if (!date) throw new Error("That date could not be read.");
+    const sourceFile = this.app.vault.getAbstractFileByPath(entry.filePath);
+    if (!(sourceFile instanceof TFile)) throw new Error("Could not find the note this entry is in.");
+
+    const sourceContent = await this.app.vault.cachedRead(sourceFile);
+    const without = core.removeTransactionBlock(sourceContent, entry.rawLine, this.settings, { lineIndex: entry.lineIndex });
+    if (without == null) throw new Error("Could not locate that entry (the note may have changed).");
+
+    const targetPath = this.getDailyNotePath(date);
+    const existing = this.app.vault.getAbstractFileByPath(targetPath);
+    const targetFile = existing instanceof TFile ? existing : await this.createDailyNoteFromTemplate(targetPath, date);
+    const expense = { ...entry, ...patch, date };
+
+    if (targetFile.path === sourceFile.path) {
+      // Same note after all (two date formats can land on one file): insert into
+      // the content the entry was just removed from, and write once.
+      await _ftModify(this.app, sourceFile, core.insertTransactionIntoDailyNote(without, expense, this.settings));
+    } else {
+      const targetContent = await this.app.vault.cachedRead(targetFile);
+      await _ftModify(this.app, targetFile, core.insertTransactionIntoDailyNote(targetContent, expense, this.settings));
+      await _ftModify(this.app, sourceFile, without);
+      this.invalidateIndexEntry(targetFile.path);
+    }
+
+    this.invalidateIndexEntry(sourceFile.path);
+    this._scheduleStatusBarUpdate();
+    this.refreshDailyBudgetView();
+    this.refreshInboxView();
+    return targetFile;
+  }
+
+  // Other uncategorised entries from the same shop, so one correction can settle
+  // them all without opening the inbox.
+  async findSiblingUncategorised(entry) {
+    const root = core.merchantRootKey(entry?.merchant || "");
+    if (!root) return [];
+    const entries = await this.collectAllTransactions();
+    return entries.filter(
+      (other) =>
+        core.isSpendingEntry(other) &&
+        (!other.category || other.category === "uncategorized") &&
+        !(other.filePath === entry.filePath && other.lineIndex === entry.lineIndex) &&
+        core.merchantRootKey(other.merchant || "") === root
+    );
+  }
+
   async deleteTransactionEntry(entry) {
     const file = this.app.vault.getAbstractFileByPath(entry.filePath);
     if (!(file instanceof TFile)) throw new Error("Could not find the note for this entry.");
     const content = await this.app.vault.cachedRead(file);
-    const next = core.removeTransactionBlock(content, entry.rawLine, this.settings);
+    const next = core.removeTransactionBlock(content, entry.rawLine, this.settings, { lineIndex: entry.lineIndex });
     if (next == null) throw new Error("Could not locate that entry in the note.");
     await _ftModify(this.app,file, next);
     this.invalidateIndexEntry(file.path);
@@ -8933,16 +9264,32 @@ class FinanceTrackerPlugin extends Plugin {
       }
     }
 
-    // Triage: period entries still needing a category (tap to fix).
-    const needsCategory = spendEntries.filter((entry) => !entry.category || entry.category === "uncategorized");
-    if (needsCategory.length) {
+    // Triage. The count is the whole backlog, not just this period: an entry
+    // from three weeks ago needs a category exactly as much as today's does, and
+    // a list capped at the current fortnight hid 20 of the author's 24.
+    const inboxGroups = await this.buildCategorisationInbox();
+    const backlog = inboxGroups.reduce((sum, group) => sum + group.count, 0);
+    if (backlog) {
       const triage = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-tracker-triage" });
-      triage.createEl("h4", { text: `Needs a category (${needsCategory.length})` });
-      for (const entry of needsCategory.slice(0, 12)) {
+      triage.createEl("h4", { text: `Needs a category (${backlog})` });
+      const thisPeriod = spendEntries.filter((entry) => !entry.category || entry.category === "uncategorized");
+      for (const entry of thisPeriod.slice(0, 6)) {
         const row = triage.createDiv({ cls: "finance-tracker-budget-card is-clickable is-uncategorized" });
         renderRowTitle(row, entry.merchant || entry.date || "Untitled", core.formatCurrency(entry.amount, currency));
-        row.addEventListener("click", () => new EditTransactionModal(this.app, this, entry).open());
+        row.addEventListener("click", () => this.openEditTransaction(entry));
       }
+      if (backlog > thisPeriod.length) {
+        triage.createDiv({
+          cls: "finance-tracker-budget-meta",
+          text: `${backlog - thisPeriod.length} more from earlier, across ${inboxGroups.length} merchant${inboxGroups.length === 1 ? "" : "s"}.`,
+        });
+      }
+      addAction(
+        triage.createDiv({ cls: "finance-tracker-header-actions" }),
+        "Open inbox",
+        () => this.activateInboxView(),
+        { primary: true, opensModal: true, errorPrefix: "Opening the inbox" }
+      );
     }
 
   }
@@ -8955,6 +9302,188 @@ class FinanceTrackerPlugin extends Plugin {
   //
   // Callers treat the result as read-only: collectTransactionsForRange builds a
   // fresh array each time, and nothing sorts or pushes into what it returns.
+  // One card per merchant, not one row per entry: the decision is "what is this
+  // shop", and answering it once should settle every capture from it — the ones
+  // already logged and the ones still to come.
+  async renderCategorisationInboxInto(el, options = {}) {
+    el.empty();
+    const currency = core.normalizeCurrency(this.settings.defaultCurrency);
+    const wrapper = el.createDiv({ cls: "finance-tracker-dashboard finance-inbox" });
+    const header = wrapper.createDiv({ cls: "finance-tracker-header" });
+    header.createEl("h3", { text: options.title || "Categorisation inbox" });
+    const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
+    const rerender = () => this.renderCategorisationInboxInto(el, options);
+    addAction(headerActions, "Refresh", () => rerender(), { errorPrefix: "Refreshing the inbox" });
+
+    const groups = await this.buildCategorisationInbox();
+    const known = await this.collectKnownSuggestions();
+    const failed = this.failedCaptureFiles();
+    const entryCount = groups.reduce((sum, group) => sum + group.count, 0);
+    const suggested = groups.filter((group) => group.suggestion.category);
+
+    if (!groups.length && !failed.length) {
+      wrapper.createDiv({
+        cls: "finance-tracker-empty",
+        text: "Nothing waiting — everything logged has a category.",
+      });
+      return;
+    }
+
+    renderStatCards(wrapper, [
+      { label: "Entries", value: String(entryCount) },
+      { label: "Merchants", value: String(groups.length) },
+      {
+        label: "Suggested",
+        value: String(suggested.length),
+        hint: suggested.length ? "one tap each" : "",
+      },
+      ...(failed.length ? [{ label: "Failed captures", value: String(failed.length), cls: "is-over" }] : []),
+    ]);
+
+    if (groups.length) {
+      const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
+      section.createEl("h4", { text: "Needs a category" });
+      for (const group of groups) {
+        this.renderInboxGroup(section, group, { currency, known, rerender });
+      }
+    }
+
+    if (failed.length) await this.renderFailedCaptures(wrapper, failed, rerender);
+  }
+
+  renderInboxGroup(host, group, context) {
+    const { currency, known, rerender } = context;
+    const card = host.createDiv({ cls: "finance-tracker-budget-card finance-inbox-group" });
+    renderRowTitle(card, group.label, core.formatCurrency(group.total, currency));
+
+    const dates = group.firstDate === group.lastDate ? group.firstDate : `${group.firstDate} to ${group.lastDate}`;
+    card.createDiv({
+      cls: "finance-tracker-budget-meta",
+      text: `${group.count} entr${group.count === 1 ? "y" : "ies"} · ${dates}`,
+    });
+    // The variants are worth showing: they are why these did not group before.
+    if (group.merchants.length > 1) {
+      card.createDiv({ cls: "finance-tracker-budget-meta", text: `as written: ${group.merchants.join(" · ")}` });
+    }
+
+    const remember = { value: !group.conflicted };
+    const apply = async (category) => {
+      const updated = await this.applyCategoryToEntries(group.entries, category, {
+        remember: remember.value,
+        merchant: group.merchant,
+      });
+      new Notice(`Filed ${updated} entr${updated === 1 ? "y" : "ies"} as ${core.displayCategoryPath(category)}.`);
+      await rerender();
+    };
+
+    if (group.suggestion.category) {
+      const reason = this.describeSuggestionSource(group.suggestion.source);
+      card.createDiv({
+        cls: "finance-tracker-budget-meta is-suggestion",
+        text: `Suggested: ${core.displayCategoryPath(group.suggestion.category)}${reason ? ` — ${reason}` : ""}`,
+      });
+    }
+
+    const actions = card.createDiv({ cls: "finance-tracker-header-actions" });
+    if (group.suggestion.category) {
+      addAction(
+        actions,
+        `File ${group.count} as ${core.displayCategoryPath(group.suggestion.category)}`,
+        () => apply(group.suggestion.category),
+        { primary: true, errorPrefix: "Filing" }
+      );
+    }
+
+    const pickerHost = card.createDiv({ cls: "finance-inbox-picker is-hidden" });
+    let picker = null;
+    addAction(
+      actions,
+      group.suggestion.category ? "Choose another" : "Choose a category",
+      () => {
+        pickerHost.toggleClass("is-hidden", !pickerHost.hasClass("is-hidden"));
+        if (picker) return;
+        picker = new CategoryPicker(pickerHost, {
+          categories: known.categories,
+          value: group.suggestion.category,
+        });
+        const pickerActions = pickerHost.createDiv({ cls: "finance-tracker-header-actions" });
+        addAction(pickerActions, `File ${group.count}`, () => apply(picker.getValue()), {
+          primary: true,
+          errorPrefix: "Filing",
+        });
+      },
+      { opensModal: true }
+    );
+
+    addToggleAction(
+      card,
+      group.conflicted ? "Remember (this shop has been filed two ways)" : "Remember this merchant",
+      remember.value,
+      (checked) => {
+        remember.value = checked;
+      }
+    );
+
+    const details = card.createEl("details", { cls: "finance-inbox-entries" });
+    details.createEl("summary", { text: `Show ${group.count} entr${group.count === 1 ? "y" : "ies"}` });
+    const sorted = group.entries.slice().sort((left, right) => String(right.date).localeCompare(String(left.date)));
+    for (const entry of sorted) {
+      const row = details.createDiv({ cls: "finance-tracker-budget-meta is-clickable" });
+      row.setText(`${entry.date} · ${core.formatCurrency(entry.amount, currency)} · ${entry.merchant || "(no merchant)"}`);
+      row.addEventListener("click", () => this.openEditTransaction(entry));
+    }
+  }
+
+  // Captures that never became entries. They used to be invisible: a notice at
+  // the time, then a file in a folder nobody opens.
+  async renderFailedCaptures(wrapper, files, rerender) {
+    const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
+    section.createEl("h4", { text: `Captures that failed (${files.length})` });
+    section.createDiv({
+      cls: "finance-tracker-budget-meta",
+      text: "These never became entries. Fix whatever sent them, then retry — or dismiss one for good.",
+    });
+
+    for (const file of files) {
+      const { reason, body } = await this.readFailedCapture(file);
+      const card = section.createDiv({ cls: "finance-tracker-budget-card" });
+      card.createDiv({ cls: "finance-tracker-budget-title", text: body || file.name });
+      card.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: [reason || "No reason recorded", file.name].join(" · "),
+      });
+      const actions = card.createDiv({ cls: "finance-tracker-header-actions" });
+      addAction(
+        actions,
+        "Retry",
+        async () => {
+          const result = await this.retryFailedCapture(file);
+          new Notice(result.logged ? "Logged." : `Still failing: ${result.reason}`);
+          await rerender();
+        },
+        { primary: true, errorPrefix: "Retrying" }
+      );
+      let armed = false;
+      const dismiss = addAction(
+        actions,
+        "Dismiss",
+        async () => {
+          // Deleting is final, so the button asks once rather than relying on a
+          // modal nobody reads.
+          if (!armed) {
+            armed = true;
+            dismiss.setText("Delete this capture?");
+            dismiss.disabled = false;
+            return;
+          }
+          await this.app.vault.delete(file);
+          await rerender();
+        },
+        { warning: true, errorPrefix: "Dismissing" }
+      );
+    }
+  }
+
   async collectAllTransactions() {
     if (this._allTransactions) return this._allTransactions;
     const entries = await this.collectTransactionsForRange({ period: "all", start: "1900-01-01", end: "2999-12-31" });
@@ -9014,6 +9543,138 @@ class FinanceTrackerPlugin extends Plugin {
     this.invalidateIndexEntry(file.path);
     this._scheduleStatusBarUpdate();
     return file;
+  }
+
+  // --- Categorisation inbox -----------------------------------------------------
+
+  // Everything still uncategorised, grouped by merchant root and carrying a
+  // suggestion. Grouping is the point: twelve rows of "SQ * Rode Fresh" are one
+  // decision, and the sidebar's date-limited list could never show them anyway.
+  async buildCategorisationInbox() {
+    const entries = (await this.collectAllTransactions()).filter(
+      (entry) => core.isSpendingEntry(entry) && (!entry.category || entry.category === "uncategorized")
+    );
+    const sources = await this.merchantSuggestionSources();
+    const conflicts = this.merchantRootConflicts(sources.history);
+
+    return core.groupEntriesByMerchantRoot(entries).map((group) => {
+      // The most recent spelling is the one to ask about.
+      const latest = group.entries.reduce(
+        (newest, entry) => (String(entry.date || "") >= String(newest.date || "") ? entry : newest),
+        group.entries[0] || {}
+      );
+      const merchant = latest.merchant || group.merchants[0] || "";
+      return {
+        ...group,
+        merchant,
+        suggestion: core.suggestCategoryForMerchant(merchant, sources),
+        // Where the same shop has been filed two different ways, remembering a
+        // rule would overrule a distinction you drew on purpose.
+        conflicted: (conflicts.get(group.key)?.size || 0) > 1,
+      };
+    });
+  }
+
+  // Has this shop been filed more than one way? Used for the "remember" default:
+  // where you have drawn a distinction on purpose (Bagel Boys as breakfast and
+  // as lunch), a rule would quietly overrule it.
+  async merchantHasConflictingHistory(merchant) {
+    const root = core.merchantRootKey(merchant || "");
+    if (!root) return false;
+    const sources = await this.merchantSuggestionSources();
+    return (this.merchantRootConflicts(sources.history).get(root)?.size || 0) > 1;
+  }
+
+  merchantRootConflicts(history) {
+    const byRoot = new Map();
+    for (const [key, info] of history || []) {
+      const root = core.merchantRootKey(info?.name || key);
+      if (!root) continue;
+      const seen = byRoot.get(root) || new Set();
+      seen.add(info?.category || "");
+      byRoot.set(root, seen);
+    }
+    return byRoot;
+  }
+
+  // Writes one category across a set of entries, note by note. Entries are found
+  // by their exact raw line, so an edit elsewhere in the note cannot shift them,
+  // and each note is written once however many of its lines changed.
+  async applyCategoryToEntries(entries, category, options = {}) {
+    const cleanCategory = core.normalizeCategoryPath(category);
+    if (!cleanCategory) throw new Error("Pick a category first.");
+
+    const byFile = new Map();
+    for (const entry of entries || []) {
+      const list = byFile.get(entry.filePath) || [];
+      list.push(entry);
+      byFile.set(entry.filePath, list);
+    }
+
+    let updated = 0;
+    for (const [path, list] of byFile) {
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (!(file instanceof TFile)) continue;
+      let content = await this.app.vault.cachedRead(file);
+      // Bottom-up, so replacing one entry cannot shift the line another is at.
+      const ordered = list.slice().sort((left, right) => (right.lineIndex ?? -1) - (left.lineIndex ?? -1));
+      for (const entry of ordered) {
+        const next = core.replaceTransactionBlock(
+          content,
+          entry.rawLine,
+          { ...entry, category: cleanCategory },
+          this.settings,
+          { lineIndex: entry.lineIndex }
+        );
+        if (next == null) continue;
+        content = next;
+        updated += 1;
+      }
+      await _ftModify(this.app, file, content);
+      this.invalidateIndexEntry(path);
+    }
+
+    if (options.remember && options.merchant) {
+      await this.rememberMerchantCategory(options.merchant, cleanCategory);
+    }
+    this._scheduleStatusBarUpdate();
+    this.refreshDailyBudgetView();
+    this.refreshInboxView();
+    return updated;
+  }
+
+  // --- Failed captures ------------------------------------------------------------
+
+  failedCaptureFiles() {
+    const folder = normalizePath(`${this.settings.captureInboxFolder || ""}/_failed`);
+    if (!folder) return [];
+    const prefix = `${folder}/`;
+    return this.app.vault.getFiles().filter((file) => file.path.startsWith(prefix));
+  }
+
+  async readFailedCapture(file) {
+    const raw = await this.app.vault.cachedRead(file);
+    const lines = String(raw).split("\n");
+    const reason = (lines[0].match(/finance-capture error:\s*(.*?)\s*-->/) || [])[1] || "";
+    return { file, reason, body: lines.slice(1).join("\n").trim() };
+  }
+
+  // Retries a quarantined capture without re-quarantining it: a line that still
+  // will not parse stays exactly where it is, with its original reason.
+  async retryFailedCapture(file) {
+    const { body } = await this.readFailedCapture(file);
+    const params = core.parseInboxLine(body);
+    if (!params) return { logged: 0, reason: "Still nothing to parse in this line." };
+    try {
+      const expense = this.parseCaptureParams(params);
+      const result = await this.handleCaptureExpense(expense, { notify: false, method: "inbox" });
+      if (result.skipped) return { logged: 0, reason: this.describeSkippedCapture(result) };
+      await this.app.vault.delete(file);
+      this.refreshInboxView();
+      return { logged: 1, reason: "" };
+    } catch (error) {
+      return { logged: 0, reason: error?.message || String(error) };
+    }
   }
 
   // --- Recurring payments -----------------------------------------------------
@@ -10460,6 +11121,49 @@ class DailyBudgetView extends ItemView {
   }
 }
 
+// The inbox is a view rather than a modal: it is somewhere you work through a
+// backlog, and a modal cannot stay open beside the notes it is about. The finance
+// hub will embed the same render method as one of its tabs.
+class FinanceInboxView extends ItemView {
+  constructor(leaf, plugin) {
+    super(leaf);
+    this.plugin = plugin;
+    this._refreshTimer = null;
+  }
+
+  getViewType() { return FINANCE_INBOX_VIEW; }
+  getDisplayText() { return "Categorisation inbox"; }
+  getIcon() { return "inbox"; }
+
+  async onOpen() {
+    this.registerEvent(
+      this.app.vault.on("modify", (file) => {
+        if (_ftSelfWrites.has(file.path)) return;
+        if (!file?.path?.startsWith(normalizePath(`${this.plugin.settings.dailyNotesFolder}/`))) return;
+        clearTimeout(this._refreshTimer);
+        this._refreshTimer = setTimeout(() => this.refresh(), 500);
+      })
+    );
+    await this.refresh();
+  }
+
+  async onClose() {
+    clearTimeout(this._refreshTimer);
+  }
+
+  async refresh() {
+    try {
+      await this.plugin.renderCategorisationInboxInto(this.contentEl);
+    } catch (error) {
+      this.contentEl.empty();
+      this.contentEl.createDiv({
+        cls: "finance-tracker-empty",
+        text: `The inbox failed to render: ${error?.message || error}`,
+      });
+    }
+  }
+}
+
 class QuickAddTransactionModal extends Modal {
   constructor(app, plugin, options = {}) {
     super(app);
@@ -10791,11 +11495,16 @@ class QuickAddTransactionModal extends Modal {
   }
 }
 
+// Correcting one entry. This was the weakest screen in the plugin: a plain text
+// box for the category with twelve flat chips beside it, no way to change the
+// date, and no way to say "and the other four from this shop as well" — so the
+// backlog was fixed one line at a time, or not at all.
 class EditTransactionModal extends Modal {
-  constructor(app, plugin, entry) {
+  constructor(app, plugin, entry, options = {}) {
     super(app);
     this.plugin = plugin;
     this.entry = entry;
+    this.onSaved = options.onSaved;
   }
 
   async onOpen() {
@@ -10803,35 +11512,93 @@ class EditTransactionModal extends Modal {
     contentEl.empty();
     contentEl.addClass("finance-edit");
     contentEl.createEl("h3", { text: "Edit transaction" });
+
     const entry = this.entry;
+    const currency = core.normalizeCurrency(entry.currency || this.plugin.settings.defaultCurrency);
+    const known = await this.plugin.collectKnownSuggestions();
+    const siblings = await this.plugin.findSiblingUncategorised(entry);
 
     const amountRow = contentEl.createDiv({ cls: "finance-edit-row" });
     amountRow.createEl("label", { text: "Amount" });
-    const amountInput = amountRow.createEl("input", { type: "number", attr: { step: "0.01" } });
+    const amountInput = amountRow.createEl("input", {
+      type: "number",
+      // A phone keyboard with a decimal point on it.
+      attr: { step: "0.01", inputmode: "decimal" },
+    });
     amountInput.value = String(entry.amount ?? "");
 
-    const catRow = contentEl.createDiv({ cls: "finance-edit-row" });
-    catRow.createEl("label", { text: "Category" });
-    const catInput = catRow.createEl("input", { type: "text" });
-    catInput.value = entry.category || "uncategorized";
+    const dateRow = contentEl.createDiv({ cls: "finance-edit-row" });
+    dateRow.createEl("label", { text: "Date" });
+    const dateInput = dateRow.createEl("input", { type: "date" });
+    dateInput.value = entry.date || core.todayIsoLocal();
+    const dateHint = contentEl.createEl("p", { cls: "finance-edit-hint", text: "" });
+    const updateDateHint = () => {
+      const next = core.parseIsoDate(dateInput.value);
+      dateHint.setText(
+        next && next !== entry.date
+          ? `The entry moves to ${next}'s note, and both totals are rewritten.`
+          : "Changing this moves the entry to that day's note."
+      );
+    };
+    dateInput.addEventListener("change", updateDateHint);
+    updateDateHint();
 
-    const chips = contentEl.createDiv({ cls: "finance-edit-chips" });
-    const known = await this.plugin.collectKnownSuggestions();
-    for (const option of known.categories.slice(0, 12)) {
-      const chip = chips.createEl("button", { cls: "finance-edit-chip", text: core.displayCategoryPath(option) });
-      chip.addEventListener("click", () => {
-        catInput.value = option;
-      });
-    }
+    contentEl.createEl("label", { cls: "finance-edit-label", text: "Category" });
+    const picker = new CategoryPicker(contentEl, {
+      categories: known.categories,
+      value: entry.category === "uncategorized" ? "" : entry.category,
+    });
 
     const merchantRow = contentEl.createDiv({ cls: "finance-edit-row" });
     merchantRow.createEl("label", { text: "Merchant" });
     const merchantInput = merchantRow.createEl("input", { type: "text" });
     merchantInput.value = entry.merchant || "";
+    const merchantSuggest = new FinanceSuggest(merchantInput, {
+      getItems: (query) => {
+        const needle = String(query || "").toLowerCase();
+        return known.merchants
+          .filter((merchant) => !needle || merchant.name.toLowerCase().includes(needle))
+          .slice(0, 8)
+          .map((merchant) => ({
+            value: merchant.name,
+            label: merchant.name,
+            kind: "merchant",
+            hint: merchant.category ? core.displayCategoryPath(merchant.category) : "",
+          }));
+      },
+      onChoose: (item) => {
+        // Accepting a known merchant fills in how it was last filed, unless a
+        // category has already been chosen here.
+        if (!picker.getValue() && item.hint) picker.setValue(core.normalizeCategoryPath(item.hint));
+      },
+    });
 
+    let applySiblings = null;
+    if (siblings.length) {
+      const label = contentEl.createEl("label", { cls: "finance-edit-remember" });
+      applySiblings = label.createEl("input", { type: "checkbox" });
+      applySiblings.checked = true;
+      label.appendText(
+        ` Apply to ${siblings.length} other uncategorised entr${siblings.length === 1 ? "y" : "ies"} from this merchant`
+      );
+    }
+
+    // Ticked by default, because remembering is almost always right — except
+    // where this shop has already been filed two different ways on purpose.
+    const conflicted = await this.plugin.merchantHasConflictingHistory(entry.merchant);
     const rememberLabel = contentEl.createEl("label", { cls: "finance-edit-remember" });
     const rememberCheckbox = rememberLabel.createEl("input", { type: "checkbox" });
-    rememberLabel.appendText(" Remember this merchant → category");
+    rememberCheckbox.checked = !conflicted;
+    rememberLabel.appendText(
+      conflicted
+        ? " Remember this merchant → category (you have filed it more than one way)"
+        : " Remember this merchant → category"
+    );
+
+    contentEl.createEl("p", {
+      cls: "finance-edit-hint",
+      text: `Logged as ${core.formatCurrency(entry.amount, currency)} on ${entry.date} in ${String(entry.filePath || "").split("/").pop()}.`,
+    });
 
     const buttons = contentEl.createDiv({ cls: "finance-edit-buttons" });
     const deleteButton = buttons.createEl("button", { text: "Delete", cls: "mod-warning" });
@@ -10840,17 +11607,28 @@ class EditTransactionModal extends Modal {
     saveButton.addEventListener("click", async () => {
       saveButton.disabled = true;
       try {
-        const patch = {
-          amount: core.parseNumber(amountInput.value),
-          category: core.normalizeCategoryPath(catInput.value) || "uncategorized",
-          merchant: merchantInput.value.trim(),
-        };
-        await this.plugin.updateTransactionEntry(entry, patch);
-        if (rememberCheckbox.checked && patch.merchant && patch.category && patch.category !== "uncategorized") {
-          await this.plugin.rememberMerchantCategory(patch.merchant, patch.category);
+        const category = picker.getValue() || "uncategorized";
+        const merchant = merchantInput.value.trim();
+        const patch = { amount: core.parseNumber(amountInput.value), category, merchant };
+        const nextDate = core.parseIsoDate(dateInput.value);
+
+        if (nextDate && nextDate !== entry.date) {
+          await this.plugin.moveTransactionEntry(entry, nextDate, patch);
+        } else {
+          await this.plugin.updateTransactionEntry(entry, patch);
         }
-        new Notice("Transaction updated");
+
+        let alsoFiled = 0;
+        if (applySiblings?.checked && category !== "uncategorized") {
+          alsoFiled = await this.plugin.applyCategoryToEntries(siblings, category);
+        }
+        if (rememberCheckbox.checked && merchant && category !== "uncategorized") {
+          await this.plugin.rememberMerchantCategory(merchant, category);
+        }
+
+        new Notice(alsoFiled ? `Updated, and filed ${alsoFiled} more from this merchant.` : "Transaction updated");
         this.close();
+        if (typeof this.onSaved === "function") await this.onSaved();
       } catch (error) {
         new Notice(`Update failed: ${error.message}`);
         saveButton.disabled = false;
@@ -10858,17 +11636,23 @@ class EditTransactionModal extends Modal {
     });
 
     deleteButton.addEventListener("click", async () => {
+      deleteButton.disabled = true;
       try {
         await this.plugin.deleteTransactionEntry(entry);
         new Notice("Transaction deleted");
         this.close();
+        if (typeof this.onSaved === "function") await this.onSaved();
       } catch (error) {
         new Notice(`Delete failed: ${error.message}`);
+        deleteButton.disabled = false;
       }
     });
+
+    this._suggests = [merchantSuggest, picker];
   }
 
   onClose() {
+    for (const component of this._suggests || []) component.destroy?.();
     this.contentEl.empty();
   }
 }
