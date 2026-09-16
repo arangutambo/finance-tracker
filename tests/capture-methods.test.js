@@ -607,3 +607,28 @@ test("a capture invalidates the cached entries", async () => {
 
   assert.equal((await plugin.collectAllTransactions()).length, 1, "the new capture must be visible immediately");
 });
+
+test("a converted trip gets an archived note so its dashboard has something to read", async () => {
+  const { plugin, app, files } = makePlugin({
+    budgetsFolderPath: "Utility/Budgets",
+    budgetArchiveFolderPath: "Utility/Budgets/Archive",
+    defaultBudgetNoteName: "Budgets.md",
+    recurringNoteName: "Recurring.md",
+  });
+  await app.vault.create("Daily/2025-10-04.md", LEGACY_NOTE);
+
+  const { plan, trips } = await plugin.planLegacyTripTagMigration();
+  await plugin.applyNoteRewritePlan(plan);
+  const created = await plugin.ensureArchivedTripNotes(trips);
+
+  assert.equal(created.length, 1);
+  const note = files.get(created[0]);
+  assert.match(note.path, /Archive\/brazil-2025\.md$/);
+  assert.match(note.content, /trip_tag: 25\/brazil/);
+  assert.match(note.content, /archived: \d{4}-\d{2}-\d{2}/);
+  assert.match(note.content, /trip_currency: BRL/);
+  assert.match(note.content, /```holiday-dashboard/);
+
+  // Running it again must not create a second note for the same trip.
+  assert.deepEqual(await plugin.ensureArchivedTripNotes(trips), []);
+});

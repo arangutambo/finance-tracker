@@ -1562,6 +1562,59 @@ class FinanceTrackerPlugin extends Plugin {
     return { written, skipped };
   }
 
+  // A converted trip has entries but no note, so nothing renders them. This is
+  // the note a trip would have had: archived from the start, since it is long
+  // over, which keeps it out of the active goal lists while its dashboard still
+  // works when opened.
+  buildArchivedTripNoteContent(trip, title) {
+    return [
+      "---",
+      `goal_name: ${title}`,
+      `goal_key: ${core.normalizeCategoryPath(trip.key.split("/")[1] || "trip")}`,
+      "target_amount: 0",
+      "starting_balance: 0",
+      `due_date: ${trip.firstDate || core.todayIsoLocal()}`,
+      "active: false",
+      `currency: ${core.normalizeCurrency(this.settings.defaultCurrency)}`,
+      ...(trip.currency ? [`trip_currency: ${trip.currency}`] : []),
+      `trip_tag: ${trip.key}`,
+      `start_date: ${trip.firstDate || ""}`,
+      `end_date: ${trip.lastDate || ""}`,
+      "total_budget: 0",
+      `archived: ${core.todayIsoLocal()}`,
+      "---",
+      "",
+      `# ${title}`,
+      "",
+      `Created by **Convert legacy trip tags** from ${trip.entries} entries logged between ${trip.firstDate} and ${trip.lastDate}.`,
+      "Set `total_budget` above if you want the reflection to compare against a budget.",
+      "",
+      "```holiday-dashboard",
+      "```",
+      "",
+    ].join("\n");
+  }
+
+  // Only creates a note for a trip that has none: a second note carrying the
+  // same trip_tag would make the dashboards ambiguous.
+  async ensureArchivedTripNotes(trips) {
+    const created = [];
+    for (const trip of trips || []) {
+      if (!trip.key) continue;
+      const existing = await this.findHolidayBudgetByKey(trip.key);
+      if (existing) continue;
+      const [year, name] = trip.key.split("/");
+      const fullYear = year.length === 2 ? `20${year}` : year;
+      const title = `${core.titleCaseSegment(name)} ${fullYear}`;
+      await this.ensureFolder(this.settings.budgetArchiveFolderPath);
+      const path = normalizePath(`${this.settings.budgetArchiveFolderPath}/${sanitizeFilePart(title)}.md`);
+      if (this.app.vault.getAbstractFileByPath(path)) continue;
+      await this.ensureTextFile(path, () => this.buildArchivedTripNoteContent(trip, title));
+      created.push(path);
+    }
+    return created;
+  }
+
   async openLegacyTripTagMigration() {
     const { plan, trips } = await this.planLegacyTripTagMigration();
     const intro = trips
@@ -1580,10 +1633,15 @@ class FinanceTrackerPlugin extends Plugin {
       emptyText: "No legacy trip tags found, so there is nothing to convert.",
       onApply: async (approved) => {
         const { written, skipped } = await this.applyNoteRewritePlan(approved);
+        const created = written ? await this.ensureArchivedTripNotes(trips) : [];
         new Notice(
-          `Converted ${written} note${written === 1 ? "" : "s"}${
-            skipped.length ? `. ${skipped.length} changed since the preview and were left alone` : ""
-          }.`
+          [
+            `Converted ${written} note${written === 1 ? "" : "s"}`,
+            skipped.length ? `${skipped.length} changed since the preview and were left alone` : "",
+            created.length ? `created ${created.map((path) => path.split("/").pop()).join(", ")}` : "",
+          ]
+            .filter(Boolean)
+            .join(". ") + "."
         );
       },
     }).open();
