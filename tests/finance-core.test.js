@@ -1868,3 +1868,76 @@ test("a skip still advances the bill it belongs to", () => {
   assert.equal(broadband.lastAmount, 89); // the $0 marker does not redefine the price
   assert.equal(broadband.nextDue, "2026-09-08"); // but it does move the anchor
 });
+
+test("merchantRootKey collapses processor prefixes, branches and company suffixes", () => {
+  // Every string here is a real ANZ descriptor from a capture.
+  const root = core.merchantRootKey;
+  assert.equal(root("Woolworths/cnr Brisbane H"), root("Woolworths/8 Sherwood Roa"));
+  assert.equal(root("Woolworths/cnr Brisbane H"), "woolworths");
+  assert.equal(root("SQ * Rode Fresh"), "rodefresh");
+  assert.equal(root("SQ * Milk N Mochi Pty Ltd"), "milknmochi");
+  assert.equal(root("Costco Wholesale Austr"), "costcowholesale");
+  assert.equal(root("Dan Murphy's/blunder Rd &"), "danmurphys");
+  assert.equal(root("FORTITUDEHALL/312-318 Bru"), "fortitudehall");
+  assert.equal(root("The Bagel Boys"), root("Bagel Boys"));
+
+  // Two Costco rules that must stay apart: groceries and fuel.
+  assert.notEqual(root("Costco Wholesale Austr"), root("Costco Gas Ipswich"));
+  // A merchant whose name merely starts with a suffix word keeps it.
+  assert.equal(root("Australia Post"), "australiapost");
+  // Numbers short enough to be part of a name survive.
+  assert.equal(root("7-Eleven"), "7eleven");
+});
+
+test("cleanMerchantDisplay keeps a readable name", () => {
+  assert.equal(core.cleanMerchantDisplay("SQ * Milk N Mochi Pty Ltd"), "Milk N Mochi");
+  assert.equal(core.cleanMerchantDisplay("Woolworths/cnr Brisbane H"), "Woolworths");
+  assert.equal(core.cleanMerchantDisplay("Dan Murphy's/blunder Rd &"), "Dan Murphy's");
+  assert.equal(core.cleanMerchantDisplay("[[_ Pousada La Luna]]"), "_ Pousada La Luna");
+  // Nothing recognisable left: better the raw descriptor than an empty row.
+  assert.equal(core.cleanMerchantDisplay("SQ *"), "SQ *");
+});
+
+test("an amount written without its leading zero is read as cents", () => {
+  const note = [
+    "---",
+    "date: 2025-11-07",
+    "---",
+    "",
+    "## Finance",
+    "- [ ] #log/spending 0",
+    "\t- R$3.08 - $.91 #log/spending/food/snacks",
+    "\t\t- Fruit groceries",
+  ].join("\n");
+  const [entry] = core.parseTransactionsFromNoteContent(note, "2025-11-07.md", {});
+  assert.equal(entry.amount, 0.91, "$.91 used to parse as $91");
+});
+
+test("legacy archive trip tags read as trip spending", () => {
+  assert.equal(
+    core.canonicalizeFinanceTag("log/archive/25/Brazil/Spending/Food/Snacks"),
+    "log/spending/25/brazil/food/snacks"
+  );
+  assert.equal(
+    core.canonicalizeFinanceTag("log/archive/25/Brazil/Spending/Planned/Flights"),
+    "log/spending/25/brazil/planned/flights"
+  );
+
+  const note = [
+    "---",
+    "date: 2025-10-04",
+    "---",
+    "",
+    "## Spending",
+    "- [ ] #log/spending 0",
+    "\t- 18BRL - 5.16 AUD #log/archive/25/Brazil/Spending/Food/Snacks",
+    "\t\t- Açai Bowl",
+  ].join("\n");
+  const [entry] = core.parseTransactionsFromNoteContent(note, "2025-10-04.md", {});
+  assert.equal(entry.holidayKey, "25/brazil");
+  assert.equal(entry.category, "food/snacks");
+  assert.equal(entry.entryType, "holiday-spending");
+  assert.equal(entry.amount, 5.16);
+  // The whole point: a finished trip stops counting as spending at home.
+  assert.equal(core.isSpendingEntry(entry), false);
+});

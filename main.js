@@ -327,7 +327,9 @@ const core = (() => {
       .replace(/^\s*-\s*(?:\[[^\]]\]\s*)?/, "")
       .trim();
     if (!visible) return null;
-    const matches = Array.from(visible.matchAll(/-?\d[\d,]*(?:\.\d+)?|-?\d+(?:,\d{3})*(?:\.\d+)?/g))
+    // The second alternative catches an amount written without its leading zero
+    // ("$.91"), which the first one skips over — it used to read as $91.
+    const matches = Array.from(visible.matchAll(/-?\d[\d,]*(?:\.\d+)?|-?\.\d+/g))
       .map((match) => Number(String(match[0]).replace(/,/g, "")))
       .filter((value) => Number.isFinite(value));
     if (!matches.length) return null;
@@ -359,6 +361,15 @@ const core = (() => {
     const normalized = normalizeCategoryPath(String(tag || "").replace(/^#/, ""));
     const parts = normalized.split("/").filter(Boolean);
     if (parts.length < 4 || parts[0] !== "log") return null;
+
+    // `#log/archive/<year>/<trip>/spending/<cat>` — an older habit of filing a
+    // finished trip under an archive branch. The archive segment says nothing the
+    // rest of the tag does not, so it is dropped and the remainder canonicalised
+    // as usual, which is what makes those entries read as trip spending rather
+    // than as uncategorised spending at home.
+    if (parts[1] === "archive" && parts.length >= 5) {
+      return canonicalizeFinanceTag(["log", ...parts.slice(2)].join("/"));
+    }
     const isYear = (value) => /^(?:\d{2}|\d{4})$/.test(value);
     if (!isYear(parts[1]) || !parts[2]) return null;
 
@@ -1463,6 +1474,56 @@ const core = (() => {
 
   function normalizeMerchant(value) {
     return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+  }
+
+  // A bank feed pads, truncates and prefixes the merchant with things that are not
+  // the merchant: a payment processor ("SQ * Rode Fresh"), a branch or address
+  // after a slash ("Woolworths/cnr Brisbane H"), a company suffix ("Milk N Mochi
+  // Pty Ltd"), a store number. Two captures from the same shop therefore rarely
+  // share a string, which is why categorising one Woolworths never taught the
+  // other. These two reduce a descriptor to the shop itself: a key for grouping
+  // and category lookup, and a readable name for display.
+  //
+  // Deliberately separate from normalizeMerchant, which must stay exactly as it
+  // is: transactionFingerprint and the cross-method duplicate ledger are built on
+  // it, and loosening those would collapse genuinely different purchases together.
+  const MERCHANT_PROCESSOR_PREFIX = /^\s*(?:sq|sp|smp|zlr|ls|pp|paypal|square|stripe|sumup|tyro|dd|eftpos|pos|visa|mc)\s*[*#]\s*/i;
+  // Only ever at the end, so "Australia Post" keeps its name while "Costco
+  // Wholesale Austr" loses the truncated country.
+  const MERCHANT_COMPANY_SUFFIX = /(?:[\s,]+(?:pty\.?|ltd\.?|limited|inc\.?|llc|corp\.?|co\.?|australia|austr[a-z]*|aust|aus))+[\s.]*$/i;
+
+  function stripMerchantNoise(value) {
+    let text = String(value || "");
+    // A wiki link stands in for the merchant; its label, or its target, is the name.
+    text = text.replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_match, target, label) => label || target);
+    text = text.replace(MERCHANT_PROCESSOR_PREFIX, "");
+    // Everything after a slash is branch or address noise: "Woolworths/8 Sherwood Roa".
+    text = text.split("/")[0];
+    text = text.replace(MERCHANT_COMPANY_SUFFIX, "");
+    // Store and terminal numbers. Three digits or more, so "7-Eleven" survives.
+    text = text.replace(/\b\d{3,}\b/g, " ");
+    return normalizeWhitespace(text);
+  }
+
+  // Grouping key: lowercase, punctuation-free, and stable across a merchant's
+  // branches and the noise each feed adds.
+  function merchantRootKey(value) {
+    return stripMerchantNoise(value)
+      .toLowerCase()
+      .replace(/&/g, " and ")
+      .replace(/['\u2019]/g, "")
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim()
+      .replace(/^the\s+/, "")
+      .replace(/\s+/g, "");
+  }
+
+  // The same cleanup, but keeping the merchant readable: "SQ * Milk N Mochi Pty
+  // Ltd" is shown as "Milk N Mochi". Falls back to the original string rather than
+  // showing nothing.
+  function cleanMerchantDisplay(value) {
+    const cleaned = stripMerchantNoise(value).replace(/[\s,\-\u2013\u2014&]+$/, "").trim();
+    return cleaned || normalizeWhitespace(String(value || ""));
   }
 
   // Stable key for de-duplicating the same purchase arriving from different
@@ -3351,6 +3412,8 @@ const core = (() => {
     parseCsvRows,
     parseFlexibleDate,
     normalizeMerchant,
+    merchantRootKey,
+    cleanMerchantDisplay,
     transactionFingerprint,
     CAPTURE_METHODS,
     CAPTURE_METHOD_LABELS,
