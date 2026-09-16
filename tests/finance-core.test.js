@@ -2353,12 +2353,15 @@ test("a bill due on the nth weekday finds it each month", () => {
 });
 
 test("a skipped cycle moves the schedule on without a $0 bullet", () => {
-  const bill = core.parseBillDefinition({ bill_id: "claude", cadence: "monthly", amount: "34", skipped: "[2026-09-26]" });
+  // A skip is recorded against the cycle's own due date, so the rhythm holds.
+  const bill = core.parseBillDefinition({ bill_id: "claude", cadence: "monthly", amount: "34", skipped: "[2026-09-30]" });
   const state = core.computeBillState(bill, [payment("2026-08-30", 34, "Claude AI Payment", "subscriptions/monthly/claude")], {
-    referenceDate: "2026-09-27",
+    referenceDate: "2026-10-01",
   });
-  assert.equal(state.nextDue, "2026-10-26", "the skip is the anchor, so the next cycle follows it");
-  assert.deepEqual(state.skipped, ["2026-09-26"]);
+  assert.equal(state.nextDue, "2026-10-30");
+  assert.deepEqual(state.skipped, ["2026-09-30"]);
+  // And nothing was written into a daily note to achieve it.
+  assert.equal(state.payments.length, 1);
 });
 
 test("a variable bill projects off its recent payments, a fixed one off its amount", () => {
@@ -2414,4 +2417,50 @@ test("a card capture is matched to the bill it pays", () => {
   assert.equal(core.findBillForPayment({ date: "2026-09-25", amount: 34, merchant: "Coles" }, view.items), null);
   // Right in every way except that it is nowhere near the due date.
   assert.equal(core.findBillForPayment({ date: "2026-11-02", amount: 34, merchant: "Claude AI Payment" }, view.items), null);
+});
+
+test("paying a bill late does not drag its schedule along", () => {
+  const weekly = core.parseBillDefinition({ bill_id: "climb", cadence: "weekly", amount: "30" });
+  const onTime = ["2026-08-03", "2026-08-10", "2026-08-17"].map((date) => payment(date, 30, "Urban Climb", "subscriptions/weekly/climb"));
+  assert.equal(core.computeBillState(weekly, onTime, { referenceDate: "2026-08-18" }).nextDue, "2026-08-24");
+
+  // Two days late one week: still that week's payment, so the Monday rhythm holds.
+  const late = [...onTime, payment("2026-08-26", 30, "Urban Climb", "subscriptions/weekly/climb")];
+  assert.equal(core.computeBillState(weekly, late, { referenceDate: "2026-08-27" }).nextDue, "2026-08-31");
+
+  // A month later is not a late payment, it is a new rhythm.
+  const moved = [...onTime, payment("2026-09-21", 30, "Urban Climb", "subscriptions/weekly/climb")];
+  assert.equal(core.computeBillState(weekly, moved, { referenceDate: "2026-09-22" }).nextDue, "2026-09-28");
+});
+
+test("a monthly bill paid a few days late keeps its day of the month", () => {
+  const monthly = core.parseBillDefinition({ bill_id: "claude", cadence: "monthly", amount: "34" });
+  const payments = [
+    payment("2026-06-26", 34, "Claude", "subscriptions/monthly/claude"),
+    payment("2026-07-26", 34, "Claude", "subscriptions/monthly/claude"),
+    payment("2026-08-30", 34, "Claude", "subscriptions/monthly/claude"),
+  ];
+  assert.equal(core.computeBillState(monthly, payments, { referenceDate: "2026-09-01" }).nextDue, "2026-09-26");
+});
+
+test("planBillsFromLegacy merges wordings but keeps genuinely separate charges", () => {
+  const items = [
+    { name: "urban-climb-subscription", label: "Urban Climb Subscription", merchant: "Urban Climb Subscription", cadence: "weekly", lastAmount: 30, firstDate: "2026-04-28", lastDate: "2026-08-14", count: 7, autoLog: true },
+    { name: "urban-climb", label: "Urban Climb", merchant: "Urban Climb", cadence: "weekly", lastAmount: 30, firstDate: "2026-05-15", lastDate: "2026-07-17", count: 10, autoLog: true },
+    { name: "martial-arts-queensland", label: "Martial Arts Queensland", merchant: "Martial Arts Queensland", cadence: "fortnightly", lastAmount: 17.5, firstDate: "2026-05-16", lastDate: "2026-07-11", count: 5, autoLog: true },
+    { name: "payment-for-martial-arts-queensland", label: "Payment For Martial Arts Queensland", merchant: "Payment for Martial Arts Queensland", cadence: "fortnightly", lastAmount: 87.5, firstDate: "2026-05-22", lastDate: "2026-07-17", count: 5, autoLog: true },
+  ];
+
+  const bills = core.planBillsFromLegacy(items, { excluded: ["urban-climb", "martial-arts-queensland", "payment-for-martial-arts-queensland"], referenceDate: "2026-09-16" });
+
+  const climb = bills.find((bill) => bill.id === "urban-climb-subscription");
+  assert.equal(bills.length, 3, "four detected bills, three real ones");
+  assert.deepEqual(climb.mergedFrom, ["urban-climb"], "same cadence, same amount, overlapping dates");
+  assert.ok(climb.aliases.includes("Urban Climb"));
+  assert.equal(climb.active, true, "one wording was removed, but the bill is still running");
+
+  // Same shop, different debits, alternating: two bills, both ended.
+  const arts = bills.filter((bill) => bill.id.includes("martial-arts"));
+  assert.equal(arts.length, 2);
+  assert.equal(arts.every((bill) => bill.retired && bill.endDate), true, "a cancelled bill keeps its history and gets an end date");
 });

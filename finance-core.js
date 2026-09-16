@@ -2107,6 +2107,7 @@ function detectRecurringPayments(entries, options = {}) {
       items.set(key, {
         cadence,
         rawCadence,
+        firstDate: date,
         name,
         label: titleCaseSegment(name.split("/").pop()),
         merchant: normalizeWhitespace(entry.merchant || "") || titleCaseSegment(name.split("/").pop()),
@@ -2120,6 +2121,7 @@ function detectRecurringPayments(entries, options = {}) {
       continue;
     }
     current.count += 1;
+    if (date && (!current.firstDate || date < current.firstDate)) current.firstDate = date;
     if (amount > 0) current.history.push({ date, amount });
     if (date >= current.lastDate) {
       current.lastDate = date;
@@ -4054,6 +4056,41 @@ function billDueAfter(bill, fromDate) {
   return nextRecurringDate(anchor, cadence) || "";
 }
 
+// How far off its due date a payment can be and still count as that cycle. Half
+// a cadence, capped: pay a weekly bill two days late and it is still this week's
+// payment; pay it five days late and the schedule has genuinely moved.
+function billDriftTolerance(cadence) {
+  const spec = RECURRING_CADENCES[normalizeCadence(cadence)];
+  if (!spec) return 3;
+  if (spec.days) return Math.max(1, Math.floor(spec.days / 2) - 1);
+  return spec.months >= 12 ? 21 : 10;
+}
+
+// Walks the payments to find which cycle was last satisfied. A payment close to
+// the expected due date fulfils that cycle — so the schedule keeps its own
+// rhythm rather than sliding by however late you happened to be. A payment far
+// from it re-anchors the schedule, because a bill paid three weeks later is a
+// bill that now falls due three weeks later.
+//
+// This is what the Next Due override existed to paper over. The override is
+// still there as a manual correction, but the ordinary case no longer needs it.
+function resolveBillCycleAnchor(bill, dates) {
+  const sorted = (dates || []).filter(Boolean).slice().sort();
+  if (!sorted.length) return "";
+  const tolerance = billDriftTolerance(bill?.cadence);
+  let expected = sorted[0];
+  for (const date of sorted.slice(1)) {
+    const due = billDueAfter(bill, expected);
+    if (!due) {
+      expected = date;
+      continue;
+    }
+    const gap = Math.abs(Math.round((isoToDate(date).getTime() - isoToDate(due).getTime()) / DAY_MS));
+    expected = gap <= tolerance ? due : date;
+  }
+  return expected;
+}
+
 // What a bill looks like right now, given the payments linked to it: what it
 // costs, when it is next due, and whether it has run its course.
 //
@@ -4072,7 +4109,7 @@ function computeBillState(bill, payments, options = {}) {
   const skips = (bill.skipped || []).slice().sort();
   const lastSkip = skips[skips.length - 1] || "";
   // A skipped cycle moves the schedule on exactly as a payment does.
-  const anchor = [lastPayment?.date || "", lastSkip, bill.startDate || ""].filter(Boolean).sort().pop() || "";
+  const anchor = resolveBillCycleAnchor(bill, [...paid.map((payment) => payment.date), ...skips, bill.startDate || ""]);
 
   const averageAmount = recentAmounts.length
     ? roundCurrencyAmount(recentAmounts.reduce((sum, value) => sum + value, 0) / recentAmounts.length)
@@ -4301,6 +4338,100 @@ function findBillForPayment(payment, items, options = {}) {
   return best ? best.item : null;
 }
 
+// Turns what the old model detected into bills worth keeping.
+//
+// The judgement it has to make is which detected "bills" were only ever wordings
+// of one bill. The rule: same cadence, same amount, and payment histories that
+// overlap in time. Overlap is what separates a renaming from two real charges —
+// the author's Urban Climb variants were logged on the *same days* as each
+// other, while the two Martial Arts Queensland debits differ in amount and
+// alternate, so they stay apart.
+//
+// A bill that was "removed completely" keeps its history and becomes an ended
+// bill rather than disappearing: cancelled is not the same as never happened.
+function planBillsFromLegacy(items, options = {}) {
+  const excluded = new Set(options.excluded || []);
+  const referenceDate = parseIsoDate(options.referenceDate) || todayIsoLocal();
+  const amountsMatch = (left, right) => {
+    if (!(left > 0) || !(right > 0)) return false;
+    return Math.abs(left - right) <= Math.max(left, right) * 0.01;
+  };
+  const overlaps = (group, item) => {
+    const start = item.firstDate || item.lastDate || "";
+    const end = item.lastDate || item.firstDate || "";
+    if (!start || !group.firstDate) return false;
+    return start <= group.lastDate && end >= group.firstDate;
+  };
+
+  // Newest first, so the wording still in use becomes the bill and the older
+  // spellings become its aliases.
+  const sorted = (items || []).slice().sort((left, right) => String(right.lastDate || "").localeCompare(String(left.lastDate || "")));
+  const groups = [];
+
+  for (const item of sorted) {
+    const group = groups.find(
+      (candidate) => candidate.cadence === item.cadence && amountsMatch(candidate.amount, item.lastAmount) && overlaps(candidate, item)
+    );
+    if (group) {
+      group.merged.push(item);
+      group.firstDate = [group.firstDate, item.firstDate].filter(Boolean).sort()[0] || group.firstDate;
+      group.lastDate = [group.lastDate, item.lastDate].filter(Boolean).sort().pop() || group.lastDate;
+      continue;
+    }
+    groups.push({
+      primary: item,
+      merged: [],
+      cadence: item.cadence,
+      amount: item.lastAmount,
+      firstDate: item.firstDate || item.lastDate || "",
+      lastDate: item.lastDate || "",
+    });
+  }
+
+  return groups.map((group) => {
+    const primary = group.primary;
+    const everyName = [primary, ...group.merged];
+    const retired = everyName.every((item) => excluded.has(item.name)) || primary.active === false;
+    const aliases = Array.from(
+      new Set(
+        everyName
+          .flatMap((item) => [item.name, item.label, item.merchant])
+          .map((value) => normalizeWhitespace(value || ""))
+          .filter((value) => value && normalizeBillId(value) !== normalizeBillId(primary.name))
+      )
+    );
+
+    return {
+      id: normalizeBillId(primary.name),
+      name: normalizeWhitespace(primary.merchant || primary.label || titleCaseSegment(primary.name)),
+      aliases,
+      cadence: primary.cadence,
+      dueRule: { type: "after-last" },
+      amount: roundCurrencyAmount(primary.lastAmount || 0),
+      amountModel: primary.variable ? "variable" : "fixed",
+      reminderDays: 3,
+      // Removed or paused bills come across as ended, keeping their history.
+      active: !retired,
+      autoLog: primary.autoLog !== false,
+      nextAmount: primary.nextAmount || null,
+      changeDate: primary.changeDate || null,
+      // An ended bill stops at its last payment; a live one keeps the terms it had.
+      endDate: retired ? primary.lastDate || null : primary.endDate || null,
+      paymentsLeft: retired ? null : primary.paymentsLeft ?? null,
+      nextDueOverride: retired ? null : primary.usedOverride ? primary.nextDue : null,
+      skipped: [],
+      startDate: group.firstDate || null,
+      currency: primary.currency || options.defaultCurrency || "AUD",
+      // For the preview.
+      mergedFrom: group.merged.map((item) => item.name),
+      payments: everyName.reduce((sum, item) => sum + Number(item.count || 0), 0),
+      retired,
+      lastDate: group.lastDate,
+      referenceDate,
+    };
+  });
+}
+
 module.exports = {
   RECURRING_CADENCES,
   RECURRING_REGISTRY_COLUMNS,
@@ -4308,10 +4439,13 @@ module.exports = {
   RECURRING_REGISTRY_SEPARATOR_ROW,
   parseRecurringRegistry,
   parseBillDefinition,
+  planBillsFromLegacy,
   parseBillDueRule,
   serializeBillDueRule,
   normalizeBillId,
   billDueAfter,
+  resolveBillCycleAnchor,
+  billDriftTolerance,
   computeBillState,
   buildBillsView,
   buildBillMatcher,
