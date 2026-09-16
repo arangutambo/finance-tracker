@@ -204,6 +204,12 @@ class FinanceTrackerPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: "finance-tracker-tidy-recurring",
+      name: "Tidy up recurring payments",
+      callback: () => this.openRecurringCleanup(),
+    });
+
+    this.addCommand({
       id: "finance-tracker-recategorise",
       name: "Rename or split a category",
       callback: () => this.openRecategorise(),
@@ -5046,6 +5052,101 @@ class FinanceTrackerPlugin extends Plugin {
     const modal = new RecategoriseModal(this.app, this, { category });
     modal.open();
     return modal;
+  }
+
+  // --- Tidying up the old bill model ---------------------------------------------
+
+  async planRecurringCleanup() {
+    const payload = [];
+    for (const file of this.getDailyNoteFiles()) {
+      payload.push({ path: file.path, content: await this.app.vault.cachedRead(file) });
+    }
+    const plan = core.planNoteRewrite(
+      payload,
+      core.buildRecurringCleanupTransform({
+        prefix: this.settings.recurringTagPrefix || "subscriptions",
+        defaultCurrency: this.settings.defaultCurrency,
+        heading: this.settings.spendingHeading,
+        spendingRootTag: this.settings.spendingRootTag,
+      })
+    );
+
+    // The registry keeps a row for every bill it has ever seen, including the
+    // phantom "Skipped This Cycle" one the old nameless skip lines minted.
+    const registryPlan = await this.planStaleRegistryRows();
+    return {
+      files: [...plan.files, ...registryPlan.files],
+      samples: [...plan.samples, ...registryPlan.samples].slice(0, 5),
+      warnings: [...plan.warnings, ...registryPlan.warnings],
+      totals: {
+        files: plan.totals.files + registryPlan.totals.files,
+        entries: plan.totals.entries + registryPlan.totals.entries,
+        warnings: plan.totals.warnings + registryPlan.totals.warnings,
+      },
+    };
+  }
+
+  // Ghost registry rows: the "Skipped This Cycle" one the old nameless skip lines
+  // minted, and any other row with no history and no amount.
+  //
+  // Deliberately narrow. A row with an amount and no history is a bill set up
+  // before its first payment — the author has one for car registration, $795 a
+  // year, logged nowhere yet — and dropping that would throw away the setup.
+  async planStaleRegistryRows() {
+    const file = this.app.vault.getAbstractFileByPath(this.getRecurringNotePath());
+    if (!(file instanceof TFile)) return { files: [], samples: [], warnings: [], totals: { files: 0, entries: 0, warnings: 0 } };
+    const content = await this.app.vault.cachedRead(file);
+    const detected = new Set(
+      core
+        .detectRecurringPayments(await this.collectAllTransactions(), {
+          prefix: this.settings.recurringTagPrefix || "subscriptions",
+        })
+        .items.map((item) => item.name)
+    );
+
+    return core.planNoteRewrite([{ path: file.path, content }], (noteContent) => {
+      const lines = String(noteContent).replace(/\r\n/g, "\n").split("\n");
+      const keep = [];
+      const warnings = [];
+      const samples = [];
+      let removed = 0;
+      for (const line of lines) {
+        const isRow = /^\s*\|/.test(line) && !/^\s*\|?[\s:-]+\|/.test(line);
+        const cells = isRow ? line.split("|").slice(1, -1).map((cell) => cell.trim()) : [];
+        const name = isRow ? core.normalizeCategoryPath(cells[0] || "") : "";
+        const amount = core.parseNumber(cells[2] || "");
+        const isGhost = !detected.has(name) && (!(amount > 0) || /^skipped/.test(name));
+        if (name && name !== "item" && isGhost) {
+          removed += 1;
+          warnings.push({ line: line.trim(), reason: "no payments and no amount — a leftover row" });
+          if (samples.length < 2) samples.push({ before: line.trim(), after: "(row removed)" });
+          continue;
+        }
+        keep.push(line);
+      }
+      return { content: keep.join("\n"), entries: removed, samples, warnings };
+    });
+  }
+
+  async openRecurringCleanup() {
+    const plan = await this.planRecurringCleanup();
+    new RewritePreviewModal(this.app, this, {
+      title: "Tidy up recurring payments",
+      intro:
+        "Removes same-day duplicate bill charges — the same bill logged twice because wording variants were each treated as their own bill — along with the old $0 skip markers and registry rows for bills that no longer exist.",
+      plan,
+      warningsLabel: "Lines being removed",
+      emptyText: "Nothing to tidy up.",
+      applyLabel: `Remove ${plan.totals.entries} line${plan.totals.entries === 1 ? "" : "s"}`,
+      onApply: async (approved) => {
+        const { written, skipped } = await this.applyNoteRewritePlan(approved);
+        new Notice(
+          `Tidied ${written} note${written === 1 ? "" : "s"}${
+            skipped.length ? `. ${skipped.length} changed since the preview and were left alone` : ""
+          }.`
+        );
+      },
+    }).open();
   }
 
   // --- Recategorising ---------------------------------------------------------

@@ -2202,3 +2202,59 @@ test("an entry whose note moved on falls back to matching by text", () => {
   const next = core.removeTransactionBlock(shifted, entry.rawLine, {}, { lineIndex: entry.lineIndex });
   assert.ok(next != null && !next.includes("Mebami"), next);
 });
+
+test("the recurring cleanup removes same-day duplicates and $0 skip markers", () => {
+  // Straight from the author's notes: auto-log treated three wordings as three
+  // bills and logged all of them, every week.
+  const note = [
+    "## Finance",
+    "- [ ] #log/spending 95",
+    "\t- $30.00 #log/spending/subscriptions/weekly",
+    "\t\t- Urban climb sub",
+    "\t- $30.00 #log/spending/subscriptions/weekly",
+    "\t\t- Urban Climb",
+    "\t- $30.00 #log/spending/subscriptions/weekly",
+    "\t\t- Urban Climb Membership",
+    "\t- $0.00 #log/spending/subscriptions/monthly",
+    "\t\t- Skipped this cycle",
+    "\t- $5.00 #log/spending/food/takeaway/coffee",
+    "\t\t- Merlo",
+    "\t- $5.00 #log/spending/food/takeaway/coffee",
+    "\t\t- Merlo",
+    "",
+  ].join("\n");
+
+  const transform = core.buildRecurringCleanupTransform({ prefix: "subscriptions", heading: "## Finance" });
+  const { content, entries, warnings } = transform(note, "2026-05-22.md");
+
+  assert.equal(entries, 3, "two duplicate charges and one skip marker");
+  const left = core.parseTransactionsFromNoteContent(content, "2026-05-22.md", {});
+  assert.equal(left.filter((entry) => entry.category.startsWith("subscriptions")).length, 1);
+  assert.equal(left.find((entry) => entry.category.startsWith("subscriptions")).merchant, "Urban climb sub", "the first one is the one kept");
+  // Two identical coffees on one day are two coffees.
+  assert.equal(left.filter((entry) => entry.category === "food/takeaway/coffee").length, 2);
+  assert.ok(content.includes("- [ ] #log/spending 40"), "the total is rewritten from what is left");
+  // Warnings are recorded in removal order, which is bottom-up.
+  assert.ok(
+    warnings.some((warning) => /already logged that day as "Urban climb sub"/.test(warning.reason)),
+    JSON.stringify(warnings)
+  );
+  assert.ok(warnings.some((warning) => /skip marker/.test(warning.reason)));
+
+  // Nothing left to do on a second pass.
+  assert.equal(transform(content, "2026-05-22.md").entries, 0);
+});
+
+test("the cleanup leaves a bill logged twice on purpose alone when amounts differ", () => {
+  const note = [
+    "## Finance",
+    "- [ ] #log/spending 105",
+    "\t- $17.50 #log/spending/subscriptions/fortnightly",
+    "\t\t- Martial Arts Queensland",
+    "\t- $87.50 #log/spending/subscriptions/fortnightly",
+    "\t\t- Payment for Martial Arts Queensland",
+    "",
+  ].join("\n");
+  const transform = core.buildRecurringCleanupTransform({ prefix: "subscriptions", heading: "## Finance" });
+  assert.equal(transform(note, "2026-05-22.md").entries, 0, "different amounts are different charges");
+});

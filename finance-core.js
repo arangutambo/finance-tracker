@@ -3833,6 +3833,79 @@ function buildCategoryTableRenameTransform(renames) {
   };
 }
 
+// Tidies the wreckage the old bill model left in the notes.
+//
+// Two kinds. A **same-day duplicate**: the same bill logged twice or three times
+// on one date, because wording variants were each detected as their own bill and
+// auto-log then logged all of them. A **$0 skip marker**: how a skipped cycle
+// used to be recorded, which is bookkeeping in the middle of a spending log, and
+// which the nameless ones could turn into a phantom bill of their own.
+//
+// Only entries under the recurring prefix are considered. Two $5 coffees on one
+// day are two coffees; two identical subscription charges on one day are not.
+function buildRecurringCleanupTransform(options = {}) {
+  const prefix = normalizeCategoryPath(options.prefix || "subscriptions") || "subscriptions";
+  const removeDuplicates = options.removeDuplicates !== false;
+  const removeZeroSkips = options.removeZeroSkips !== false;
+  const settings = {
+    defaultCurrency: options.defaultCurrency || "AUD",
+    spendingHeading: options.heading || "## Finance",
+    spendingRootTag: options.spendingRootTag || "#log/spending",
+  };
+
+  return function transform(content, path) {
+    const entries = parseTransactionsFromNoteContent(content, path, {
+      defaultCurrency: settings.defaultCurrency,
+      financeHeading: settings.spendingHeading,
+      spendingHeading: settings.spendingHeading,
+    }).filter((entry) => {
+      const category = normalizeCategoryPath(entry.category || "");
+      return category === prefix || category.startsWith(`${prefix}/`);
+    });
+
+    const doomed = [];
+    const kept = new Map();
+    for (const entry of entries) {
+      if (!(entry.amount > 0)) {
+        if (removeZeroSkips) doomed.push({ entry, reason: "skip marker, recorded on the bill now" });
+        continue;
+      }
+      if (!removeDuplicates) continue;
+      const key = `${entry.date}|${entry.amount.toFixed(2)}|${normalizeCategoryPath(entry.category)}`;
+      const first = kept.get(key);
+      if (!first) {
+        kept.set(key, entry);
+        continue;
+      }
+      doomed.push({
+        entry,
+        reason: `same ${formatCurrency(entry.amount, entry.currency || settings.defaultCurrency)} charge already logged that day${
+          first.merchant ? ` as "${first.merchant}"` : ""
+        }`,
+      });
+    }
+
+    if (!doomed.length) return { content, entries: 0, samples: [], warnings: [] };
+
+    // Bottom-up, so removing one entry cannot shift the line another sits at.
+    const ordered = doomed.slice().sort((left, right) => (right.entry.lineIndex ?? -1) - (left.entry.lineIndex ?? -1));
+    let next = content;
+    let removed = 0;
+    const samples = [];
+    const warnings = [];
+    for (const { entry, reason } of ordered) {
+      const without = removeTransactionBlock(next, entry.rawLine, settings, { lineIndex: entry.lineIndex });
+      if (without == null) continue;
+      next = without;
+      removed += 1;
+      warnings.push({ line: `${entry.date} ${entry.rawLine.trim()}${entry.merchant ? ` (${entry.merchant})` : ""}`, reason });
+      if (samples.length < 3) samples.push({ before: entry.rawLine.trim(), after: "(removed)" });
+    }
+
+    return { content: next, entries: removed, samples, warnings };
+  };
+}
+
 module.exports = {
   RECURRING_CADENCES,
   RECURRING_REGISTRY_COLUMNS,
@@ -3914,6 +3987,7 @@ module.exports = {
   planNoteRewrite,
   buildLegacyTripTagTransform,
   buildCategoryTableRenameTransform,
+  buildRecurringCleanupTransform,
   summarizeLegacyTripTags,
   findFinanceHeadingIndex,
   findTransactionLineIndex,

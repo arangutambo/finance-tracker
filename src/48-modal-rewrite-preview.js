@@ -51,7 +51,9 @@ class RewritePreviewModal extends Modal {
 
     if (plan.warnings?.length) {
       const warnings = contentEl.createEl("details", { cls: "finance-tracker-chart-card" });
-      warnings.createEl("summary", { text: `Lines worth checking afterwards (${plan.warnings.length})` });
+      warnings.createEl("summary", {
+        text: `${this.options.warningsLabel || "Lines worth checking afterwards"} (${plan.warnings.length})`,
+      });
       for (const warning of plan.warnings.slice(0, 25)) {
         const row = warnings.createDiv({ cls: "finance-tracker-budget-card" });
         row.createDiv({ cls: "finance-tracker-budget-title", text: String(warning.line || "").trim() });

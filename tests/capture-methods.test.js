@@ -1090,3 +1090,42 @@ test("logging a bill writes a tag that names it", async () => {
     .join("\n");
   assert.match(logged, /#log\/spending\/subscriptions\/weekly\/urban-climb-subscription/, "the logged payment names its bill");
 });
+
+test("the tidy-up plan covers notes and the registry's ghost rows", async () => {
+  const { plugin, app } = makePlugin(billSettings());
+  delete plugin.invalidateIndexEntry;
+  await app.vault.create(
+    "Daily/2026-05-22.md",
+    [
+      "## Finance",
+      "- [ ] #log/spending 60",
+      "\t- $30.00 #log/spending/subscriptions/weekly",
+      "\t\t- Urban climb sub",
+      "\t- $30.00 #log/spending/subscriptions/weekly",
+      "\t\t- Urban Climb Membership",
+      "",
+    ].join("\n")
+  );
+  await app.vault.create(
+    "Utility/Budgets/Recurring.md",
+    [
+      "| Item | Cadence | Amount | Active | Auto-log |",
+      "| --- | --- | ---: | --- | --- |",
+      "| urban-climb-sub | weekly | 30 | yes | yes |",
+      "| skipped-this-cycle | monthly | 0 | no | yes |",
+      "| tmr-car-registration | yearly | 795.15 | yes | yes |",
+      "",
+    ].join("\n")
+  );
+
+  const plan = await plugin.planRecurringCleanup();
+
+  assert.equal(plan.totals.files, 2, "the daily note and the registry");
+  assert.equal(plan.totals.entries, 2, "one duplicate charge, one ghost row");
+  await plugin.applyNoteRewritePlan(plan);
+
+  const registry = (await plugin.app.vault.getAbstractFileByPath("Utility/Budgets/Recurring.md")).content;
+  assert.ok(!registry.includes("skipped-this-cycle"), "the phantom bill's row goes");
+  assert.ok(registry.includes("tmr-car-registration"), "a bill set up before its first payment keeps its row");
+  assert.ok(registry.includes("urban-climb-sub"));
+});
