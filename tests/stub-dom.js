@@ -43,10 +43,21 @@ class StubEl {
 
   setText(value) { this.text = String(value); }
   appendText(value) { this.text += String(value); }
-  addClass(cls) { this.classList.add(cls); }
-  removeClass(cls) { this.classList.delete(cls); }
+  // Obsidian's addClass is classList.add, which throws on a string containing a
+  // space. The stub was forgiving, so a blank modal reached the user instead of
+  // a failing test.
+  addClass(...classes) {
+    for (const cls of classes) {
+      if (/\s/.test(String(cls))) throw new Error(`InvalidCharacterError: class "${cls}" contains whitespace — pass one per argument`);
+      this.classList.add(cls);
+    }
+  }
+  removeClass(...classes) {
+    for (const cls of classes) this.classList.delete(cls);
+  }
   hasClass(cls) { return this.classList.has(cls); }
   toggleClass(cls, force) {
+    if (/\s/.test(String(cls))) throw new Error(`InvalidCharacterError: class "${cls}" contains whitespace`);
     const on = force === undefined ? !this.classList.has(cls) : force;
     if (on) this.classList.add(cls);
     else this.classList.delete(cls);

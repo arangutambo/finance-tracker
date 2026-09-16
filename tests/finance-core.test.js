@@ -2258,3 +2258,160 @@ test("the cleanup leaves a bill logged twice on purpose alone when amounts diffe
   const transform = core.buildRecurringCleanupTransform({ prefix: "subscriptions", heading: "## Finance" });
   assert.equal(transform(note, "2026-05-22.md").entries, 0, "different amounts are different charges");
 });
+
+// --- Bills ------------------------------------------------------------------------
+
+const URBAN_CLIMB = core.parseBillDefinition({
+  bill_id: "urban-climb",
+  bill_name: "Urban Climb",
+  aliases: "[Urban Climb Membership, Urban climb sub, urban-climb-subscription]",
+  cadence: "weekly",
+  amount: "30",
+});
+
+function payment(date, amount, merchant, category = "subscriptions/weekly") {
+  return { date, amount, merchant, category, entryType: "spending" };
+}
+
+test("parseBillDefinition reads a bill note's frontmatter", () => {
+  const bill = core.parseBillDefinition({
+    bill_id: "Aussie Broadband NBN",
+    cadence: "monthly",
+    due_rule: "day-of-month: 15",
+    amount: "89",
+    amount_model: "variable",
+    reminder_days: "3",
+    auto_log: "yes",
+    next_amount: "66.50",
+    change_date: "2026-08-15",
+    skipped: "[2026-09-08]",
+  });
+
+  assert.equal(bill.id, "aussie-broadband-nbn");
+  assert.equal(bill.name, "Aussie Broadband NBN");
+  assert.deepEqual(bill.dueRule, { type: "day-of-month", day: 15 });
+  assert.equal(bill.amountModel, "variable");
+  assert.equal(bill.reminderDays, 3);
+  assert.equal(bill.autoLog, true);
+  assert.deepEqual(bill.skipped, ["2026-09-08"]);
+  assert.equal(core.serializeBillDueRule(bill.dueRule), "day-of-month: 15");
+
+  // A note with nothing useful in it is not a bill.
+  assert.equal(core.parseBillDefinition({ bill_name: "Something" }), null);
+});
+
+test("a bill's aliases gather up the wordings that used to be separate bills", () => {
+  const entries = [
+    payment("2026-07-03", 30, "Urban climb sub"),
+    payment("2026-07-10", 30, "Urban Climb"),
+    payment("2026-07-17", 30, "Urban Climb Membership"),
+    payment("2026-08-14", 30, "Urban Climb Subscription", "subscriptions/weekly/urban-climb-subscription"),
+    payment("2026-08-20", 12.5, "Coles", "food/groceries"),
+  ];
+
+  const view = core.buildBillsView([URBAN_CLIMB], entries, { referenceDate: "2026-08-21" });
+
+  assert.equal(view.items.length, 1);
+  assert.equal(view.items[0].count, 4, "all four wordings belong to one bill");
+  assert.equal(view.items[0].lastDate, "2026-08-14");
+  assert.equal(view.unmatched.length, 0, "the groceries entry is not a bill entry at all");
+  assert.equal(view.totals.monthly, core.roundCurrencyAmount(30 * (52 / 12)));
+});
+
+test("a payment clears a stale next-due override instead of being ignored by it", () => {
+  // The exact shape of the bug: Log now set an override, then the bill was paid
+  // by hand a few days later. The override used to win forever.
+  const bill = { ...core.parseBillDefinition({ bill_id: "apple", cadence: "monthly", amount: "7.99", next_due: "2026-08-24" }) };
+  const paidLate = [payment("2026-06-28", 7.99, "apple payment", "subscriptions/monthly/apple"), payment("2026-08-28", 7.99, "apple payment", "subscriptions/monthly/apple")];
+
+  const stale = core.computeBillState(bill, paidLate, { referenceDate: "2026-09-16" });
+  assert.equal(stale.nextDue, "2026-09-28", "the schedule follows the payment that was actually made");
+  assert.equal(stale.status, "upcoming");
+  assert.equal(stale.usedOverride, false);
+
+  // An override still does its job while no payment has overtaken it.
+  const pending = core.computeBillState(bill, [paidLate[0]], { referenceDate: "2026-08-20" });
+  assert.equal(pending.nextDue, "2026-08-24");
+  assert.equal(pending.usedOverride, true);
+});
+
+test("a bill due on a day of the month keeps that day, clamped to short months", () => {
+  const bill = core.parseBillDefinition({ bill_id: "rent", cadence: "monthly", due_rule: "day-of-month: 31", amount: "600" });
+  assert.equal(core.billDueAfter(bill, "2026-01-31"), "2026-02-28");
+  assert.equal(core.billDueAfter(bill, "2026-02-28"), "2026-03-31");
+  // Paying late does not move the day.
+  assert.equal(core.billDueAfter(bill, "2026-03-03"), "2026-03-31");
+});
+
+test("a bill due on the nth weekday finds it each month", () => {
+  const bill = core.parseBillDefinition({ bill_id: "cleaner", cadence: "monthly", due_rule: "nth-weekday: 2 tue", amount: "120" });
+  assert.equal(core.billDueAfter(bill, "2026-09-01"), "2026-09-08");
+  assert.equal(core.billDueAfter(bill, "2026-09-08"), "2026-10-13");
+
+  const last = core.parseBillDefinition({ bill_id: "payday", cadence: "monthly", due_rule: "nth-weekday: -1 fri", amount: "10" });
+  assert.equal(core.billDueAfter(last, "2026-09-01"), "2026-09-25");
+});
+
+test("a skipped cycle moves the schedule on without a $0 bullet", () => {
+  const bill = core.parseBillDefinition({ bill_id: "claude", cadence: "monthly", amount: "34", skipped: "[2026-09-26]" });
+  const state = core.computeBillState(bill, [payment("2026-08-30", 34, "Claude AI Payment", "subscriptions/monthly/claude")], {
+    referenceDate: "2026-09-27",
+  });
+  assert.equal(state.nextDue, "2026-10-26", "the skip is the anchor, so the next cycle follows it");
+  assert.deepEqual(state.skipped, ["2026-09-26"]);
+});
+
+test("a variable bill projects off its recent payments, a fixed one off its amount", () => {
+  const variable = core.parseBillDefinition({ bill_id: "power", cadence: "quarterly", amount_model: "variable" });
+  const payments = [payment("2026-01-10", 220, "Energy", "subscriptions/quarterly/power"), payment("2026-04-10", 260, "Energy", "subscriptions/quarterly/power"), payment("2026-07-10", 300, "Energy", "subscriptions/quarterly/power")];
+  const state = core.computeBillState(variable, payments, { referenceDate: "2026-08-01" });
+  assert.equal(state.averageAmount, 260);
+  assert.equal(state.lastAmount, 260, "the average, not the last bill");
+  assert.equal(state.variable, true);
+});
+
+test("a bill retires at its end date or when its payments run out", () => {
+  const ending = core.parseBillDefinition({ bill_id: "gym", cadence: "monthly", amount: "50", end_date: "2026-09-30" });
+  const past = core.computeBillState(ending, [payment("2026-09-15", 50, "Gym", "subscriptions/monthly/gym")], { referenceDate: "2026-10-20" });
+  assert.equal(past.finished, true);
+  assert.equal(past.finishedReason, "end-date");
+  assert.equal(past.active, false);
+
+  const instalments = core.parseBillDefinition({ bill_id: "laptop", cadence: "monthly", amount: "100", payments_left: "0" });
+  const done = core.computeBillState(instalments, [], { referenceDate: "2026-10-20" });
+  assert.equal(done.finishedReason, "payments");
+});
+
+test("entries no bill claims become suggestions, one per merchant", () => {
+  const entries = [
+    payment("2026-07-03", 11.99, "HBO Max Subscription", "subscriptions/monthly"),
+    payment("2026-06-03", 11.99, "HBO Max Subscription", "subscriptions/monthly"),
+    payment("2026-07-15", 18.99, "Adobe Payment", "subscriptions/monthly"),
+  ];
+  const view = core.buildBillsView([], entries, { referenceDate: "2026-09-16" });
+
+  assert.equal(view.items.length, 0);
+  assert.equal(view.unmatched.length, 3);
+  assert.equal(view.suggestions.length, 2);
+  assert.equal(view.suggestions[0].id, "hbomaxsubscription");
+  assert.equal(view.suggestions[0].count, 2);
+  assert.equal(view.suggestions[0].cadence, "monthly");
+  assert.equal(view.suggestions[0].lastAmount, 11.99);
+});
+
+test("a card capture is matched to the bill it pays", () => {
+  const bill = core.parseBillDefinition({ bill_id: "claude", bill_name: "Claude", aliases: "[Claude AI Payment]", cadence: "monthly", amount: "34" });
+  const view = core.buildBillsView([bill], [payment("2026-08-26", 34, "Claude AI Payment", "subscriptions/monthly/claude")], {
+    referenceDate: "2026-09-20",
+  });
+
+  // Right merchant, right sort of amount, close to the due date.
+  const matched = core.findBillForPayment({ date: "2026-09-25", amount: 34, merchant: "CLAUDE AI PAYMENT" }, view.items);
+  assert.equal(matched?.billId, "claude");
+
+  // Wrong amount, and a merchant that has nothing to do with it.
+  assert.equal(core.findBillForPayment({ date: "2026-09-25", amount: 340, merchant: "Claude AI Payment" }, view.items), null);
+  assert.equal(core.findBillForPayment({ date: "2026-09-25", amount: 34, merchant: "Coles" }, view.items), null);
+  // Right in every way except that it is nowhere near the due date.
+  assert.equal(core.findBillForPayment({ date: "2026-11-02", amount: 34, merchant: "Claude AI Payment" }, view.items), null);
+});

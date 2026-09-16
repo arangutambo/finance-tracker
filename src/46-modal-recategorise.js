@@ -36,7 +36,10 @@ class RecategoriseModal extends Modal {
   async onOpen() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.addClass("finance-edit finance-recategorise");
+    // One class per argument: addClass goes to classList.add, which rejects a
+    // string with a space in it — and the throw happens before anything renders,
+    // leaving an empty modal.
+    contentEl.addClass("finance-edit", "finance-recategorise");
     contentEl.createEl("h3", { text: "Rename or split a category" });
     this.known = await this.plugin.collectKnownSuggestions();
 

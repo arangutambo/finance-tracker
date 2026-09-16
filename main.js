@@ -3909,12 +3909,419 @@ const core = (() => {
     };
   }
 
+  // --- Bills ----------------------------------------------------------------------
+  //
+  // A bill is a thing you have decided to track, with an id that does not change.
+  // Before this, a bill *was* its tag: `cadence/name`, where name came from the tag
+  // or, failing that, from a slug of whatever the child line happened to say. So
+  // "Urban Climb", "Urban climb sub" and "Urban Climb Membership" were three bills,
+  // a cadence change was a new bill, and the only fix offered was to remove the
+  // duplicates one by one — twelve of them, in the author's vault.
+  //
+  // Detection still exists, but as a suggestion: "this looks recurring, track it?".
+  // What a bill *is* now lives in a note you can read and edit.
+
+  const BILL_DUE_RULES = ["after-last", "day-of-month", "nth-weekday"];
+  const WEEKDAYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+
+  // Cadences that can sit on a calendar day. A weekly bill has no "14th of the
+  // month", so it always falls back to counting from the last payment.
+  const CADENCE_MONTHS = { monthly: 1, quarterly: 3, yearly: 12 };
+
+  function normalizeBillId(value) {
+    return normalizeCategoryPath(value).split("/").filter(Boolean).join("-");
+  }
+
+  function billNameFromId(raw, id) {
+    const text = normalizeWhitespace(raw);
+    return /[A-Z\s]/.test(text) ? text : titleCaseSegment(id);
+  }
+
+  function parseBillDueRule(value) {
+    const raw = normalizeWhitespace(String(value || "")).toLowerCase();
+    if (!raw || raw === "after-last" || raw === "after last") return { type: "after-last" };
+
+    const dayMatch = raw.match(/^day[- ]of[- ]month\s*[:=]?\s*(\d{1,2})$/);
+    if (dayMatch) return { type: "day-of-month", day: Math.min(31, Math.max(1, Number(dayMatch[1]))) };
+
+    const weekdayMatch = raw.match(/^nth[- ]weekday\s*[:=]?\s*(-?\d)\s+([a-z]+)$/);
+    if (weekdayMatch) {
+      const weekday = WEEKDAYS.findIndex((day) => day.startsWith(weekdayMatch[2].slice(0, 3)));
+      if (weekday >= 0) return { type: "nth-weekday", ordinal: Number(weekdayMatch[1]), weekday };
+    }
+    return { type: "after-last" };
+  }
+
+  function serializeBillDueRule(rule) {
+    if (rule?.type === "day-of-month") return `day-of-month: ${rule.day}`;
+    if (rule?.type === "nth-weekday") return `nth-weekday: ${rule.ordinal} ${WEEKDAYS[rule.weekday] || "monday"}`;
+    return "after-last";
+  }
+
+  function parseListValue(value) {
+    if (Array.isArray(value)) return value.map((item) => normalizeWhitespace(item)).filter(Boolean);
+    const raw = String(value || "").trim().replace(/^\[|\]$/g, "");
+    return raw
+      .split(",")
+      .map((item) => normalizeWhitespace(item).replace(/^["']|["']$/g, ""))
+      .filter(Boolean);
+  }
+
+  // A bill note's frontmatter. Everything is optional except an id and a cadence:
+  // a half-filled note should still describe a usable bill.
+  function parseBillDefinition(frontmatter, options = {}) {
+    const fm = frontmatter || {};
+    const id = normalizeBillId(fm.bill_id || fm.id || fm.bill_name || fm.name || "");
+    const cadence = normalizeCadence(fm.cadence || fm.frequency || "");
+    if (!id || !cadence) return null;
+
+    const amount = parseNumber(fm.amount);
+    const amountModel = String(fm.amount_model || (/^(?:true|yes|1)$/i.test(String(fm.variable || "")) ? "variable" : "fixed"))
+      .trim()
+      .toLowerCase();
+
+    return {
+      id,
+      // Keep the name as written where there is one to keep: title-casing the id
+      // turns "Aussie Broadband NBN" into "Aussie Broadband Nbn".
+      name: normalizeWhitespace(fm.bill_name || fm.name || "") || billNameFromId(fm.bill_id || fm.id || "", id),
+      aliases: parseListValue(fm.aliases),
+      cadence,
+      dueRule: parseBillDueRule(fm.due_rule),
+      amount: Number.isFinite(amount) && amount > 0 ? roundCurrencyAmount(amount) : null,
+      amountModel: amountModel === "variable" || amountModel === "range" ? amountModel : "fixed",
+      amountMin: parseNumber(fm.amount_min),
+      amountMax: parseNumber(fm.amount_max),
+      reminderDays: Math.max(0, Number(parseNumber(fm.reminder_days)) || 0),
+      active: !/^(?:false|no|0)$/i.test(String(fm.active ?? "true")),
+      autoLog: /^(?:true|yes|1|on)$/i.test(String(fm.auto_log ?? "")),
+      nextAmount: parseNumber(fm.next_amount),
+      changeDate: parseIsoDate(fm.change_date || ""),
+      endDate: parseIsoDate(fm.end_date || ""),
+      paymentsLeft: Number.isFinite(parseNumber(fm.payments_left)) ? Math.floor(parseNumber(fm.payments_left)) : null,
+      nextDueOverride: parseIsoDate(fm.next_due || fm.next_due_override || ""),
+      skipped: parseListValue(fm.skipped).map((date) => parseIsoDate(date)).filter(Boolean),
+      startDate: parseIsoDate(fm.start_date || ""),
+      currency: normalizeCurrency(fm.currency || options.defaultCurrency || "AUD"),
+      notePath: options.notePath || "",
+    };
+  }
+
+  function clampDayOfMonth(monthIso, day) {
+    const [year, month] = String(monthIso).split("-").map(Number);
+    if (!year || !month) return "";
+    const lastDay = new Date(year, month, 0).getDate();
+    return `${monthIso}-${pad(Math.min(Math.max(1, Number(day) || 1), lastDay))}`;
+  }
+
+  function nthWeekdayOfMonth(monthIso, ordinal, weekday) {
+    const [year, month] = String(monthIso).split("-").map(Number);
+    if (!year || !month) return "";
+    const lastDay = new Date(year, month, 0).getDate();
+    if (Number(ordinal) === -1) {
+      for (let day = lastDay; day >= 1; day -= 1) {
+        if (new Date(year, month - 1, day).getDay() === weekday) return `${monthIso}-${pad(day)}`;
+      }
+      return "";
+    }
+    let seen = 0;
+    for (let day = 1; day <= lastDay; day += 1) {
+      if (new Date(year, month - 1, day).getDay() !== weekday) continue;
+      seen += 1;
+      if (seen === Number(ordinal)) return `${monthIso}-${pad(day)}`;
+    }
+    return "";
+  }
+
+  // The next date this bill falls due, strictly after `fromDate`.
+  function billDueAfter(bill, fromDate) {
+    const anchor = parseIsoDate(fromDate);
+    const cadence = normalizeCadence(bill?.cadence);
+    if (!anchor || !cadence) return "";
+    const rule = bill.dueRule || { type: "after-last" };
+    const months = CADENCE_MONTHS[cadence];
+
+    // A calendar rule needs a cadence measured in months; weekly and fortnightly
+    // bills count from the last payment however the rule is written.
+    if (rule.type === "after-last" || !months) return nextRecurringDate(anchor, cadence) || "";
+
+    const dateIn = (monthIso) =>
+      rule.type === "day-of-month" ? clampDayOfMonth(monthIso, rule.day) : nthWeekdayOfMonth(monthIso, rule.ordinal, rule.weekday);
+
+    let month = anchor.slice(0, 7);
+    for (let step = 0; step < 24; step += 1) {
+      const candidate = dateIn(month);
+      if (candidate && candidate > anchor) return candidate;
+      month = addMonths(`${month}-01`, months).slice(0, 7);
+    }
+    return nextRecurringDate(anchor, cadence) || "";
+  }
+
+  // What a bill looks like right now, given the payments linked to it: what it
+  // costs, when it is next due, and whether it has run its course.
+  //
+  // The override is the one piece with history behind it. It exists so that
+  // logging a bill late does not drag every future due date along with it — but it
+  // used to win unconditionally, so a bill paid any other way (typed by hand, or
+  // captured from a card) stayed "overdue" forever behind a stale override. It is
+  // now cleared by any payment on or after the date it names.
+  function computeBillState(bill, payments, options = {}) {
+    const referenceDate = parseIsoDate(options.referenceDate) || todayIsoLocal();
+    const paid = (payments || [])
+      .filter((payment) => Number(payment?.amount || 0) > 0)
+      .sort((left, right) => String(left.date).localeCompare(String(right.date)));
+    const recentAmounts = paid.slice(-6).map((payment) => roundCurrencyAmount(payment.amount));
+    const lastPayment = paid[paid.length - 1] || null;
+    const skips = (bill.skipped || []).slice().sort();
+    const lastSkip = skips[skips.length - 1] || "";
+    // A skipped cycle moves the schedule on exactly as a payment does.
+    const anchor = [lastPayment?.date || "", lastSkip, bill.startDate || ""].filter(Boolean).sort().pop() || "";
+
+    const averageAmount = recentAmounts.length
+      ? roundCurrencyAmount(recentAmounts.reduce((sum, value) => sum + value, 0) / recentAmounts.length)
+      : 0;
+    const observed = bill.amountModel === "variable" ? averageAmount : roundCurrencyAmount(lastPayment?.amount || 0);
+    const baseAmount = roundCurrencyAmount(bill.amount ?? observed ?? 0);
+
+    const derived = anchor ? billDueAfter(bill, anchor) : "";
+    const overrideStillStands = Boolean(bill.nextDueOverride) && !(anchor && anchor >= bill.nextDueOverride);
+    const nextDue = overrideStillStands ? bill.nextDueOverride : derived || bill.nextDueOverride || "";
+
+    const changePending = bill.nextAmount > 0 && bill.changeDate && bill.changeDate > referenceDate;
+    const changeApplied = bill.nextAmount > 0 && bill.changeDate && bill.changeDate <= referenceDate;
+    const lastAmount = changeApplied ? roundCurrencyAmount(bill.nextAmount) : baseAmount;
+    const nextDueAmount =
+      bill.nextAmount > 0 && bill.changeDate && nextDue && bill.changeDate <= nextDue
+        ? roundCurrencyAmount(bill.nextAmount)
+        : lastAmount;
+
+    const outOfPayments = bill.paymentsLeft !== null && bill.paymentsLeft <= 0;
+    const pastEndDate = Boolean(bill.endDate && (!nextDue || nextDue > bill.endDate));
+    const finishedReason = outOfPayments ? "payments" : pastEndDate ? "end-date" : "";
+    const finished = Boolean(finishedReason);
+    const active = bill.active !== false && !finished;
+
+    const status = finished
+      ? "finished"
+      : !nextDue
+        ? "unknown"
+        : nextDue < referenceDate
+          ? "overdue"
+          : nextDue === referenceDate
+            ? "due"
+            : "upcoming";
+    const daysUntilDue = nextDue
+      ? nextDue >= referenceDate
+        ? daysBetweenInclusive(referenceDate, nextDue) - 1
+        : -(daysBetweenInclusive(nextDue, referenceDate) - 1)
+      : null;
+    const spec = RECURRING_CADENCES[bill.cadence];
+
+    return {
+      // The shape every existing consumer already reads — the block, the sidebar
+      // card, the payment calendar, runway — so they keep working unchanged.
+      active,
+      autoLog: bill.autoLog,
+      cadence: bill.cadence,
+      category: `${normalizeCategoryPath(options.prefix || "subscriptions")}/${bill.cadence}/${bill.id}`,
+      changeDate: changePending ? bill.changeDate : null,
+      count: paid.length,
+      currency: bill.currency,
+      daysUntilDue,
+      endDate: bill.endDate,
+      finished,
+      finishedReason,
+      label: bill.name,
+      lastAmount,
+      lastDate: lastPayment?.date || "",
+      merchant: lastPayment?.merchant || bill.name,
+      monthlyCost: spec ? roundCurrencyAmount(nextDueAmount * spec.perMonth) : 0,
+      name: bill.id,
+      nextAmount: changePending ? roundCurrencyAmount(bill.nextAmount) : null,
+      nextDue,
+      nextDueAmount,
+      paymentsLeft: bill.paymentsLeft,
+      recentAmounts,
+      averageAmount: averageAmount || lastAmount,
+      status,
+      tag: `#log/spending/${normalizeCategoryPath(options.prefix || "subscriptions")}/${bill.cadence}/${bill.id}`,
+      variable: bill.amountModel === "variable",
+      yearlyCost: spec ? roundCurrencyAmount(nextDueAmount * spec.perMonth * 12) : 0,
+
+      // New, for the bills UI.
+      bill,
+      billId: bill.id,
+      dueRule: bill.dueRule,
+      notePath: bill.notePath,
+      payments: paid,
+      reminderDays: bill.reminderDays,
+      skipped: skips,
+      usedOverride: overrideStillStands,
+    };
+  }
+
+  // Which bill does this entry belong to? In order: the id in its own tag, then an
+  // alias or the merchant root. Anything left over is not claimed — a guess that
+  // files a payment under the wrong bill is worse than an unlinked entry.
+  function buildBillMatcher(bills, options = {}) {
+    const prefix = normalizeCategoryPath(options.prefix || "subscriptions") || "subscriptions";
+    const byId = new Map();
+    const byAlias = new Map();
+    for (const bill of bills || []) {
+      byId.set(bill.id, bill.id);
+      const names = [bill.id, bill.name, ...(bill.aliases || [])];
+      for (const alias of names) {
+        for (const key of [normalizeBillId(alias), normalizeMerchant(alias), merchantRootKey(alias)]) {
+          if (key && !byAlias.has(key)) byAlias.set(key, bill.id);
+        }
+      }
+    }
+
+    return function match(entry) {
+      const category = normalizeCategoryPath(entry?.category || "");
+      const underPrefix = category === prefix || category.startsWith(`${prefix}/`);
+      if (!underPrefix) return "";
+      const rest = category.slice(prefix.length).split("/").filter(Boolean);
+      const tagged = normalizeBillId(rest.slice(1).join("-"));
+      if (tagged && byId.has(tagged)) return tagged;
+      if (tagged && byAlias.has(tagged)) return byAlias.get(tagged);
+      for (const key of [normalizeBillId(entry?.merchant || ""), normalizeMerchant(entry?.merchant || ""), merchantRootKey(entry?.merchant || "")]) {
+        if (key && byAlias.has(key)) return byAlias.get(key);
+      }
+      return "";
+    };
+  }
+
+  // Everything the bills UI needs: each bill's state, the recurring entries no bill
+  // claimed, and what those suggest tracking.
+  function buildBillsView(bills, entries, options = {}) {
+    const prefix = normalizeCategoryPath(options.prefix || "subscriptions") || "subscriptions";
+    const referenceDate = parseIsoDate(options.referenceDate) || todayIsoLocal();
+    const match = buildBillMatcher(bills, { prefix });
+    const payments = new Map((bills || []).map((bill) => [bill.id, []]));
+    const unmatched = [];
+
+    for (const entry of entries || []) {
+      if (entry?.isIncome || entry?.isGoalContribution || isPlannedExpenseEntry(entry)) continue;
+      const category = normalizeCategoryPath(entry.category || "");
+      if (category !== prefix && !category.startsWith(`${prefix}/`)) continue;
+      const billId = match(entry);
+      if (billId && payments.has(billId)) payments.get(billId).push(entry);
+      else unmatched.push(entry);
+    }
+
+    const items = (bills || []).map((bill) =>
+      computeBillState(bill, payments.get(bill.id) || [], { referenceDate, prefix })
+    );
+    const live = items.filter((item) => item.active);
+
+    return {
+      items,
+      unmatched,
+      suggestions: suggestBillsFromEntries(unmatched, { prefix, referenceDate }),
+      totals: {
+        monthly: roundCurrencyAmount(live.reduce((sum, item) => sum + item.monthlyCost, 0)),
+        yearly: roundCurrencyAmount(live.reduce((sum, item) => sum + item.yearlyCost, 0)),
+      },
+    };
+  }
+
+  // Recurring-looking entries nothing is tracking yet, grouped into one suggestion
+  // per merchant. This is what detection is for now: an offer, not a fact.
+  function suggestBillsFromEntries(entries, options = {}) {
+    const prefix = normalizeCategoryPath(options.prefix || "subscriptions") || "subscriptions";
+    const groups = new Map();
+
+    for (const entry of entries || []) {
+      if (!(Number(entry?.amount || 0) > 0)) continue;
+      const category = normalizeCategoryPath(entry.category || "");
+      const rest = category.slice(prefix.length).split("/").filter(Boolean);
+      const cadence = normalizeCadence(rest[0]);
+      if (!cadence) continue;
+      const named = rest.slice(1).join("-");
+      const key = normalizeBillId(named || merchantRootKey(entry.merchant || "") || "");
+      if (!key) continue;
+      const group = groups.get(key) || {
+        id: key,
+        cadence,
+        name: normalizeWhitespace(entry.merchant || "") || titleCaseSegment(key),
+        amounts: [],
+        dates: [],
+        merchants: new Set(),
+      };
+      group.amounts.push(roundCurrencyAmount(entry.amount));
+      group.dates.push(parseIsoDate(entry.date) || "");
+      if (entry.merchant) group.merchants.add(normalizeWhitespace(entry.merchant));
+      groups.set(key, group);
+    }
+
+    return Array.from(groups.values())
+      .map((group) => {
+        const dates = group.dates.filter(Boolean).sort();
+        return {
+          id: group.id,
+          name: group.name,
+          cadence: group.cadence,
+          count: group.amounts.length,
+          lastAmount: group.amounts[group.amounts.length - 1],
+          lastDate: dates[dates.length - 1] || "",
+          firstDate: dates[0] || "",
+          merchants: Array.from(group.merchants),
+          total: roundCurrencyAmount(group.amounts.reduce((sum, value) => sum + value, 0)),
+        };
+      })
+      .sort((left, right) => right.count - left.count || right.total - left.total);
+  }
+
+  // A capture that looks like a bill: right sort of amount, near enough the due
+  // date, and a merchant that matches. Used when a card capture arrives, and to
+  // offer "is this the Claude bill?" for ones already logged.
+  function findBillForPayment(payment, items, options = {}) {
+    const windowDays = Number.isFinite(options.windowDays) ? options.windowDays : 7;
+    const tolerance = Number.isFinite(options.tolerance) ? options.tolerance : 0.1;
+    const date = parseIsoDate(payment?.date);
+    const amount = Number(payment?.amount || 0);
+    if (!date || !(amount > 0)) return null;
+    const merchantKey = merchantRootKey(payment?.merchant || "");
+
+    let best = null;
+    for (const item of items || []) {
+      if (!item.active || !item.nextDue) continue;
+      const names = [item.billId, item.label, ...(item.bill?.aliases || [])];
+      const matchesMerchant = merchantKey && names.some((name) => merchantRootKey(name) === merchantKey);
+      if (!matchesMerchant) continue;
+
+      const expected = item.nextDueAmount || item.lastAmount;
+      const withinAmount =
+        item.variable ||
+        (expected > 0 && Math.abs(amount - expected) <= Math.max(expected * tolerance, 0.5));
+      if (!withinAmount) continue;
+
+      const gap = Math.abs(Math.round((isoToDate(date).getTime() - isoToDate(item.nextDue).getTime()) / DAY_MS));
+      if (gap > windowDays) continue;
+      if (!best || gap < best.gap) best = { item, gap };
+    }
+    return best ? best.item : null;
+  }
+
   return {
     RECURRING_CADENCES,
     RECURRING_REGISTRY_COLUMNS,
     RECURRING_REGISTRY_HEADER_ROW,
     RECURRING_REGISTRY_SEPARATOR_ROW,
     parseRecurringRegistry,
+    parseBillDefinition,
+    parseBillDueRule,
+    serializeBillDueRule,
+    normalizeBillId,
+    billDueAfter,
+    computeBillState,
+    buildBillsView,
+    buildBillMatcher,
+    suggestBillsFromEntries,
+    findBillForPayment,
+    clampDayOfMonth,
+    nthWeekdayOfMonth,
     applyRecurringRegistry,
     buildTripReflection,
     computeRunway,
@@ -12115,7 +12522,10 @@ class RecategoriseModal extends Modal {
   async onOpen() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.addClass("finance-edit finance-recategorise");
+    // One class per argument: addClass goes to classList.add, which rejects a
+    // string with a space in it — and the throw happens before anything renders,
+    // leaving an empty modal.
+    contentEl.addClass("finance-edit", "finance-recategorise");
     contentEl.createEl("h3", { text: "Rename or split a category" });
     this.known = await this.plugin.collectKnownSuggestions();
 
