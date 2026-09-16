@@ -2443,11 +2443,7 @@ class FinanceTrackerPlugin extends Plugin {
     // The tag must name the bill. A bare `#log/spending/subscriptions/monthly`
     // skip line names no item, so the next parse can only fall back to the
     // line's own note text and invent a bill out of the marker.
-    const category = core.normalizeCategoryPath(item.category || "");
-    const named = category && item.name && !category.endsWith(`/${item.name}`)
-      ? `${category}/${item.name}`
-      : category;
-    const tag = named ? core.buildCategoryTag(named) : item.tag;
+    const tag = this.recurringPaymentTag(item);
     return this.appendFinanceLines(item.nextDue || core.todayIsoLocal(), [
       `\t- ${core.formatCurrency(0, item.currency || this.settings.defaultCurrency)} ${tag}`,
       "\t\t- Skipped this cycle",
@@ -5219,7 +5215,21 @@ class FinanceTrackerPlugin extends Plugin {
   excludeRemovedRecurringItems(applied) {
     const excluded = new Set(this.settings.excludedRecurringItems || []);
     if (!excluded.size) return applied;
-    return { ...applied, items: applied.items.filter((item) => !excluded.has(item.name)) };
+    const items = applied.items.filter((item) => !excluded.has(item.name));
+    // The totals have to be recomputed, not carried over. They were not, so a
+    // bill you removed for good still counted toward cost per month, cost per
+    // year, and everything downstream of them — in the author's vault twelve
+    // removed duplicates, most of a thousand dollars a month of bills that do
+    // not exist.
+    const active = items.filter((item) => item.active !== false);
+    return {
+      ...applied,
+      items,
+      totals: {
+        monthly: core.roundCurrencyAmount(active.reduce((sum, item) => sum + Number(item.monthlyCost || 0), 0)),
+        yearly: core.roundCurrencyAmount(active.reduce((sum, item) => sum + Number(item.yearlyCost || 0), 0)),
+      },
+    };
   }
 
   // "Due date" (the default) keeps finance-core's own ordering — overdue
@@ -5344,10 +5354,22 @@ class FinanceTrackerPlugin extends Plugin {
     this.refreshDailyBudgetView();
   }
 
+  // The tag a logged payment carries has to name its bill. Log now and auto-log
+  // used to write the bare `subscriptions/<cadence>` tag the bill was detected
+  // from, so every payment the plugin logged itself kept the identity problem
+  // alive: the next parse had only the child line to go on, and a different
+  // wording there minted a different bill. Skips were fixed in 0.8.0; logging
+  // was not.
+  recurringPaymentTag(item) {
+    const category = core.normalizeCategoryPath(item.category || "");
+    const named = category && item.name && !category.endsWith(`/${item.name}`) ? `${category}/${item.name}` : category;
+    return named ? core.buildCategoryTag(named) : item.tag;
+  }
+
   async logRecurringItem(item, date, amountOverride) {
     const amount = Number.isFinite(amountOverride) && amountOverride > 0 ? amountOverride : item.lastAmount;
     const logDate = date || core.todayIsoLocal();
-    const bullet = [`\t- ${core.formatCurrency(amount, item.currency || this.settings.defaultCurrency)} ${item.tag}`];
+    const bullet = [`\t- ${core.formatCurrency(amount, item.currency || this.settings.defaultCurrency)} ${this.recurringPaymentTag(item)}`];
     if (item.merchant) bullet.push(`\t\t- ${item.merchant}`);
     // No separate runway deduction is written: computeRunwayBalance derives the
     // draw-down from this very bullet, so there is only ever one line per bill.
@@ -6130,10 +6152,11 @@ class FinanceTrackerPlugin extends Plugin {
     const referenceDate = this.getReferenceDateForSource(ctx.sourcePath);
     const currency = core.normalizeCurrency(config.currency || this.settings.defaultCurrency);
     const entries = await this.collectAllTransactions();
-    const recurring = core.detectRecurringPayments(entries, {
-      prefix: this.settings.recurringTagPrefix || "subscriptions",
-      referenceDate,
-    });
+    // detectRecurring, not the raw detector: the registry's pauses, end dates and
+    // removals have to apply here too. Without them the forecast counted every
+    // bill ever detected — in the author's vault $1,134.90 a month against $316.82
+    // of live bills, most of it duplicates and cancelled subscriptions.
+    const recurring = await this.detectRecurring(referenceDate);
 
     const goals = await this.collectSavingsGoalDefinitions();
     const goalKeys = goals.map((goal) => goal.goalKey).filter(Boolean);
@@ -6196,6 +6219,19 @@ class FinanceTrackerPlugin extends Plugin {
       cls: "finance-tracker-budget-meta",
       text: `Based on income minus recurring bills minus the trailing ${inputs.windowDays}-day average discretionary spend, including committed goal set-asides.`,
     });
+
+    // A projection from nothing is not a projection. Say which half is missing
+    // rather than drawing a confident line down from zero.
+    const missing = [];
+    if (!(inputs.monthlyIncome > 0) && !Number.isFinite(core.parseNumber(config.income))) {
+      missing.push(`no income logged in the last ${inputs.windowDays} days — add \`income:\` to this block, or log income as #log/income/salary`);
+    }
+    if (!(balances.latestTotal > 0) && !Number.isFinite(core.parseNumber(config.start))) {
+      missing.push("no balance snapshots, so the line starts at zero — run Snapshot balances, or add `start:`");
+    }
+    if (missing.length) {
+      wrapper.createDiv({ cls: "finance-tracker-empty", text: `This forecast is incomplete: ${missing.join("; ")}.` });
+    }
   }
 
   // --- Year/quarter review command --------------------------------------------------

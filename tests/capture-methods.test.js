@@ -144,7 +144,10 @@ function makePlugin(overrides = {}) {
   plugin.getActiveTripContext = async () => null;
   plugin.ensureFolder = async () => {};
   plugin.upsertFile = async (p, body) => {
-    files.set(p, new StubTFile(p, body));
+    const file = new StubTFile(p, body);
+    files.set(p, file);
+    // The real one returns the file, and callers read it back.
+    return file;
   };
   plugin.getDailyNotePath = (date) => `Daily/${date}.md`;
   plugin.createDailyNoteFromTemplate = async (p) =>
@@ -1015,4 +1018,75 @@ test("quick add previews the category the capture will actually use", async () =
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.match(preview.text, /Food \/ Groceries/);
   assert.doesNotMatch(preview.text, /how you filed it/);
+});
+
+// --- Recurring bills ------------------------------------------------------------------
+
+function billSettings(extra = {}) {
+  return {
+    budgetsFolderPath: "Utility/Budgets",
+    budgetArchiveFolderPath: "Utility/Budgets/Archive",
+    defaultBudgetNoteName: "Budgets.md",
+    recurringNoteName: "Recurring.md",
+    recurringTagPrefix: "subscriptions",
+    ...extra,
+  };
+}
+
+test("the forecast counts the bills that are live, not every bill ever detected", async () => {
+  const { plugin, app } = makePlugin(billSettings({ excludedRecurringItems: ["hbo-max-subscription"] }));
+  delete plugin.invalidateIndexEntry;
+  await app.vault.create(
+    "Daily/2026-08-06.md",
+    [
+      "## Finance",
+      "- [ ] #log/spending 60.98",
+      "\t- $34.00 #log/spending/subscriptions/monthly/claude",
+      "\t- $14.99 #log/spending/subscriptions/monthly/telstra",
+      "\t- $11.99 #log/spending/subscriptions/monthly/hbo-max-subscription",
+      "",
+    ].join("\n")
+  );
+  // Telstra is paused in the registry; HBO was removed for good.
+  await app.vault.create(
+    "Utility/Budgets/Recurring.md",
+    [
+      "| Item | Cadence | Amount | Active | Auto-log |",
+      "| --- | --- | ---: | --- | --- |",
+      "| telstra | monthly | 14.99 | no | yes |",
+      "",
+    ].join("\n")
+  );
+
+  const el = new StubEl();
+  await plugin.renderForecastBlock("months: 6", el, { sourcePath: "Dashboard.md" });
+
+  const text = el.allText();
+  // Only Claude is live: $34.00 a month, not $60.98.
+  assert.match(text, /Recurring bills \/ month \| \$34\.00/, text);
+  // And it says why the projection is thin, instead of drawing a line from zero.
+  assert.match(text, /no income logged in the last 90 days/);
+  assert.match(text, /no balance snapshots/);
+});
+
+test("logging a bill writes a tag that names it", async () => {
+  const { plugin, app, files } = makePlugin(billSettings());
+  delete plugin.invalidateIndexEntry;
+  await app.vault.create(
+    "Daily/2026-08-14.md",
+    "## Finance\n- [ ] #log/spending 30\n\t- $30.00 #log/spending/subscriptions/weekly\n\t\t- Urban Climb Subscription\n"
+  );
+
+  const recurring = await plugin.detectRecurring("2026-09-16");
+  const item = recurring.items.find((entry) => entry.name === "urban-climb-subscription");
+  assert.ok(item, "the bill is detected from its child line");
+  // The bare tag is what made the identity fragile in the first place.
+  assert.equal(item.tag, "#log/spending/subscriptions/weekly");
+
+  await plugin.logRecurringNow(item);
+
+  const logged = Object.values(Object.fromEntries(files))
+    .map((file) => file.content)
+    .join("\n");
+  assert.match(logged, /#log\/spending\/subscriptions\/weekly\/urban-climb-subscription/, "the logged payment names its bill");
 });
