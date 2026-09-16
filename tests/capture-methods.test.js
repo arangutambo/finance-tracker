@@ -565,3 +565,45 @@ test("appending finance lines joins a note's existing legacy heading", async () 
   assert.equal((content.match(/^## /gm) || []).length, 1, "a second finance section must not appear");
   assert.ok(content.includes("- [ ] #log/spending 15"), content);
 });
+
+// --- Entry cache -------------------------------------------------------------------
+
+test("the all-entries walk happens once until a note changes", async () => {
+  const { plugin, app, files } = makePlugin();
+  // The real invalidation, not the harness stub: that is what clears the cache.
+  delete plugin.invalidateIndexEntry;
+  await app.vault.create("Daily/2026-09-14.md", "## Finance\n- [ ] #log/spending 27.3\n\t- $27.30 #log/spending/food/takeaway\n");
+
+  let reads = 0;
+  const read = app.vault.cachedRead;
+  app.vault.cachedRead = async (file) => {
+    reads += 1;
+    return read(file);
+  };
+
+  const first = await plugin.collectAllTransactions();
+  const afterFirst = reads;
+  const second = await plugin.collectAllTransactions();
+
+  assert.equal(first.length, 1);
+  assert.equal(second.length, 1);
+  assert.equal(reads, afterFirst, "a second pass must not re-read the vault");
+
+  files.get("Daily/2026-09-14.md").content += "\t- $5.00 #log/spending/food/snacks\n";
+  plugin.invalidateIndexEntry("Daily/2026-09-14.md");
+
+  const third = await plugin.collectAllTransactions();
+  assert.equal(third.length, 2, "an edited note is picked up again");
+  assert.ok(reads > afterFirst);
+});
+
+test("a capture invalidates the cached entries", async () => {
+  const { plugin, app } = makePlugin();
+  delete plugin.invalidateIndexEntry;
+  await app.vault.create("Daily/2026-07-30.md", "## Finance\n- [ ] #log/spending 0\n");
+
+  assert.equal((await plugin.collectAllTransactions()).length, 0);
+  await plugin.handleCapture({ amount: "12.50", merchant: "Coles", date: "2026-07-30", source: "anz" });
+
+  assert.equal((await plugin.collectAllTransactions()).length, 1, "the new capture must be visible immediately");
+});

@@ -5680,6 +5680,7 @@ class FinanceTrackerPlugin extends Plugin {
 
   invalidateIndexEntry(path) {
     if (this._txnIndex) this._txnIndex.delete(path);
+    this._allTransactions = null;
     // Merchant history is derived from the index, so any note that changes can
     // change what the next capture learns.
     this._merchantHistory = null;
@@ -5712,6 +5713,15 @@ class FinanceTrackerPlugin extends Plugin {
           this.invalidateIndexEntry(file.path);
           this._scheduleStatusBarUpdate();
         }
+      })
+    );
+    this.registerEvent(
+      this.app.vault.on("create", (file) => {
+        // A note arriving from Sync, or from another device, changes the numbers
+        // exactly as much as one edited here does.
+        if (!file?.path?.startsWith(normalizePath(`${this.settings.dailyNotesFolder}/`))) return;
+        this.invalidateIndexEntry(file.path);
+        this._scheduleStatusBarUpdate();
       })
     );
     this.registerEvent(this.app.vault.on("delete", (file) => this.invalidateIndexEntry(file.path)));
@@ -5851,12 +5861,12 @@ class FinanceTrackerPlugin extends Plugin {
   async collectTransactionsForHoliday(holidayKey, range = {}) {
     const normalizedHolidayKey = core.normalizeHolidayKey(holidayKey);
     if (!normalizedHolidayKey) return [];
-    const allEntries = await this.collectTransactionsForRange({
-      period: "all",
-      start: range.start || "1900-01-01",
-      end: range.end || "2999-12-31",
-    });
-    return allEntries.filter((entry) => entry.holidayKey === normalizedHolidayKey);
+    const allEntries = await this.collectAllTransactions();
+    const start = range.start || "1900-01-01";
+    const end = range.end || "2999-12-31";
+    return allEntries.filter(
+      (entry) => entry.holidayKey === normalizedHolidayKey && core.isDateInRange(entry.date, { start, end })
+    );
   }
 
   async exportEntriesToCsv(entries, label) {
@@ -6903,11 +6913,7 @@ class FinanceTrackerPlugin extends Plugin {
   }
 
   async buildSavingsGoalSummary(goalDefinition, referenceDate, options = {}) {
-    const allEntries = await this.collectTransactionsForRange({
-      period: "all",
-      start: "1900-01-01",
-      end: "2999-12-31",
-    });
+    const allEntries = await this.collectAllTransactions();
     let effectiveGoalDefinition = goalDefinition;
     if (goalDefinition?.goalType === "holiday") {
       const plannedEntries = allEntries.filter(
@@ -8766,8 +8772,19 @@ class FinanceTrackerPlugin extends Plugin {
 
   }
 
+  // One sidebar render asks for every transaction about ten times over — split
+  // balances, due bills, each savings goal, the merchant history. The per-file
+  // index already avoids re-parsing unchanged notes, but each call still walked
+  // the whole vault and rebuilt the list. This holds that list until a note
+  // actually changes; invalidateIndexEntry drops it.
+  //
+  // Callers treat the result as read-only: collectTransactionsForRange builds a
+  // fresh array each time, and nothing sorts or pushes into what it returns.
   async collectAllTransactions() {
-    return this.collectTransactionsForRange({ period: "all", start: "1900-01-01", end: "2999-12-31" });
+    if (this._allTransactions) return this._allTransactions;
+    const entries = await this.collectTransactionsForRange({ period: "all", start: "1900-01-01", end: "2999-12-31" });
+    this._allTransactions = entries;
+    return entries;
   }
 
   // Appends raw finance lines (already tab-indented as needed) to the end of a
