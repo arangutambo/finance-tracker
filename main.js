@@ -4115,7 +4115,7 @@ const core = (() => {
     const skips = (bill.skipped || []).slice().sort();
     const lastSkip = skips[skips.length - 1] || "";
     // A skipped cycle moves the schedule on exactly as a payment does.
-    const anchor = resolveBillCycleAnchor(bill, [...paid.map((payment) => payment.date), ...skips, bill.startDate || ""]);
+    let anchor = resolveBillCycleAnchor(bill, [...paid.map((payment) => payment.date), ...skips, bill.startDate || ""]);
 
     const averageAmount = recentAmounts.length
       ? roundCurrencyAmount(recentAmounts.reduce((sum, value) => sum + value, 0) / recentAmounts.length)
@@ -4123,8 +4123,22 @@ const core = (() => {
     const observed = bill.amountModel === "variable" ? averageAmount : roundCurrencyAmount(lastPayment?.amount || 0);
     const baseAmount = roundCurrencyAmount(bill.amount ?? observed ?? 0);
 
+    // An override is settled by a payment on or after its date — or a little
+    // before it, within the same tolerance a late payment gets. Paying a weekly
+    // bill the day before it is due is paying that week's bill; without this the
+    // author's gym, paid on the 16th, still read "due today" on the 17th.
+    let overrideStillStands = Boolean(bill.nextDueOverride);
+    if (overrideStillStands && anchor) {
+      const early = Math.round((isoToDate(bill.nextDueOverride).getTime() - isoToDate(anchor).getTime()) / DAY_MS);
+      if (anchor >= bill.nextDueOverride) {
+        overrideStillStands = false;
+      } else if (early <= billDriftTolerance(bill.cadence)) {
+        overrideStillStands = false;
+        // That cycle is done, so the next one follows the date it was due.
+        anchor = bill.nextDueOverride;
+      }
+    }
     const derived = anchor ? billDueAfter(bill, anchor) : "";
-    const overrideStillStands = Boolean(bill.nextDueOverride) && !(anchor && anchor >= bill.nextDueOverride);
     const nextDue = overrideStillStands ? bill.nextDueOverride : derived || bill.nextDueOverride || "";
 
     const changePending = bill.nextAmount > 0 && bill.changeDate && bill.changeDate > referenceDate;

@@ -2464,3 +2464,21 @@ test("planBillsFromLegacy merges wordings but keeps genuinely separate charges",
   assert.equal(arts.length, 2);
   assert.equal(arts.every((bill) => bill.retired && bill.endDate), true, "a cancelled bill keeps its history and gets an end date");
 });
+
+test("a bill paid a day before its override date is settled for that cycle", () => {
+  // The author's gym: an override of the 17th, paid on the 16th.
+  const bill = core.parseBillDefinition({ bill_id: "climb", cadence: "weekly", amount: "30", next_due: "2026-09-17" });
+  const payments = ["2026-09-02", "2026-09-09", "2026-09-16"].map((date) => payment(date, 30, "Urban Climb", "subscriptions/weekly/climb"));
+
+  const state = core.computeBillState(bill, payments, { referenceDate: "2026-09-17" });
+  assert.equal(state.usedOverride, false);
+  assert.equal(state.nextDue, "2026-09-24", "the rhythm follows the date it was due, not the day it was paid");
+  assert.equal(state.status, "upcoming");
+
+  // Paid well before the override is not the same thing: the override stands.
+  const early = core.computeBillState(bill, [payment("2026-09-09", 30, "Urban Climb", "subscriptions/weekly/climb")], {
+    referenceDate: "2026-09-12",
+  });
+  assert.equal(early.nextDue, "2026-09-17");
+  assert.equal(early.usedOverride, true);
+});
