@@ -40,12 +40,13 @@ Support the project: [Buy Me a Coffee](https://buymeacoffee.com/tonyhad)
 - [How logging works](#how-logging-works) — the tag format, and six ways to capture
 - [Tag language](#tag-language) — spending, income, balances, trips, splits
 - [Budgets](#budgets) — pace-aware limits in a markdown table
-- [Dashboards](#dashboards) — the donut, trends and budget bars
+- [Finance hub](#finance-hub) — one view with Today, Inbox, Budgets, Bills, Goals & trips, Portfolio and Reviews
+- [Dashboards](#dashboards) — the donut, trends, budget bars and review sections
 - [Goals (savings + trips)](#goals-savings--trips) — sinking funds and trip mode
 - [Recurring payments](#recurring-payments) — bills, cadences, and the lifecycle
 - [Runway](#runway) — how much of your outgoings you have covered
 - [Split expenses](#split-expenses) · [Forecast](#forecast) · [Accounts & portfolio](#accounts--portfolio)
-- [Query block](#query-block) · [Year & quarter reviews](#year--quarter-reviews)
+- [Query block](#query-block) · [Reviews](#reviews) — weekly, monthly, quarterly and yearly snapshots
 - [Daily budget sidebar](#daily-budget-sidebar--status-bar) · [Merchant map](#merchant-map)
 - [Commands](#commands) · [Settings](#key-settings) · [Limitations](#limitations)
 - [Development](#development)
@@ -472,6 +473,33 @@ A real budgets note, with the free-form Notes section people tend to add below t
   forecast. Use `type: all` in a `finance-query` block for a report that
   includes trip entries.
 
+## Finance hub
+
+Command: **Open finance hub** · ribbon **wallet** icon · **Hub** in the Daily budget sidebar
+
+One view for everything beyond logging, in tabs:
+
+| Tab | What's there |
+| --- | --- |
+| **Today** | The Daily budget panel: today, this period, left per day, budgets, bills due. |
+| **Inbox** | Bills that are overdue or due soon (with **Mark paid**), payments that look recurring but belong to no bill, every uncategorised entry grouped by merchant, and captures that failed. The tab's badge counts all of them. |
+| **Budgets** | This week or month (whichever periods your budgets use): budget bars, uncategorised callout, daily spend and the category donut. |
+| **Bills** | The full bills list: overdue, due soon, later, the payment calendar and suggestions. |
+| **Goals & trips** | Every goal with **Contribute**, **New goal**, trip mode, and each trip's dates. |
+| **Portfolio** | The portfolio dashboard, with **Log trade**. |
+| **Reviews** | A week, month, quarter or year with every dashboard section. Step back and forward with **‹ ›**; **Copy as text** copies a frozen review to paste into a note. |
+
+Every tab has its own command (**Open finance hub: bills**, and so on), so any
+of them can have a hotkey. The hub remembers its tab. It sits alongside the
+Daily budget sidebar rather than replacing it, and every code block keeps
+working inside notes.
+
+**Everything stays current.** When a daily note, budget, goal, bill or the
+portfolio note changes — typed here, synced from your phone, or written by the
+plugin — the hub, the sidebar and every finance block open in a note refresh
+once, half a second later. A block you're typing into waits until you click
+away.
+
 ## Dashboards
 
 Add a fenced code block to any note; each reads transactions from your daily notes.
@@ -484,10 +512,41 @@ currency: AUD       # optional override
 start: 2026-06-01   # optional explicit range (needs end)
 end: 2026-06-30
 title: June Spending
+show: defaults, merchants   # optional: which sections, in this order
+hide: trend                 # optional: sections to leave out
 ```
 ````
 
-Shows summary cards (total, avg/day, vs previous period, top category), a
+### Sections
+
+| Section | Shows |
+| --- | --- |
+| `summary` | Total, average per day, change vs the previous period, top category. |
+| `income` | Income, spent, saved and **savings rate** = (income − home spending) ÷ income. Goal contributions, settle-ups and trip spending are transfers, so they're left out. With no income logged it says so rather than showing a rate. |
+| `uncategorised` | How many entries (and how much) have no category, with **Open inbox**. Only appears when there are some. |
+| `categories` | The category donut. |
+| `trend` | Daily spend with your budget line (periods up to 62 days). |
+| `changes` | The categories that moved most since the previous period, either way. |
+| `merchants` | Top five merchants, with branches of one shop grouped together. |
+| `largest` | The five largest transactions (your share of a split). Tap one to edit it. |
+| `budgets` | Pace-aware budget bars. |
+| `bills` | Bills paid this period; for a period that's still running, what's still due and what's due next period. |
+| `trips` | Trip spending, which never counts toward home totals. |
+| `savings` | Savings contributions this period. |
+| `portfolio` | Trades, dividends and — when there's price history — the change in value. Never fetches prices. |
+
+**Defaults:** `period: week` and `period: month` show every section. Other
+periods show what dashboards always did — summary, categories, trend, budgets,
+savings — plus the uncategorised callout. Sections with nothing to say stay
+hidden, so a quiet week doesn't fill up with empty cards. `show:` lists the
+sections you want in the order you want them (`defaults` and `all` expand in
+place); `hide:` removes some. Your existing weekly and monthly notes pick up
+the new sections without any edits.
+
+"The previous period" is the previous calendar period: September is compared
+with August, a week with the week before.
+
+The donut is a
 **three-ring category donut** — inner ring is the major categories, middle
 ring is each subcategory as its own colour section (a shade of its parent's
 hue), and the outer ring splits each subcategory further into its own leaf
@@ -942,19 +1001,56 @@ Views: `table` (grouped sums), `categories` (ranked category table with
 percentages), `bars` (ranked bars), `income-expense` (monthly income-vs-expense
 bars), `cumulative` (cumulative balance line).
 
-## Year & quarter reviews
+## Reviews
 
-Command: **Insert a finance block** → Year in review / Quarter in review
+Commands: **Insert weekly review** · **Insert monthly review** · **Insert a finance block** → Weekly review / Monthly review / Quarter in review / Year in review · **Copy as text** in the hub's Reviews tab
 
-Unlike the other entries in that list, these two don't insert a live code
-block — they compute the numbers once, right now, and insert the finished
-markdown at your cursor. Run one inside a "Yearly Review" or "Quarterly
-Review" note (or any note) to drop in a frozen snapshot for the current
-year/quarter: total spent and income, the best and worst month by spend, the
-top spending categories with their share of the total, and a transfers
-summary (savings contributions, savings withdrawals, settled split repayments
-received, and runway contributions). Re-running the command later
-produces a fresh snapshot reflecting whatever you've logged since.
+A review is not a live block. It works the numbers out once and inserts
+finished markdown at your cursor, so the note still says the same thing a year
+from now. The period is **the note's own**: a review inserted into your W19 note
+covers week 19, and one inserted into `2026-07.md` covers July, whenever you
+get round to writing it up. Outside a periodic note it covers the current
+period.
+
+A **weekly or monthly review** has what you spent (and the change from the
+period before), income, what you saved and your savings rate, uncategorised
+entries, bills paid, trip spending, a table of where the money went with each
+category's change, top merchants, the largest transactions, and any transfers:
+
+```md
+## Finance review: week of 7 Sep 2026
+
+- Period: 2026-09-07 to 2026-09-13
+- Spent: $801.73 (▲ $661.73 (+473%) vs previous week)
+- Income: $2,050.00
+- Saved: $1,248.27 (61% savings rate)
+- Uncategorised: 1 entry, $33.23
+- Bills paid: 1 ($66.50)
+- Trip spending, not counted above: Japan $210.00
+
+### Where it went
+
+| Category | Spent | Share | vs previous week |
+| --- | ---: | ---: | ---: |
+| Medical | $480.00 | 60% | ▲ $480.00 |
+| Food | $210.00 | 26% | ▲ $110.00 |
+
+### Top merchants
+
+| Merchant | Spent | Visits |
+| --- | ---: | ---: |
+| The Good Group Cli | $480.00 | 1 |
+| Woolworths | $150.00 | 2 |
+
+### Largest transactions
+
+- 2026-09-09 · The Good Group Cli · Medical · $480.00
+```
+
+A **quarter or year review** has total spent and income, the best and worst
+month by spend, the top spending categories with their share, and a transfers
+summary (savings contributions and withdrawals, settled split repayments,
+runway contributions):
 
 ```md
 ## 2026 Year in Review
@@ -980,12 +1076,16 @@ produces a fresh snapshot reflecting whatever you've logged since.
 - Runway contributions: $400.00 (4)
 ```
 
+Running one again later gives a fresh snapshot with whatever you've logged
+since.
+
 ## Daily budget sidebar & status bar
 
 The **Daily Budget** sidebar (ribbon coin icon) shows today + period spend, a
 Left/Day card, a mini pie, compact pace-aware budget rows (tap a row for the
 detail), savings goals, split balances, a **Recurring bills due** card, and a
-**Needs a Category** triage list.
+**Needs a category** card counting everything uncategorised, with **Open inbox**.
+**Hub** opens the [finance hub](#finance-hub).
 
 <img src="docs/images/daily-budget-sidebar.png" alt="Daily budget sidebar: today and fortnight totals, a category pie, pace-aware budget rows, savings goals, and a recurring bill due with a filled Log now" width="380">
 
@@ -1034,12 +1134,15 @@ with **Finance Tracker:**.
 | Command | What it does |
 | --- | --- |
 | **Quick add transaction** | Opens the quick-add modal — one field, natural language, live preview. |
+| **Open finance hub** | Opens the [finance hub](#finance-hub) (same as the ribbon wallet icon). |
+| **Open finance hub: today / inbox / budgets / bills / goals & trips / portfolio / reviews** | Opens the hub on that tab. |
 | **Open daily budget** | Opens the Daily budget sidebar (same as clicking the ribbon coin icon). |
+| **Insert weekly review** / **Insert monthly review** | Inserts a frozen [review](#reviews) of the note's own week or month at the cursor. |
 | **Log due recurring payments** | Logs every recurring bill whose next-due date has arrived (loops to catch up several missed cycles), same as **Log all due** in the block. |
 | **Contribute to a goal** | Log a contribution to a chosen goal and date. |
 | **Settle up split expenses** | Outstanding split balances per person, with one-tap settle (logs the repayment as income). |
 | **Snapshot balances** | Log one balance bullet per account into today's note, pre-filled with each account's last snapshotted value. |
-| **Insert a finance block** | Pick a block from a list — dashboard, recurring payments, goals, splits, forecast, net worth, query, or a frozen year/quarter review — and insert it at the cursor. Replaces the eight separate `Insert … block` commands. |
+| **Insert a finance block** | Pick a block from a list — dashboard, recurring payments, goals, splits, forecast, accounts & portfolio, portfolio, query, or a frozen weekly, monthly, quarterly or yearly review — and insert it at the cursor. |
 | **Start trip** / **End trip** | Switches quick-add and URL capture to a trip's tag and currency, and back. |
 | **Add trip exchange rate** | Add or update an `exchange_rates` entry on the active trip note. |
 | **Create savings goal** | Create a savings-goal note from the shared goal/trip frontmatter schema. |
@@ -1054,7 +1157,6 @@ with **Finance Tracker:**.
 | **Refresh share prices** | Fetches prices now from the chosen source, unless it is backing off after refusing. |
 | **Convert recurring payments to bill notes** | Turns detected bills and the registry into one note per bill, merging duplicate wordings and keeping cancelled bills as ended. Preview first. |
 | **Tidy up recurring payments** | Removes same-day duplicate bill charges, old $0 skip markers and leftover registry rows. Preview first. |
-| **Open categorisation inbox** | Every uncategorised entry, whatever its date, grouped by merchant with a suggested category and one-tap filing. Also lists captures that failed, with retry. |
 | **Rename or split a category** | Rename a category everywhere — daily notes, the budgets table, merchant rules — or split it by merchant (bare `transport` into public transport, rideshare and scooter). Preview first. |
 | **Convert legacy trip tags** | Converts trips filed under the older `#log/archive/<year>/<trip>/spending/…` tags to the current trip format, rewriting two-currency amounts so the original currency is read back. Shows a full preview first. |
 | **Import merchant map note** | Re-reads `Merchant Map.md` into the merchant map in settings. |
