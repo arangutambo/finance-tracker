@@ -4652,7 +4652,7 @@ class FinanceTrackerPlugin extends Plugin {
     }
   }
 
-  async renderDailyBudgetCheckInto(el, referenceDate, groupBy = "full") {
+  async renderDailyBudgetCheckInto(el, referenceDate, groupBy = "full", options = {}) {
     el.empty();
 
     const basePeriod = this.settings.budgetCheckPeriod || "week";
@@ -4690,7 +4690,9 @@ class FinanceTrackerPlugin extends Plugin {
       tooltip: "Quick add a transaction",
     });
     addAction(headerActions, "Budgets", () => this.openDefaultBudgetNote(), { errorPrefix: "Opening budgets note" });
-    addAction(headerActions, "Hub", () => this.activateHubView(), { opensModal: true, tooltip: "Open the finance hub" });
+    if (!options.inHub) {
+      addAction(headerActions, "Hub", () => this.activateHubView(), { opensModal: true, tooltip: "Open the finance hub" });
+    }
 
     // Summary cards: Today + this period (+ trip cards when one is running).
     // Collected first, rendered once, so the conditional cards join the same
@@ -7228,47 +7230,49 @@ class FinanceTrackerPlugin extends Plugin {
     const prevEntries = filterReal(await this.collectTransactionsForRange(previousRange));
     const previousTotal = core.roundCurrencyAmount(prevEntries.reduce((sum, entry) => sum + core.entrySpendAmount(entry), 0));
 
-    if (on.has("summary")) this.renderSummary(wrapper, entries, currency, range, { previousTotal });
-
-    if (on.has("income")) {
-      const goalKeys = (await this.collectSavingsGoalDefinitions()).map((goal) => goal.goalKey).filter(Boolean);
-      this.renderIncomeSection(wrapper, allEntries, currency, range, goalKeys);
-    }
-
-    if (on.has("uncategorised")) this.renderUncategorisedCallout(wrapper, entries, currency, range);
-
-    if (on.has("categories")) {
-      // Honour the Default grouping setting. This was hardcoded to "full", so a
-      // vault set to "Primary category" still got subcategory rings it had asked
-      // not to see.
-      const hierarchy = core.buildHierarchicalCategoryGroups(entries, groupBy);
-      this.renderPieChart(wrapper, hierarchy, currency, Number(this.settings.dashboardSliceLabelThreshold || 0.08));
-    }
-
+    // Sections render in the order resolveDashboardSections gives, which is
+    // the order a `show:` line names them.
     const budgets = on.has("trend") || on.has("budgets") ? await this.loadBudgets("default") : [];
-    if (on.has("trend")) {
-      const allBudget = budgets.find((budget) => budget.category === "all");
-      let perDayBudget = 0;
-      if (allBudget) {
-        const scaled = core.scaleBudgetLimit(Number(allBudget.limit || 0), allBudget.period, range, referenceDate || range.start, weekStartsOn);
-        perDayBudget = spanDays > 0 ? core.roundCurrencyAmount(scaled / spanDays) : 0;
+    // Budget pace is judged at today's date while the period is running, and at
+    // its last day once it's over — not at the note's date, which for a weekly
+    // note is its Monday.
+    const today = core.todayIsoLocal();
+    const paceDate = today < range.start ? range.start : today > range.end ? range.end : today;
+    for (const section of sections) {
+      if (section === "summary") this.renderSummary(wrapper, entries, currency, range, { previousTotal });
+      if (section === "income") {
+        const goalKeys = (await this.collectSavingsGoalDefinitions()).map((goal) => goal.goalKey).filter(Boolean);
+        this.renderIncomeSection(wrapper, allEntries, currency, range, goalKeys);
       }
-      this.renderSpendTrend(wrapper, entries, range, currency, { perDayBudget });
+      if (section === "uncategorised") this.renderUncategorisedCallout(wrapper, entries, currency, range);
+      if (section === "categories") {
+        // Honour the Default grouping setting. This was hardcoded to "full", so a
+        // vault set to "Primary category" still got subcategory rings it had
+        // asked not to see.
+        const hierarchy = core.buildHierarchicalCategoryGroups(entries, groupBy);
+        this.renderPieChart(wrapper, hierarchy, currency, Number(this.settings.dashboardSliceLabelThreshold || 0.08));
+      }
+      if (section === "trend") {
+        const allBudget = budgets.find((budget) => budget.category === "all");
+        let perDayBudget = 0;
+        if (allBudget) {
+          const scaled = core.scaleBudgetLimit(Number(allBudget.limit || 0), allBudget.period, range, referenceDate || range.start, weekStartsOn);
+          perDayBudget = spanDays > 0 ? core.roundCurrencyAmount(scaled / spanDays) : 0;
+        }
+        this.renderSpendTrend(wrapper, entries, range, currency, { perDayBudget });
+      }
+      if (section === "changes") this.renderCategoryChanges(wrapper, entries, prevEntries, currency, range);
+      if (section === "merchants") this.renderTopMerchants(wrapper, entries, currency);
+      if (section === "largest") this.renderLargestTransactions(wrapper, entries, currency);
+      if (section === "budgets") {
+        const budgetProgress = this.buildBudgetProgress(entries, budgets, range, groupBy, paceDate);
+        this.renderBudgets(wrapper, budgetProgress, currency);
+      }
+      if (section === "bills") await this.renderBillsForPeriod(wrapper, allEntries, currency, range);
+      if (section === "trips") this.renderTripSpendSection(wrapper, allEntries, currency);
+      if (section === "savings") await this.renderSavingsActivity(wrapper, allEntries, currency, range, referenceDate);
+      if (section === "portfolio") await this.renderPortfolioChange(wrapper, allEntries, currency, range);
     }
-
-    if (on.has("changes")) this.renderCategoryChanges(wrapper, entries, prevEntries, currency, range);
-    if (on.has("merchants")) this.renderTopMerchants(wrapper, entries, currency);
-    if (on.has("largest")) this.renderLargestTransactions(wrapper, entries, currency);
-
-    if (on.has("budgets")) {
-      const budgetProgress = this.buildBudgetProgress(entries, budgets, range, groupBy, referenceDate);
-      this.renderBudgets(wrapper, budgetProgress, currency);
-    }
-
-    if (on.has("bills")) await this.renderBillsForPeriod(wrapper, allEntries, currency, range);
-    if (on.has("trips")) this.renderTripSpendSection(wrapper, allEntries, currency);
-    if (on.has("savings")) await this.renderSavingsActivity(wrapper, allEntries, currency, range, referenceDate);
-    if (on.has("portfolio")) await this.renderPortfolioChange(wrapper, allEntries, currency, range);
 
     if (unknown.length) {
       wrapper.createDiv({

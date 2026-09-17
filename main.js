@@ -3315,9 +3315,10 @@ const core = (() => {
     networth: "portfolio",
   };
 
-  // `show:` lists exactly the sections wanted (`defaults` and `all` expand in
-  // place, so `show: defaults, merchants` adds one); `hide:` removes from
-  // whatever that leaves. Unknown names come back so the block can say so.
+  // `show:` lists exactly the sections wanted, in the order wanted (`defaults`
+  // and `all` expand in place, so `show: defaults, merchants` adds one); `hide:`
+  // removes from whatever that leaves. Unknown names come back so the block can
+  // say so.
   function resolveDashboardSections(config = {}, period = "week") {
     const normalize = (token) => {
       const key = String(token || "").trim().toLowerCase().replace(/[\s_-]+/g, "");
@@ -3335,6 +3336,8 @@ const core = (() => {
     const defaults = normalizedPeriod === "week" || normalizedPeriod === "month" ? DASHBOARD_SECTIONS : DASHBOARD_BASE_SECTIONS;
     const unknown = [];
     const shown = parse(config.show);
+    // A Set keeps insertion order, so sections appear in the order `show:` names
+    // them; `defaults` and `all` expand in their usual order.
     let chosen;
     if (shown.length) {
       chosen = new Set();
@@ -3351,7 +3354,7 @@ const core = (() => {
       if (DASHBOARD_SECTIONS.includes(token)) chosen.delete(token);
       else if (token !== "all" && token !== "defaults" && token !== "default") unknown.push(token);
     }
-    return { sections: DASHBOARD_SECTIONS.filter((key) => chosen.has(key)), unknown };
+    return { sections: Array.from(chosen), unknown };
   }
 
   const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
@@ -11116,7 +11119,7 @@ class FinanceTrackerPlugin extends Plugin {
     }
   }
 
-  async renderDailyBudgetCheckInto(el, referenceDate, groupBy = "full") {
+  async renderDailyBudgetCheckInto(el, referenceDate, groupBy = "full", options = {}) {
     el.empty();
 
     const basePeriod = this.settings.budgetCheckPeriod || "week";
@@ -11154,7 +11157,9 @@ class FinanceTrackerPlugin extends Plugin {
       tooltip: "Quick add a transaction",
     });
     addAction(headerActions, "Budgets", () => this.openDefaultBudgetNote(), { errorPrefix: "Opening budgets note" });
-    addAction(headerActions, "Hub", () => this.activateHubView(), { opensModal: true, tooltip: "Open the finance hub" });
+    if (!options.inHub) {
+      addAction(headerActions, "Hub", () => this.activateHubView(), { opensModal: true, tooltip: "Open the finance hub" });
+    }
 
     // Summary cards: Today + this period (+ trip cards when one is running).
     // Collected first, rendered once, so the conditional cards join the same
@@ -13692,47 +13697,49 @@ class FinanceTrackerPlugin extends Plugin {
     const prevEntries = filterReal(await this.collectTransactionsForRange(previousRange));
     const previousTotal = core.roundCurrencyAmount(prevEntries.reduce((sum, entry) => sum + core.entrySpendAmount(entry), 0));
 
-    if (on.has("summary")) this.renderSummary(wrapper, entries, currency, range, { previousTotal });
-
-    if (on.has("income")) {
-      const goalKeys = (await this.collectSavingsGoalDefinitions()).map((goal) => goal.goalKey).filter(Boolean);
-      this.renderIncomeSection(wrapper, allEntries, currency, range, goalKeys);
-    }
-
-    if (on.has("uncategorised")) this.renderUncategorisedCallout(wrapper, entries, currency, range);
-
-    if (on.has("categories")) {
-      // Honour the Default grouping setting. This was hardcoded to "full", so a
-      // vault set to "Primary category" still got subcategory rings it had asked
-      // not to see.
-      const hierarchy = core.buildHierarchicalCategoryGroups(entries, groupBy);
-      this.renderPieChart(wrapper, hierarchy, currency, Number(this.settings.dashboardSliceLabelThreshold || 0.08));
-    }
-
+    // Sections render in the order resolveDashboardSections gives, which is
+    // the order a `show:` line names them.
     const budgets = on.has("trend") || on.has("budgets") ? await this.loadBudgets("default") : [];
-    if (on.has("trend")) {
-      const allBudget = budgets.find((budget) => budget.category === "all");
-      let perDayBudget = 0;
-      if (allBudget) {
-        const scaled = core.scaleBudgetLimit(Number(allBudget.limit || 0), allBudget.period, range, referenceDate || range.start, weekStartsOn);
-        perDayBudget = spanDays > 0 ? core.roundCurrencyAmount(scaled / spanDays) : 0;
+    // Budget pace is judged at today's date while the period is running, and at
+    // its last day once it's over — not at the note's date, which for a weekly
+    // note is its Monday.
+    const today = core.todayIsoLocal();
+    const paceDate = today < range.start ? range.start : today > range.end ? range.end : today;
+    for (const section of sections) {
+      if (section === "summary") this.renderSummary(wrapper, entries, currency, range, { previousTotal });
+      if (section === "income") {
+        const goalKeys = (await this.collectSavingsGoalDefinitions()).map((goal) => goal.goalKey).filter(Boolean);
+        this.renderIncomeSection(wrapper, allEntries, currency, range, goalKeys);
       }
-      this.renderSpendTrend(wrapper, entries, range, currency, { perDayBudget });
+      if (section === "uncategorised") this.renderUncategorisedCallout(wrapper, entries, currency, range);
+      if (section === "categories") {
+        // Honour the Default grouping setting. This was hardcoded to "full", so a
+        // vault set to "Primary category" still got subcategory rings it had
+        // asked not to see.
+        const hierarchy = core.buildHierarchicalCategoryGroups(entries, groupBy);
+        this.renderPieChart(wrapper, hierarchy, currency, Number(this.settings.dashboardSliceLabelThreshold || 0.08));
+      }
+      if (section === "trend") {
+        const allBudget = budgets.find((budget) => budget.category === "all");
+        let perDayBudget = 0;
+        if (allBudget) {
+          const scaled = core.scaleBudgetLimit(Number(allBudget.limit || 0), allBudget.period, range, referenceDate || range.start, weekStartsOn);
+          perDayBudget = spanDays > 0 ? core.roundCurrencyAmount(scaled / spanDays) : 0;
+        }
+        this.renderSpendTrend(wrapper, entries, range, currency, { perDayBudget });
+      }
+      if (section === "changes") this.renderCategoryChanges(wrapper, entries, prevEntries, currency, range);
+      if (section === "merchants") this.renderTopMerchants(wrapper, entries, currency);
+      if (section === "largest") this.renderLargestTransactions(wrapper, entries, currency);
+      if (section === "budgets") {
+        const budgetProgress = this.buildBudgetProgress(entries, budgets, range, groupBy, paceDate);
+        this.renderBudgets(wrapper, budgetProgress, currency);
+      }
+      if (section === "bills") await this.renderBillsForPeriod(wrapper, allEntries, currency, range);
+      if (section === "trips") this.renderTripSpendSection(wrapper, allEntries, currency);
+      if (section === "savings") await this.renderSavingsActivity(wrapper, allEntries, currency, range, referenceDate);
+      if (section === "portfolio") await this.renderPortfolioChange(wrapper, allEntries, currency, range);
     }
-
-    if (on.has("changes")) this.renderCategoryChanges(wrapper, entries, prevEntries, currency, range);
-    if (on.has("merchants")) this.renderTopMerchants(wrapper, entries, currency);
-    if (on.has("largest")) this.renderLargestTransactions(wrapper, entries, currency);
-
-    if (on.has("budgets")) {
-      const budgetProgress = this.buildBudgetProgress(entries, budgets, range, groupBy, referenceDate);
-      this.renderBudgets(wrapper, budgetProgress, currency);
-    }
-
-    if (on.has("bills")) await this.renderBillsForPeriod(wrapper, allEntries, currency, range);
-    if (on.has("trips")) this.renderTripSpendSection(wrapper, allEntries, currency);
-    if (on.has("savings")) await this.renderSavingsActivity(wrapper, allEntries, currency, range, referenceDate);
-    if (on.has("portfolio")) await this.renderPortfolioChange(wrapper, allEntries, currency, range);
 
     if (unknown.length) {
       wrapper.createDiv({
@@ -15035,7 +15042,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
       case "reviews":
         return this.renderHubReviews(host, view);
       default:
-        return this.renderDailyBudgetCheckInto(host.createDiv(), core.todayIsoLocal(), "full");
+        return this.renderDailyBudgetCheckInto(host.createDiv(), core.todayIsoLocal(), "full", { inHub: true });
     }
   },
 
@@ -15090,7 +15097,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
       }
     }
 
-    await this.renderCategorisationInboxInto(host.createDiv(), { title: "Needs a category" });
+    await this.renderCategorisationInboxInto(host.createDiv(), { title: "Uncategorised spending" });
   },
 
   async renderHubBudgets(host, view) {
@@ -15119,7 +15126,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     });
 
     await this.renderDashboard(
-      [`period: ${period}`, `title: This ${period}`, "show: summary, uncategorised, budgets, categories, trend"].join("\n"),
+      [`period: ${period}`, `title: This ${period}`, "show: summary, budgets, uncategorised, trend, categories"].join("\n"),
       host.createDiv(),
       { sourcePath: "" }
     );
@@ -15171,8 +15178,12 @@ Object.assign(FinanceTrackerPlugin.prototype, {
   },
 
   async renderHubPortfolio(host) {
-    const toolbar = host.createDiv({ cls: "finance-hub-toolbar" });
-    addAction(toolbar, "Open portfolio note", () => this.openPortfolioNote(), { errorPrefix: "Opening the portfolio" });
+    // Opening the note creates it, and an empty portfolio already offers Log
+    // trade, so the button only appears once there is a note to open.
+    if (this.app.vault.getAbstractFileByPath(this.getPortfolioNotePath())) {
+      const toolbar = host.createDiv({ cls: "finance-hub-toolbar" });
+      addAction(toolbar, "Open portfolio note", () => this.openPortfolioNote(), { errorPrefix: "Opening the portfolio" });
+    }
     await this.renderPortfolioBlock("", host.createDiv(), { sourcePath: this.getPortfolioNotePath() });
   },
 
@@ -15215,7 +15226,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     const title = core.describePeriodTitle(range);
     await this.renderDashboard([`period: ${period}`, `title: ${title}`, "show: all"].join("\n"), host.createDiv(), {
       sourcePath: "",
-      referenceDate: anchor,
+      referenceDate: range.start,
     });
   },
 
@@ -15312,7 +15323,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     if (!rows.length || !(previousTotal > 0)) return;
     const section = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-dashboard-changes" });
     section.createEl("h4", { text: `Change vs previous ${periodWordFor(range)}` });
-    const list = section.createDiv({ cls: "finance-tracker-budget-list" });
+    const list = section.createDiv({ cls: "finance-tracker-budget-list finance-dashboard-rows" });
     for (const row of rows) {
       const item = list.createDiv({ cls: "finance-tracker-budget-card" });
       item.addClass(row.delta > 0 ? "is-up" : "is-down");
@@ -15331,7 +15342,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     const spend = entries.reduce((sum, entry) => sum + core.entrySpendAmount(entry), 0);
     const section = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-dashboard-merchants" });
     section.createEl("h4", { text: "Top merchants" });
-    const list = section.createDiv({ cls: "finance-tracker-budget-list" });
+    const list = section.createDiv({ cls: "finance-tracker-budget-list finance-dashboard-rows" });
     for (const row of result.rows) {
       const item = list.createDiv({ cls: "finance-tracker-budget-card" });
       renderRowTitle(item, row.label, core.formatCurrency(row.total, currency));
@@ -15356,7 +15367,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     if (!rows.length) return;
     const section = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-dashboard-largest" });
     section.createEl("h4", { text: "Largest transactions" });
-    const list = section.createDiv({ cls: "finance-tracker-budget-list" });
+    const list = section.createDiv({ cls: "finance-tracker-budget-list finance-dashboard-rows" });
     for (const { entry, spend } of rows) {
       const item = list.createDiv({ cls: "finance-tracker-budget-card is-clickable" });
       const name = core.cleanMerchantDisplay(entry.merchant || "") || entry.categoryDisplay || core.displayCategoryPath(entry.category || "uncategorized");
@@ -15397,7 +15408,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
 
     const group = (title, rows) => {
       section.createDiv({ cls: "finance-dashboard-subheading", text: title });
-      const list = section.createDiv({ cls: "finance-tracker-budget-list" });
+      const list = section.createDiv({ cls: "finance-tracker-budget-list finance-dashboard-rows" });
       for (const row of rows) {
         const item = list.createDiv({ cls: "finance-tracker-budget-card" });
         renderRowTitle(item, row.label, core.formatCurrency(row.amount, currency));
@@ -15432,7 +15443,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
       cls: "finance-tracker-budget-meta",
       text: "Paid from trip savings, so it isn't in the totals above.",
     });
-    const list = section.createDiv({ cls: "finance-tracker-budget-list" });
+    const list = section.createDiv({ cls: "finance-tracker-budget-list finance-dashboard-rows" });
     for (const trip of trips.rows) {
       const item = list.createDiv({ cls: "finance-tracker-budget-card" });
       renderRowTitle(item, trip.label, core.formatCurrency(trip.total, currency));

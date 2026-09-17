@@ -2906,9 +2906,9 @@ test("dashboard sections: week and month get everything, show and hide adjust it
     "savings",
   ]);
   const custom = core.resolveDashboardSections({ show: "defaults, top merchants", hide: "trend, sparkles" }, "year");
-  assert.deepEqual(custom.sections, ["summary", "uncategorised", "categories", "merchants", "budgets", "savings"]);
+  assert.deepEqual(custom.sections, ["summary", "uncategorised", "categories", "budgets", "savings", "merchants"]);
   assert.deepEqual(custom.unknown, ["sparkles"]);
-  assert.deepEqual(core.resolveDashboardSections({ show: "Budgets, uncategorized" }, "week").sections, ["uncategorised", "budgets"]);
+  assert.deepEqual(core.resolveDashboardSections({ show: "Budgets, uncategorized" }, "week").sections, ["budgets", "uncategorised"], "in the order given");
   assert.deepEqual(core.resolveDashboardSections({ hide: "all" }, "week").sections, core.DASHBOARD_SECTIONS, "hide: all is ignored, not an error");
 });
 

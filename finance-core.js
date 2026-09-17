@@ -3312,9 +3312,10 @@ const DASHBOARD_SECTION_ALIASES = {
   networth: "portfolio",
 };
 
-// `show:` lists exactly the sections wanted (`defaults` and `all` expand in
-// place, so `show: defaults, merchants` adds one); `hide:` removes from
-// whatever that leaves. Unknown names come back so the block can say so.
+// `show:` lists exactly the sections wanted, in the order wanted (`defaults`
+// and `all` expand in place, so `show: defaults, merchants` adds one); `hide:`
+// removes from whatever that leaves. Unknown names come back so the block can
+// say so.
 function resolveDashboardSections(config = {}, period = "week") {
   const normalize = (token) => {
     const key = String(token || "").trim().toLowerCase().replace(/[\s_-]+/g, "");
@@ -3332,6 +3333,8 @@ function resolveDashboardSections(config = {}, period = "week") {
   const defaults = normalizedPeriod === "week" || normalizedPeriod === "month" ? DASHBOARD_SECTIONS : DASHBOARD_BASE_SECTIONS;
   const unknown = [];
   const shown = parse(config.show);
+  // A Set keeps insertion order, so sections appear in the order `show:` names
+  // them; `defaults` and `all` expand in their usual order.
   let chosen;
   if (shown.length) {
     chosen = new Set();
@@ -3348,7 +3351,7 @@ function resolveDashboardSections(config = {}, period = "week") {
     if (DASHBOARD_SECTIONS.includes(token)) chosen.delete(token);
     else if (token !== "all" && token !== "defaults" && token !== "default") unknown.push(token);
   }
-  return { sections: DASHBOARD_SECTIONS.filter((key) => chosen.has(key)), unknown };
+  return { sections: Array.from(chosen), unknown };
 }
 
 const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];

@@ -48,7 +48,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
       case "reviews":
         return this.renderHubReviews(host, view);
       default:
-        return this.renderDailyBudgetCheckInto(host.createDiv(), core.todayIsoLocal(), "full");
+        return this.renderDailyBudgetCheckInto(host.createDiv(), core.todayIsoLocal(), "full", { inHub: true });
     }
   },
 
@@ -103,7 +103,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
       }
     }
 
-    await this.renderCategorisationInboxInto(host.createDiv(), { title: "Needs a category" });
+    await this.renderCategorisationInboxInto(host.createDiv(), { title: "Uncategorised spending" });
   },
 
   async renderHubBudgets(host, view) {
@@ -132,7 +132,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     });
 
     await this.renderDashboard(
-      [`period: ${period}`, `title: This ${period}`, "show: summary, uncategorised, budgets, categories, trend"].join("\n"),
+      [`period: ${period}`, `title: This ${period}`, "show: summary, budgets, uncategorised, trend, categories"].join("\n"),
       host.createDiv(),
       { sourcePath: "" }
     );
@@ -184,8 +184,12 @@ Object.assign(FinanceTrackerPlugin.prototype, {
   },
 
   async renderHubPortfolio(host) {
-    const toolbar = host.createDiv({ cls: "finance-hub-toolbar" });
-    addAction(toolbar, "Open portfolio note", () => this.openPortfolioNote(), { errorPrefix: "Opening the portfolio" });
+    // Opening the note creates it, and an empty portfolio already offers Log
+    // trade, so the button only appears once there is a note to open.
+    if (this.app.vault.getAbstractFileByPath(this.getPortfolioNotePath())) {
+      const toolbar = host.createDiv({ cls: "finance-hub-toolbar" });
+      addAction(toolbar, "Open portfolio note", () => this.openPortfolioNote(), { errorPrefix: "Opening the portfolio" });
+    }
     await this.renderPortfolioBlock("", host.createDiv(), { sourcePath: this.getPortfolioNotePath() });
   },
 
@@ -228,7 +232,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     const title = core.describePeriodTitle(range);
     await this.renderDashboard([`period: ${period}`, `title: ${title}`, "show: all"].join("\n"), host.createDiv(), {
       sourcePath: "",
-      referenceDate: anchor,
+      referenceDate: range.start,
     });
   },
 

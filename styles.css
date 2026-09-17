@@ -1780,6 +1780,18 @@
   font-size: var(--font-ui-small);
   font-weight: var(--font-semibold);
 }
+/* Review lists read as ledgers, not stacks of cards: five merchants should fit
+   in the space one budget card takes. */
+.finance-tracker-budget-list.finance-dashboard-rows { gap: 0; }
+.finance-dashboard-rows .finance-tracker-budget-card {
+  padding: 7px 2px;
+  border: none;
+  border-bottom: 1px solid var(--background-modifier-border);
+  border-radius: 0;
+  background: transparent;
+}
+.finance-dashboard-rows .finance-tracker-budget-card:last-child { border-bottom: none; }
+.finance-dashboard-rows .finance-tracker-budget-meta { font-size: var(--font-ui-smaller); }
 .finance-dashboard-changes .is-up .ft-row-amount { color: var(--color-red, #c0392b); }
 .finance-dashboard-changes .is-down .ft-row-amount { color: var(--color-green, #2f855a); }
 

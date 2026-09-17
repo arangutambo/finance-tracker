@@ -72,7 +72,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     if (!rows.length || !(previousTotal > 0)) return;
     const section = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-dashboard-changes" });
     section.createEl("h4", { text: `Change vs previous ${periodWordFor(range)}` });
-    const list = section.createDiv({ cls: "finance-tracker-budget-list" });
+    const list = section.createDiv({ cls: "finance-tracker-budget-list finance-dashboard-rows" });
     for (const row of rows) {
       const item = list.createDiv({ cls: "finance-tracker-budget-card" });
       item.addClass(row.delta > 0 ? "is-up" : "is-down");
@@ -91,7 +91,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     const spend = entries.reduce((sum, entry) => sum + core.entrySpendAmount(entry), 0);
     const section = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-dashboard-merchants" });
     section.createEl("h4", { text: "Top merchants" });
-    const list = section.createDiv({ cls: "finance-tracker-budget-list" });
+    const list = section.createDiv({ cls: "finance-tracker-budget-list finance-dashboard-rows" });
     for (const row of result.rows) {
       const item = list.createDiv({ cls: "finance-tracker-budget-card" });
       renderRowTitle(item, row.label, core.formatCurrency(row.total, currency));
@@ -116,7 +116,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     if (!rows.length) return;
     const section = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-dashboard-largest" });
     section.createEl("h4", { text: "Largest transactions" });
-    const list = section.createDiv({ cls: "finance-tracker-budget-list" });
+    const list = section.createDiv({ cls: "finance-tracker-budget-list finance-dashboard-rows" });
     for (const { entry, spend } of rows) {
       const item = list.createDiv({ cls: "finance-tracker-budget-card is-clickable" });
       const name = core.cleanMerchantDisplay(entry.merchant || "") || entry.categoryDisplay || core.displayCategoryPath(entry.category || "uncategorized");
@@ -157,7 +157,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
 
     const group = (title, rows) => {
       section.createDiv({ cls: "finance-dashboard-subheading", text: title });
-      const list = section.createDiv({ cls: "finance-tracker-budget-list" });
+      const list = section.createDiv({ cls: "finance-tracker-budget-list finance-dashboard-rows" });
       for (const row of rows) {
         const item = list.createDiv({ cls: "finance-tracker-budget-card" });
         renderRowTitle(item, row.label, core.formatCurrency(row.amount, currency));
@@ -192,7 +192,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
       cls: "finance-tracker-budget-meta",
       text: "Paid from trip savings, so it isn't in the totals above.",
     });
-    const list = section.createDiv({ cls: "finance-tracker-budget-list" });
+    const list = section.createDiv({ cls: "finance-tracker-budget-list finance-dashboard-rows" });
     for (const trip of trips.rows) {
       const item = list.createDiv({ cls: "finance-tracker-budget-card" });
       renderRowTitle(item, trip.label, core.formatCurrency(trip.total, currency));
