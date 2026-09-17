@@ -4472,6 +4472,464 @@ function planBillsFromLegacy(items, options = {}) {
   });
 }
 
+// --- Portfolio -------------------------------------------------------------------
+//
+// Share holdings, from a hand-editable table of trades. Nothing here fetches
+// anything: prices come in as an argument, from the market-data cache or from a
+// price typed by hand, so every number can be worked out offline and tested.
+//
+// Buying shares moves money from cash into holdings. It is a transfer, not
+// spending, which is why trades live in the portfolio note rather than in daily
+// notes: they never touch a budget or a spending total.
+//
+// All of this is informational arithmetic, not tax or investment advice.
+
+const TRADE_TYPES = new Set(["buy", "sell", "drp", "split"]);
+
+function normalizeTicker(value) {
+  return String(value || "").trim().toUpperCase().replace(/\s+/g, "");
+}
+
+// A ticker as it can appear in a tag: "VAS.AX" is written #log/income/dividend/vas-ax,
+// which the tag parser reduces to "vasax". Both reduce to the same key.
+function tickerKey(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function tickerMarket(ticker) {
+  const symbol = normalizeTicker(ticker);
+  if (symbol.endsWith(".AX")) return "ASX";
+  if (/^[A-Z.\-]+$/.test(symbol) && !symbol.includes(".")) return "US";
+  return "Other";
+}
+
+function parseTradeRow(row, index) {
+  const type = String(row.type || row.action || "").trim().toLowerCase();
+  const ticker = normalizeTicker(row.ticker || row.symbol || row.code || "");
+  const date = parseIsoDate(row.date || "");
+  const warnings = [];
+  if (!TRADE_TYPES.has(type)) {
+    if (type || ticker) warnings.push({ row: index + 1, reason: `unknown trade type "${row.type || ""}"` });
+    return { trade: null, warnings };
+  }
+  if (!ticker || !date) {
+    warnings.push({ row: index + 1, reason: "a trade needs a date and a ticker" });
+    return { trade: null, warnings };
+  }
+  const units = parseNumber(row.units ?? row.quantity ?? row.qty);
+  const price = parseNumber(row.price);
+  const fees = parseNumber(row.fees ?? row.brokerage) || 0;
+  const currency = normalizeCurrency(row.currency || (tickerMarket(ticker) === "US" ? "USD" : "AUD"));
+  const audCost = parseNumber(row["aud cost"] ?? row.audcost ?? row["aud total"]);
+
+  if (!(units > 0)) {
+    warnings.push({ row: index + 1, reason: type === "split" ? "a split needs its ratio in Units (2 for a 2-for-1)" : "a trade needs a positive number of units" });
+    return { trade: null, warnings };
+  }
+  if (type !== "split" && !(price >= 0 && Number.isFinite(price))) {
+    warnings.push({ row: index + 1, reason: "a trade needs a price" });
+    return { trade: null, warnings };
+  }
+
+  return {
+    trade: {
+      account: normalizeWhitespace(row.account || row.broker || ""),
+      audCost: Number.isFinite(audCost) && audCost > 0 ? roundCurrencyAmount(audCost) : null,
+      currency,
+      date,
+      fees: roundCurrencyAmount(fees),
+      note: normalizeWhitespace(row.note || ""),
+      price: type === "split" ? null : Number(price),
+      row: index + 1,
+      ticker,
+      type,
+      units: Number(units),
+    },
+    warnings,
+  };
+}
+
+// Reads every table in the note that has Date, Type and Ticker columns.
+function parseTradesTable(content) {
+  const trades = [];
+  const warnings = [];
+  for (const rows of parseMarkdownTable(content)) {
+    if (!rows.length || !("type" in rows[0]) || !("ticker" in rows[0] || "symbol" in rows[0])) continue;
+    rows.forEach((row, index) => {
+      if (Object.values(row).every((cell) => !String(cell || "").trim())) return;
+      const parsed = parseTradeRow(row, index);
+      warnings.push(...parsed.warnings);
+      if (parsed.trade) trades.push(parsed.trade);
+    });
+  }
+  trades.sort((left, right) => left.date.localeCompare(right.date) || left.row - right.row);
+  return { trades, warnings };
+}
+
+// "VAS.AX=102.50, AAPL=230" — prices typed by hand, which always win.
+function parsePriceOverrides(value) {
+  const prices = {};
+  for (const part of String(value || "").split(/[,;\n]+/)) {
+    const match = part.trim().match(/^([A-Za-z0-9.\-^=]+)\s*[=:]\s*([\d.,]+)$/);
+    if (!match) continue;
+    const price = parseNumber(match[2]);
+    if (price > 0) prices[normalizeTicker(match[1])] = price;
+  }
+  return prices;
+}
+
+function daysBetween(start, end) {
+  return Math.round((isoToDate(end).getTime() - isoToDate(start).getTime()) / DAY_MS);
+}
+
+// Eligible for the CGT discount when held for at least twelve months. The
+// ATO counts from the day after acquisition, so a parcel bought on 1 March 2025
+// qualifies when sold on or after 2 March 2026. Informational only.
+function heldTwelveMonths(acquired, disposed) {
+  const threshold = addDays(addMonths(acquired, 12), 1);
+  return Boolean(threshold && disposed >= threshold);
+}
+
+// Walks the trades in date order, first-in-first-out, and returns what is still
+// held, what has been sold, and what the arithmetic could not settle.
+//
+// Costs are tracked in the trade's own currency and in AUD. A foreign trade
+// should carry its AUD cost (what actually left the account); where it does not,
+// the AUD figure is estimated from `options.fx` and flagged.
+function buildHoldings(trades, options = {}) {
+  const fx = options.fx || {};
+  const byTicker = new Map();
+  const realised = [];
+  const warnings = [];
+
+  const audPerUnit = (currency) => (currency === "AUD" ? 1 : Number(fx[currency]) || null);
+
+  for (const trade of trades || []) {
+    const holding = byTicker.get(trade.ticker) || {
+      ticker: trade.ticker,
+      currency: trade.currency,
+      market: tickerMarket(trade.ticker),
+      parcels: [],
+      realisedAud: 0,
+      realisedNative: 0,
+      accounts: new Set(),
+      firstDate: trade.date,
+      estimatedAud: false,
+    };
+    if (trade.account) holding.accounts.add(trade.account);
+
+    if (trade.type === "split") {
+      for (const parcel of holding.parcels) parcel.units = parcel.units * trade.units;
+      byTicker.set(trade.ticker, holding);
+      continue;
+    }
+
+    const grossNative = trade.units * trade.price;
+    if (trade.type === "buy" || trade.type === "drp") {
+      const costNative = grossNative + trade.fees;
+      let costAud = trade.audCost;
+      if (costAud === null) {
+        const rate = audPerUnit(trade.currency);
+        if (rate) {
+          costAud = roundCurrencyAmount(costNative * rate);
+          if (trade.currency !== "AUD") {
+            holding.estimatedAud = true;
+            warnings.push({ row: trade.row, ticker: trade.ticker, reason: "no AUD cost given, so it was estimated at the current exchange rate" });
+          }
+        } else {
+          costAud = 0;
+          warnings.push({ row: trade.row, ticker: trade.ticker, reason: `no AUD cost and no ${trade.currency} exchange rate to estimate one` });
+        }
+      }
+      holding.parcels.push({ acquired: trade.date, units: trade.units, costNative, costAud, type: trade.type });
+      byTicker.set(trade.ticker, holding);
+      continue;
+    }
+
+    // Sell: consume the oldest parcels first.
+    let remaining = trade.units;
+    const proceedsNative = grossNative - trade.fees;
+    const rate = audPerUnit(trade.currency);
+    const proceedsAud = trade.audCost ?? (rate ? roundCurrencyAmount(proceedsNative * rate) : 0);
+    const heldUnits = holding.parcels.reduce((sum, parcel) => sum + parcel.units, 0);
+    if (remaining > heldUnits + 1e-9) {
+      warnings.push({ row: trade.row, ticker: trade.ticker, reason: `sells ${trade.units} units but only ${heldUnits} are held` });
+    }
+
+    while (remaining > 1e-9 && holding.parcels.length) {
+      const parcel = holding.parcels[0];
+      const take = Math.min(parcel.units, remaining);
+      const share = take / parcel.units;
+      const portion = take / trade.units;
+      const costNative = parcel.costNative * share;
+      const costAud = parcel.costAud * share;
+      const saleNative = proceedsNative * portion;
+      const saleAud = proceedsAud * portion;
+      realised.push({
+        acquired: parcel.acquired,
+        costAud: roundCurrencyAmount(costAud),
+        costNative: roundCurrencyAmount(costNative),
+        date: trade.date,
+        discountEligible: heldTwelveMonths(parcel.acquired, trade.date),
+        gainAud: roundCurrencyAmount(saleAud - costAud),
+        gainNative: roundCurrencyAmount(saleNative - costNative),
+        heldDays: daysBetween(parcel.acquired, trade.date),
+        proceedsAud: roundCurrencyAmount(saleAud),
+        ticker: trade.ticker,
+        units: take,
+      });
+      holding.realisedAud += saleAud - costAud;
+      holding.realisedNative += saleNative - costNative;
+      parcel.units -= take;
+      parcel.costNative -= costNative;
+      parcel.costAud -= costAud;
+      remaining -= take;
+      if (parcel.units <= 1e-9) holding.parcels.shift();
+    }
+    byTicker.set(trade.ticker, holding);
+  }
+
+  const holdings = Array.from(byTicker.values()).map((holding) => {
+    const units = holding.parcels.reduce((sum, parcel) => sum + parcel.units, 0);
+    const costNative = holding.parcels.reduce((sum, parcel) => sum + parcel.costNative, 0);
+    const costAud = holding.parcels.reduce((sum, parcel) => sum + parcel.costAud, 0);
+    return {
+      accounts: Array.from(holding.accounts),
+      averageCostNative: units > 0 ? costNative / units : 0,
+      costAud: roundCurrencyAmount(costAud),
+      costNative: roundCurrencyAmount(costNative),
+      currency: holding.currency,
+      estimatedAud: holding.estimatedAud,
+      firstDate: holding.firstDate,
+      market: holding.market,
+      parcels: holding.parcels.map((parcel) => ({
+        ...parcel,
+        costAud: roundCurrencyAmount(parcel.costAud),
+        costNative: roundCurrencyAmount(parcel.costNative),
+        discountEligible: heldTwelveMonths(parcel.acquired, parseIsoDate(options.referenceDate) || todayIsoLocal()),
+      })),
+      realisedAud: roundCurrencyAmount(holding.realisedAud),
+      realisedNative: roundCurrencyAmount(holding.realisedNative),
+      ticker: holding.ticker,
+      units: Number(units.toFixed(6)),
+    };
+  });
+
+  return { holdings, realised, warnings };
+}
+
+// Values the holdings at the prices given. A quote is { price, previousClose,
+// currency, name, type, fetchedAt, source }; `fx` maps a currency to AUD per unit.
+function valuePortfolio(holdingsResult, quotes = {}, fx = {}, options = {}) {
+  const rows = [];
+  const missing = [];
+  for (const holding of holdingsResult?.holdings || []) {
+    if (!(holding.units > 1e-9)) continue;
+    const quote = quotes[holding.ticker] || null;
+    const currency = normalizeCurrency(quote?.currency || holding.currency);
+    const rate = currency === "AUD" ? 1 : Number(fx[currency]) || null;
+    const price = Number(quote?.price);
+    if (!(price > 0) || !rate) {
+      missing.push(holding.ticker);
+      rows.push({ ...holding, name: quote?.name || holding.ticker, price: null, valueAud: null, gainAud: null, gainPct: null, dayChangePct: null, weight: 0, priceSource: "", stale: false });
+      continue;
+    }
+    const valueNative = holding.units * price;
+    const valueAud = roundCurrencyAmount(valueNative * rate);
+    const previous = Number(quote.previousClose);
+    rows.push({
+      ...holding,
+      dayChangeAud: previous > 0 ? roundCurrencyAmount(holding.units * (price - previous) * rate) : 0,
+      dayChangePct: previous > 0 ? Number((((price - previous) / previous) * 100).toFixed(2)) : null,
+      fetchedAt: quote.fetchedAt || "",
+      gainAud: roundCurrencyAmount(valueAud - holding.costAud),
+      gainPct: holding.costAud > 0 ? Number((((valueAud - holding.costAud) / holding.costAud) * 100).toFixed(2)) : null,
+      name: quote.name || holding.ticker,
+      price,
+      priceSource: quote.source || "",
+      stale: Boolean(quote.stale),
+      type: quote.type || "",
+      valueAud,
+      valueNative: roundCurrencyAmount(valueNative),
+    });
+  }
+
+  const priced = rows.filter((row) => row.valueAud !== null);
+  const valueAud = roundCurrencyAmount(priced.reduce((sum, row) => sum + row.valueAud, 0));
+  const costAud = roundCurrencyAmount(priced.reduce((sum, row) => sum + row.costAud, 0));
+  for (const row of rows) row.weight = valueAud > 0 && row.valueAud ? Number(((row.valueAud / valueAud) * 100).toFixed(2)) : 0;
+
+  const groupBy = (keyOf) => {
+    const groups = new Map();
+    for (const row of priced) {
+      const key = keyOf(row) || "Other";
+      groups.set(key, roundCurrencyAmount((groups.get(key) || 0) + row.valueAud));
+    }
+    return Array.from(groups.entries())
+      .map(([key, value]) => ({ key, value, pct: valueAud > 0 ? Number(((value / valueAud) * 100).toFixed(2)) : 0 }))
+      .sort((left, right) => right.value - left.value);
+  };
+
+  return {
+    rows: rows.sort((left, right) => (right.valueAud || 0) - (left.valueAud || 0)),
+    missing,
+    allocation: {
+      byHolding: groupBy((row) => row.ticker),
+      byMarket: groupBy((row) => row.market),
+      byType: groupBy((row) => (row.type ? titleCaseSegment(String(row.type).toLowerCase()) : "Unknown")),
+    },
+    totals: {
+      costAud,
+      dayChangeAud: roundCurrencyAmount(priced.reduce((sum, row) => sum + (row.dayChangeAud || 0), 0)),
+      gainAud: roundCurrencyAmount(valueAud - costAud),
+      gainPct: costAud > 0 ? Number((((valueAud - costAud) / costAud) * 100).toFixed(2)) : null,
+      realisedAud: roundCurrencyAmount((holdingsResult?.realised || []).reduce((sum, sale) => sum + sale.gainAud, 0)),
+      valueAud,
+    },
+  };
+}
+
+// Dividends are logged in daily notes as #log/income/dividend/<ticker>, so they
+// count as income everywhere income is counted, and are gathered back here.
+function summarizeDividends(entries, holdingsResult, options = {}) {
+  const referenceDate = parseIsoDate(options.referenceDate) || todayIsoLocal();
+  const yearAgo = addMonths(referenceDate, -12);
+  const holdings = new Map((holdingsResult?.holdings || []).map((holding) => [tickerKey(holding.ticker), holding]));
+  const byTicker = new Map();
+
+  for (const entry of entries || []) {
+    if (entry?.entryType !== "income") continue;
+    const category = normalizeCategoryPath(entry.category || "");
+    if (!category.startsWith("dividend/")) continue;
+    const key = tickerKey(category.slice("dividend/".length));
+    const holding = holdings.get(key);
+    const ticker = holding?.ticker || category.slice("dividend/".length).toUpperCase();
+    const current = byTicker.get(ticker) || { ticker, total: 0, lastTwelveMonths: 0, payments: [] };
+    const amount = roundCurrencyAmount(entry.amount);
+    current.total = roundCurrencyAmount(current.total + amount);
+    if (entry.date > yearAgo && entry.date <= referenceDate) {
+      current.lastTwelveMonths = roundCurrencyAmount(current.lastTwelveMonths + amount);
+    }
+    current.payments.push({ date: entry.date, amount });
+    byTicker.set(ticker, current);
+  }
+
+  const rows = Array.from(byTicker.values()).map((row) => {
+    const holding = Array.from(holdings.values()).find((item) => item.ticker === row.ticker);
+    return {
+      ...row,
+      payments: row.payments.sort((left, right) => right.date.localeCompare(left.date)),
+      yieldOnCostPct: holding?.costAud > 0 ? Number(((row.lastTwelveMonths / holding.costAud) * 100).toFixed(2)) : null,
+    };
+  });
+
+  return {
+    rows: rows.sort((left, right) => right.lastTwelveMonths - left.lastTwelveMonths),
+    lastTwelveMonths: roundCurrencyAmount(rows.reduce((sum, row) => sum + row.lastTwelveMonths, 0)),
+    total: roundCurrencyAmount(rows.reduce((sum, row) => sum + row.total, 0)),
+  };
+}
+
+// Units of each ticker held at the close of each date in `dates`.
+function unitsHeldOn(trades, date) {
+  const units = new Map();
+  for (const trade of trades || []) {
+    if (trade.date > date) break;
+    const current = units.get(trade.ticker) || 0;
+    if (trade.type === "split") units.set(trade.ticker, current * trade.units);
+    else if (trade.type === "sell") units.set(trade.ticker, current - trade.units);
+    else units.set(trade.ticker, current + trade.units);
+  }
+  return units;
+}
+
+// Value against cost over time, from historical closes: no snapshots to take.
+// `history` maps a ticker to [{ date, close }] ascending; `fxHistory` maps a
+// currency to [{ date, audPerUnit }]. The last known value on or before each
+// date is used, so weekends and holidays carry forward.
+function buildPortfolioValueSeries(trades, history = {}, fxHistory = {}, options = {}) {
+  const sortedTrades = (trades || []).slice().sort((left, right) => left.date.localeCompare(right.date));
+  if (!sortedTrades.length) return [];
+  const start = parseIsoDate(options.start) || sortedTrades[0].date;
+  const end = parseIsoDate(options.end) || todayIsoLocal();
+  const step = Math.max(1, Number(options.stepDays) || 7);
+
+  const lastOnOrBefore = (series, date, field) => {
+    let found = null;
+    for (const point of series || []) {
+      if (point.date > date) break;
+      found = point[field];
+    }
+    return found;
+  };
+
+  const points = [];
+  for (let date = start; date && date <= end; date = addDays(date, step)) {
+    const held = unitsHeldOn(sortedTrades, date);
+    let valueAud = 0;
+    let complete = true;
+    for (const [ticker, units] of held) {
+      if (!(units > 1e-9)) continue;
+      const trade = sortedTrades.find((item) => item.ticker === ticker);
+      const currency = trade?.currency || "AUD";
+      const close = lastOnOrBefore(history[ticker], date, "close");
+      const rate = currency === "AUD" ? 1 : lastOnOrBefore(fxHistory[currency], date, "audPerUnit");
+      if (!(close > 0) || !(rate > 0)) {
+        complete = false;
+        continue;
+      }
+      valueAud += units * close * rate;
+    }
+    const holdings = buildHoldings(sortedTrades.filter((trade) => trade.date <= date), { fx: options.fx, referenceDate: date });
+    const costAud = holdings.holdings.reduce((sum, holding) => sum + holding.costAud, 0);
+    points.push({ date, valueAud: roundCurrencyAmount(valueAud), costAud: roundCurrencyAmount(costAud), complete });
+    if (date === end) break;
+    if (addDays(date, step) > end && date < end) {
+      // Always finish on the end date itself.
+      const held = unitsHeldOn(sortedTrades, end);
+      let finalValue = 0;
+      for (const [ticker, units] of held) {
+        const trade = sortedTrades.find((item) => item.ticker === ticker);
+        const currency = trade?.currency || "AUD";
+        const close = lastOnOrBefore(history[ticker], end, "close");
+        const rate = currency === "AUD" ? 1 : lastOnOrBefore(fxHistory[currency], end, "audPerUnit");
+        if (units > 1e-9 && close > 0 && rate > 0) finalValue += units * close * rate;
+      }
+      points.push({ date: end, valueAud: roundCurrencyAmount(finalValue), costAud: roundCurrencyAmount(costAud), complete });
+      break;
+    }
+  }
+  return points;
+}
+
+// Annualised return from dated cash flows (negative in, positive out), by
+// Newton's method. Returns null when it will not converge, which is better than a
+// confident wrong number.
+function computeXirr(cashflows) {
+  const flows = (cashflows || []).filter((flow) => parseIsoDate(flow.date) && Number.isFinite(flow.amount) && flow.amount !== 0);
+  if (flows.length < 2 || !flows.some((flow) => flow.amount < 0) || !flows.some((flow) => flow.amount > 0)) return null;
+  const first = flows.reduce((earliest, flow) => (flow.date < earliest ? flow.date : earliest), flows[0].date);
+  const years = flows.map((flow) => daysBetween(first, flow.date) / 365);
+
+  let rate = 0.1;
+  for (let iteration = 0; iteration < 100; iteration += 1) {
+    let value = 0;
+    let derivative = 0;
+    flows.forEach((flow, index) => {
+      const factor = Math.pow(1 + rate, years[index]);
+      value += flow.amount / factor;
+      derivative -= (years[index] * flow.amount) / (factor * (1 + rate));
+    });
+    if (Math.abs(value) < 1e-7) return Number(rate.toFixed(6));
+    if (derivative === 0) return null;
+    const next = rate - value / derivative;
+    if (!Number.isFinite(next) || next <= -0.9999) return null;
+    if (Math.abs(next - rate) < 1e-10) return Number(next.toFixed(6));
+    rate = next;
+  }
+  return null;
+}
+
 module.exports = {
   RECURRING_CADENCES,
   RECURRING_REGISTRY_COLUMNS,
@@ -4479,6 +4937,18 @@ module.exports = {
   RECURRING_REGISTRY_SEPARATOR_ROW,
   parseRecurringRegistry,
   parseBillDefinition,
+  normalizeTicker,
+  tickerKey,
+  tickerMarket,
+  parseTradesTable,
+  parsePriceOverrides,
+  heldTwelveMonths,
+  buildHoldings,
+  valuePortfolio,
+  summarizeDividends,
+  unitsHeldOn,
+  buildPortfolioValueSeries,
+  computeXirr,
   planBillsFromLegacy,
   parseBillDueRule,
   serializeBillDueRule,

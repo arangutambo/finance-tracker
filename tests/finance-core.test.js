@@ -2491,3 +2491,159 @@ test("a bill's aliases keep one spelling of each", () => {
   });
   assert.deepEqual(bill.aliases, ["urban-climb-membership", "urban-climb-sub", "urban-climb"]);
 });
+
+// --- Portfolio ----------------------------------------------------------------------
+
+const TRADES_NOTE = [
+  "## Trades",
+  "",
+  "| Date | Type | Ticker | Units | Price | Fees | Currency | AUD cost | Account | Note |",
+  "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | --- | --- |",
+  "| 2025-03-01 | buy | VAS.AX | 100 | 10 | 10 | AUD | | Pearler | |",
+  "| 2025-09-01 | buy | vas.ax | 50 | 12 | 10 | AUD | | Pearler | |",
+  "| 2026-03-02 | sell | VAS.AX | 120 | 15 | 10 | AUD | | Pearler | |",
+  "| 2026-01-10 | buy | AAPL | 5 | 200 | 2 | USD | 1520 | Stake | |",
+  "| 2026-06-01 | split | AAPL | 2 | | | | | | 2-for-1 |",
+  "| 2026-06-02 | hold | XYZ | 1 | 1 | | | | | |",
+  "",
+].join("\n");
+
+test("parseTradesTable reads trades and reports the rows it cannot use", () => {
+  const { trades, warnings } = core.parseTradesTable(TRADES_NOTE);
+  assert.equal(trades.length, 5);
+  assert.deepEqual(trades.map((trade) => trade.date), ["2025-03-01", "2025-09-01", "2026-01-10", "2026-03-02", "2026-06-01"]);
+  assert.equal(trades[1].ticker, "VAS.AX", "tickers are upper-cased");
+  assert.equal(trades[2].currency, "USD");
+  assert.equal(trades[2].audCost, 1520);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0].reason, /unknown trade type "hold"/);
+});
+
+test("holdings are first in, first out, with brokerage in the cost base", () => {
+  const { trades } = core.parseTradesTable(TRADES_NOTE);
+  const result = core.buildHoldings(trades, { referenceDate: "2026-09-17" });
+  const vas = result.holdings.find((holding) => holding.ticker === "VAS.AX");
+
+  // 100 @ $10 + $10 and 50 @ $12 + $10, then 120 sold @ $15 less $10.
+  assert.equal(vas.units, 30);
+  assert.equal(vas.costAud, 366, "30 of the second parcel's 50 units, at $610 for 50");
+  const sales = result.realised.filter((sale) => sale.ticker === "VAS.AX");
+  assert.equal(sales.length, 2, "the sale draws on both parcels, oldest first");
+  assert.equal(sales[0].units, 100);
+  assert.equal(sales[0].costAud, 1010);
+  assert.equal(sales[0].proceedsAud, 1491.67);
+  assert.equal(sales[0].gainAud, 481.67);
+  assert.equal(sales[1].units, 20);
+  assert.equal(sales[1].gainAud, 54.33);
+  assert.equal(vas.realisedAud, 536);
+});
+
+test("the CGT discount flag counts twelve months from the day after purchase", () => {
+  assert.equal(core.heldTwelveMonths("2025-03-01", "2026-03-01"), false);
+  assert.equal(core.heldTwelveMonths("2025-03-01", "2026-03-02"), true);
+
+  const { trades } = core.parseTradesTable(TRADES_NOTE);
+  const sales = core.buildHoldings(trades, { referenceDate: "2026-09-17" }).realised;
+  assert.equal(sales[0].discountEligible, true, "bought 1 March 2025, sold 2 March 2026");
+  assert.equal(sales[1].discountEligible, false, "bought 1 September 2025");
+});
+
+test("a split changes the units, not the cost", () => {
+  const { trades } = core.parseTradesTable(TRADES_NOTE);
+  const aapl = core.buildHoldings(trades).holdings.find((holding) => holding.ticker === "AAPL");
+  assert.equal(aapl.units, 10);
+  assert.equal(aapl.costAud, 1520, "the AUD actually paid");
+  assert.equal(aapl.costNative, 1002);
+  assert.equal(aapl.averageCostNative, 100.2);
+});
+
+test("a foreign trade with no AUD cost is estimated, and says so", () => {
+  const { trades } = core.parseTradesTable(
+    "| Date | Type | Ticker | Units | Price | Fees | Currency |\n| --- | --- | --- | --- | --- | --- | --- |\n| 2026-02-01 | buy | MSFT | 2 | 400 | 0 | USD |\n"
+  );
+  const result = core.buildHoldings(trades, { fx: { USD: 1.5 } });
+  assert.equal(result.holdings[0].costAud, 1200);
+  assert.equal(result.holdings[0].estimatedAud, true);
+  assert.match(result.warnings[0].reason, /estimated at the current exchange rate/);
+});
+
+test("valuePortfolio prices holdings in AUD and weighs them", () => {
+  const { trades } = core.parseTradesTable(TRADES_NOTE);
+  const holdings = core.buildHoldings(trades, { referenceDate: "2026-09-17" });
+  const value = core.valuePortfolio(
+    holdings,
+    {
+      "VAS.AX": { price: 20, previousClose: 19.5, currency: "AUD", name: "Vanguard Australian Shares", type: "ETF", source: "manual" },
+      AAPL: { price: 250, previousClose: 245, currency: "USD", name: "Apple", type: "EQUITY", source: "cache" },
+    },
+    { USD: 1.5 }
+  );
+
+  const vas = value.rows.find((row) => row.ticker === "VAS.AX");
+  const aapl = value.rows.find((row) => row.ticker === "AAPL");
+  assert.equal(vas.valueAud, 600);
+  assert.equal(vas.gainAud, 234);
+  assert.equal(aapl.valueAud, 3750, "10 × US$250 × 1.5");
+  assert.equal(aapl.gainAud, 2230);
+  assert.equal(value.totals.valueAud, 4350);
+  assert.equal(value.totals.costAud, 1886);
+  assert.equal(value.totals.realisedAud, 536);
+  assert.equal(aapl.weight + vas.weight, 100);
+  assert.deepEqual(value.allocation.byMarket.map((group) => group.key), ["US", "ASX"]);
+  assert.equal(vas.dayChangePct, 2.56);
+});
+
+test("a holding with no price is reported, not valued at zero", () => {
+  const { trades } = core.parseTradesTable(TRADES_NOTE);
+  const value = core.valuePortfolio(core.buildHoldings(trades), { "VAS.AX": { price: 20, currency: "AUD" } }, {});
+  assert.deepEqual(value.missing, ["AAPL"]);
+  assert.equal(value.totals.valueAud, 600, "only what can be priced is summed");
+});
+
+test("dividends logged as income are matched back to their holding", () => {
+  const { trades } = core.parseTradesTable(TRADES_NOTE);
+  const holdings = core.buildHoldings(trades, { referenceDate: "2026-09-17" });
+  const note = [
+    "## Finance",
+    "- [ ] #log/spending 0",
+    "- $12.40 #log/income/dividend/vas-ax",
+    "- $3.10 #log/income/dividend/aapl",
+    "",
+  ].join("\n");
+  const entries = [
+    ...core.parseTransactionsFromNoteContent(note, "2026-07-15.md", {}),
+    ...core.parseTransactionsFromNoteContent(note.replace("12.40", "9.00").replace("3.10", "0"), "2025-07-15.md", {}),
+  ];
+  const dividends = core.summarizeDividends(entries, holdings, { referenceDate: "2026-09-17" });
+  const vas = dividends.rows.find((row) => row.ticker === "VAS.AX");
+  assert.equal(vas.total, 21.4);
+  assert.equal(vas.lastTwelveMonths, 12.4);
+  assert.equal(vas.yieldOnCostPct, 3.39, "$12.40 on a $366 cost base");
+  assert.equal(dividends.lastTwelveMonths, 15.5);
+});
+
+test("the value series carries prices forward and tracks cost", () => {
+  const trades = core.parseTradesTable(
+    "| Date | Type | Ticker | Units | Price | Fees |\n| --- | --- | --- | --- | --- | --- |\n| 2026-01-05 | buy | VAS.AX | 10 | 100 | 0 |\n| 2026-01-19 | buy | VAS.AX | 10 | 110 | 0 |\n"
+  ).trades;
+  const series = core.buildPortfolioValueSeries(
+    trades,
+    { "VAS.AX": [{ date: "2026-01-05", close: 100 }, { date: "2026-01-12", close: 105 }, { date: "2026-01-19", close: 110 }] },
+    {},
+    { start: "2026-01-05", end: "2026-01-26", stepDays: 7 }
+  );
+  assert.deepEqual(
+    series.map((point) => [point.date, point.valueAud, point.costAud]),
+    [
+      ["2026-01-05", 1000, 1000],
+      ["2026-01-12", 1050, 1000],
+      ["2026-01-19", 2200, 2100],
+      ["2026-01-26", 2200, 2100],
+    ]
+  );
+});
+
+test("computeXirr annualises dated cash flows", () => {
+  assert.equal(core.computeXirr([{ date: "2025-01-01", amount: -1000 }, { date: "2026-01-01", amount: 1100 }]), 0.1);
+  assert.equal(core.computeXirr([{ date: "2025-01-01", amount: -1000 }]), null, "one flow has no return");
+});
