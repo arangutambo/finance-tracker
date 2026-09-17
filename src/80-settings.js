@@ -525,6 +525,31 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
           })
       );
 
+    new Setting(containerEl)
+      .setName("Account")
+      .setDesc("Where your bills and spending come out of. Runway compares itself with this account's latest balance snapshot: covered, or short by how much.")
+      .addDropdown((dropdown) => {
+        const current = this.plugin.settings.runwayAccount || "";
+        dropdown.addOption("", "None");
+        if (current) dropdown.addOption(current, current);
+        dropdown.setValue(current);
+        this.plugin
+          .collectAllTransactions()
+          .then((entries) => {
+            for (const account of core.summarizeBalanceSnapshots(entries).accounts) {
+              if (account.key !== current) dropdown.addOption(account.key, account.key);
+            }
+            dropdown.setValue(current);
+          })
+          .catch(() => {});
+        dropdown.onChange(async (value) => {
+          this.plugin.settings.runwayAccount = value;
+          await this.plugin.saveSettings();
+          this.plugin.refreshDailyBudgetView();
+          this.renderRunwayStatus(runwayStatus).catch(() => {});
+        });
+      });
+
     const runwayStatus = containerEl.createDiv({ cls: "finance-tracker-vault-status" });
     this.renderRunwayStatus(runwayStatus).catch(() => {});
 
@@ -649,11 +674,17 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
       const runway = await this.plugin.computeRunwayState(core.todayIsoLocal());
       statusEl.empty();
       statusEl.addClass(runway.target > 0 ? "is-ok" : "is-warning");
+      const currency = this.plugin.settings.defaultCurrency;
+      const balance = runway.balance
+        ? runway.balance.status === "covered"
+          ? ` ${runway.accountLabel} covers it with ${core.formatCurrency(runway.balance.difference, currency)} to spare.`
+          : ` ${runway.accountLabel} is short by ${core.formatCurrency(Math.abs(runway.balance.difference), currency)}.`
+        : "";
       statusEl.setText(
         runway.target > 0
-          ? `Right now: keep ${core.formatCurrency(runway.target, this.plugin.settings.defaultCurrency)} available for the next ${runway.period} — ${runway.occurrences.length} bill${
+          ? `Right now: keep ${core.formatCurrency(runway.target, currency)} available for the next ${runway.period}, with ${runway.occurrences.length} bill${
               runway.occurrences.length === 1 ? "" : "s"
-            } due by ${runway.windowEnd}.`
+            } due by ${runway.windowEnd}.${balance}`
           : `No bills fall inside the next ${runway.period}, so there is nothing to set aside yet.`
       );
     } catch (error) {

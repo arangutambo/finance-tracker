@@ -2426,6 +2426,59 @@ function computeRunway(recurring, options = {}) {
 }
 
 
+// Runway against money you actually have. `account` is a balance snapshot
+// ({ amount, date }) for the account the outgoings come from. Days covered
+// walks the window day by day — bills land on their dates, usual spending a
+// little each day — so a large bill on day 3 counts on day 3, not spread thin.
+// Past the window it carries on at the window's average daily cost.
+const RUNWAY_STALE_BALANCE_DAYS = 14;
+
+function compareRunwayToBalance(runway, account, options = {}) {
+  const amount = Number(account?.amount);
+  if (!runway || !Number.isFinite(amount)) return { status: "no-balance" };
+  const referenceDate = parseIsoDate(options.referenceDate) || runway.windowStart || todayIsoLocal();
+  const target = roundCurrencyAmount(runway.target || 0);
+  const windowDays = Math.max(1, Number(runway.windowDays) || 1);
+  const dailySpendCents = Math.round(toCents(runway.discretionary || 0) / windowDays);
+  const billsByDate = new Map();
+  for (const occurrence of runway.occurrences || []) {
+    billsByDate.set(occurrence.date, (billsByDate.get(occurrence.date) || 0) + toCents(occurrence.amount || 0));
+  }
+
+  const balanceCents = toCents(amount);
+  let spentCents = 0;
+  let daysCovered = 0;
+  let runsOutOn = "";
+  for (let day = 0; day < windowDays; day += 1) {
+    const date = addDays(runway.windowStart || referenceDate, day);
+    spentCents += dailySpendCents + (billsByDate.get(date) || 0);
+    if (spentCents > balanceCents) {
+      runsOutOn = date;
+      break;
+    }
+    daysCovered += 1;
+  }
+  if (!runsOutOn) {
+    const perDayCents = Math.round(toCents(target) / windowDays);
+    if (perDayCents > 0) daysCovered += Math.floor((balanceCents - spentCents) / perDayCents);
+  }
+
+  const difference = roundCurrencyAmount(amount - target);
+  const asOf = parseIsoDate(account.date) || "";
+  const ageDays = asOf ? daysBetweenInclusive(asOf, referenceDate) - 1 : null;
+  return {
+    status: difference >= 0 ? "covered" : "short",
+    balance: roundCurrencyAmount(amount),
+    target,
+    difference,
+    daysCovered: Math.max(0, daysCovered),
+    runsOutOn,
+    asOf,
+    stale: ageDays !== null && ageDays > RUNWAY_STALE_BALANCE_DAYS,
+    ageDays,
+  };
+}
+
 const RECURRING_REGISTRY_COLUMNS = [
   { header: "Item", align: "---" },
   { header: "Cadence", align: "---" },
@@ -5745,6 +5798,7 @@ module.exports = {
   parseGoalDefinition,
   computeSinkingFund,
   buildGoalPrompts,
+  compareRunwayToBalance,
   slugifyName,
   deriveGoalKey,
   deriveTripTag,

@@ -2429,6 +2429,59 @@ const core = (() => {
   }
 
 
+  // Runway against money you actually have. `account` is a balance snapshot
+  // ({ amount, date }) for the account the outgoings come from. Days covered
+  // walks the window day by day — bills land on their dates, usual spending a
+  // little each day — so a large bill on day 3 counts on day 3, not spread thin.
+  // Past the window it carries on at the window's average daily cost.
+  const RUNWAY_STALE_BALANCE_DAYS = 14;
+
+  function compareRunwayToBalance(runway, account, options = {}) {
+    const amount = Number(account?.amount);
+    if (!runway || !Number.isFinite(amount)) return { status: "no-balance" };
+    const referenceDate = parseIsoDate(options.referenceDate) || runway.windowStart || todayIsoLocal();
+    const target = roundCurrencyAmount(runway.target || 0);
+    const windowDays = Math.max(1, Number(runway.windowDays) || 1);
+    const dailySpendCents = Math.round(toCents(runway.discretionary || 0) / windowDays);
+    const billsByDate = new Map();
+    for (const occurrence of runway.occurrences || []) {
+      billsByDate.set(occurrence.date, (billsByDate.get(occurrence.date) || 0) + toCents(occurrence.amount || 0));
+    }
+
+    const balanceCents = toCents(amount);
+    let spentCents = 0;
+    let daysCovered = 0;
+    let runsOutOn = "";
+    for (let day = 0; day < windowDays; day += 1) {
+      const date = addDays(runway.windowStart || referenceDate, day);
+      spentCents += dailySpendCents + (billsByDate.get(date) || 0);
+      if (spentCents > balanceCents) {
+        runsOutOn = date;
+        break;
+      }
+      daysCovered += 1;
+    }
+    if (!runsOutOn) {
+      const perDayCents = Math.round(toCents(target) / windowDays);
+      if (perDayCents > 0) daysCovered += Math.floor((balanceCents - spentCents) / perDayCents);
+    }
+
+    const difference = roundCurrencyAmount(amount - target);
+    const asOf = parseIsoDate(account.date) || "";
+    const ageDays = asOf ? daysBetweenInclusive(asOf, referenceDate) - 1 : null;
+    return {
+      status: difference >= 0 ? "covered" : "short",
+      balance: roundCurrencyAmount(amount),
+      target,
+      difference,
+      daysCovered: Math.max(0, daysCovered),
+      runsOutOn,
+      asOf,
+      stale: ageDays !== null && ageDays > RUNWAY_STALE_BALANCE_DAYS,
+      ageDays,
+    };
+  }
+
   const RECURRING_REGISTRY_COLUMNS = [
     { header: "Item", align: "---" },
     { header: "Cadence", align: "---" },
@@ -5748,6 +5801,7 @@ const core = (() => {
     parseGoalDefinition,
     computeSinkingFund,
     buildGoalPrompts,
+    compareRunwayToBalance,
     slugifyName,
     deriveGoalKey,
     deriveTripTag,
@@ -5932,6 +5986,8 @@ const DEFAULT_SETTINGS = {
   recurringSortOrder: "dueDate",
   runwayPeriod: "1 month",
   runwayMode: "spending",
+  // The account runway is compared with. Blank until chosen.
+  runwayAccount: "",
   excludedRecurringItems: [],
   // Bill suggestions dismissed with Ignore, by suggestion id.
   ignoredBillSuggestions: [],
@@ -9330,12 +9386,23 @@ class FinanceTrackerPlugin extends Plugin {
           recurringPrefix,
         })
       : null;
-    return core.computeRunway(recurring, {
+    const runway = core.computeRunway(recurring, {
       referenceDate,
       period: this.settings.runwayPeriod,
       mode,
       monthlyDiscretionary: forecast?.monthlyDiscretionary || 0,
     });
+
+    // Against the account it comes out of, when one is chosen (the block's
+    // `account:`, else Settings → Runway) and has a balance snapshot.
+    const balances = core.summarizeBalanceSnapshots(entries);
+    const accountKey = core.normalizeCategoryPath(options.account || this.settings.runwayAccount || "");
+    const account = accountKey ? balances.accounts.find((item) => item.key === accountKey) : null;
+    runway.accountKey = accountKey;
+    runway.accountLabel = account?.label || (accountKey ? core.titleCaseSegment(accountKey.split("/").pop()) : "");
+    runway.knownAccounts = balances.accounts.map((item) => item.key);
+    runway.balance = account?.latest ? core.compareRunwayToBalance(runway, account.latest, { referenceDate }) : null;
+    return runway;
   }
 
   buildRecurringNoteContent() {
@@ -13125,7 +13192,7 @@ class FinanceTrackerPlugin extends Plugin {
     const config = parseConfigBlock(source);
     const referenceDate = this.getReferenceDateForSource(ctx.sourcePath);
     const currency = core.normalizeCurrency(config.currency || this.settings.defaultCurrency);
-    const runway = await this.computeRunwayState(referenceDate);
+    const runway = await this.computeRunwayState(referenceDate, { account: config.account });
 
     const wrapper = el.createDiv({ cls: "finance-tracker-dashboard" });
     const header = wrapper.createDiv({ cls: "finance-tracker-header" });
@@ -13171,6 +13238,8 @@ class FinanceTrackerPlugin extends Plugin {
       text: `${covers.charAt(0).toUpperCase()}${covers.slice(1)}, between today and ${runway.windowEnd}. Change the period or what counts in Settings → Runway.`,
     });
 
+    this.renderRunwayBalance(section, runway, currency);
+
     renderStatCards(section, [
       {
         label: `Next ${runway.period}`,
@@ -13210,6 +13279,47 @@ class FinanceTrackerPlugin extends Plugin {
           text: `Plus ${core.formatCurrency(runway.discretionary, currency)} of usual spending, from your average over the last 90 days.`,
         });
       }
+    }
+  }
+
+  // Whether the money is actually there. Runway on its own is a number to keep
+  // available; next to a balance it's an answer.
+  renderRunwayBalance(section, runway, currency) {
+    const compare = runway.balance;
+    const box = section.createDiv({ cls: "finance-runway-balance" });
+    if (!compare) {
+      box.addClass("is-empty");
+      box.setText(
+        runway.accountKey
+          ? `No balance snapshot for ${runway.accountLabel} yet. Run Snapshot balances to see whether you're covered.`
+          : runway.knownAccounts?.length
+            ? "Choose the account this comes out of in Settings → Runway (or add account: to this block) to see whether you're covered."
+            : "Run Snapshot balances, then choose that account in Settings → Runway, to see whether you're covered."
+      );
+      return;
+    }
+    const covered = compare.status === "covered";
+    box.addClass(covered ? "is-covered" : "is-short");
+    box.createDiv({
+      cls: "finance-runway-balance-headline",
+      text: covered
+        ? `Covered, with ${core.formatCurrency(compare.difference, currency)} to spare`
+        : `Short by ${core.formatCurrency(Math.abs(compare.difference), currency)}`,
+    });
+    const lasts = covered
+      ? `enough for about ${compare.daysCovered} days of outgoings`
+      : compare.runsOutOn
+        ? `which runs out around ${compare.runsOutOn}`
+        : `about ${compare.daysCovered} days of outgoings`;
+    box.createDiv({
+      cls: "finance-tracker-budget-meta",
+      text: `${runway.accountLabel} had ${core.formatCurrency(compare.balance, currency)} on ${compare.asOf}, ${lasts}.`,
+    });
+    if (compare.stale) {
+      box.createDiv({
+        cls: "finance-tracker-budget-meta is-warning",
+        text: `That snapshot is ${compare.ageDays} days old. Run Snapshot balances for a current answer.`,
+      });
     }
   }
 
@@ -19251,6 +19361,31 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
           })
       );
 
+    new Setting(containerEl)
+      .setName("Account")
+      .setDesc("Where your bills and spending come out of. Runway compares itself with this account's latest balance snapshot: covered, or short by how much.")
+      .addDropdown((dropdown) => {
+        const current = this.plugin.settings.runwayAccount || "";
+        dropdown.addOption("", "None");
+        if (current) dropdown.addOption(current, current);
+        dropdown.setValue(current);
+        this.plugin
+          .collectAllTransactions()
+          .then((entries) => {
+            for (const account of core.summarizeBalanceSnapshots(entries).accounts) {
+              if (account.key !== current) dropdown.addOption(account.key, account.key);
+            }
+            dropdown.setValue(current);
+          })
+          .catch(() => {});
+        dropdown.onChange(async (value) => {
+          this.plugin.settings.runwayAccount = value;
+          await this.plugin.saveSettings();
+          this.plugin.refreshDailyBudgetView();
+          this.renderRunwayStatus(runwayStatus).catch(() => {});
+        });
+      });
+
     const runwayStatus = containerEl.createDiv({ cls: "finance-tracker-vault-status" });
     this.renderRunwayStatus(runwayStatus).catch(() => {});
 
@@ -19375,11 +19510,17 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
       const runway = await this.plugin.computeRunwayState(core.todayIsoLocal());
       statusEl.empty();
       statusEl.addClass(runway.target > 0 ? "is-ok" : "is-warning");
+      const currency = this.plugin.settings.defaultCurrency;
+      const balance = runway.balance
+        ? runway.balance.status === "covered"
+          ? ` ${runway.accountLabel} covers it with ${core.formatCurrency(runway.balance.difference, currency)} to spare.`
+          : ` ${runway.accountLabel} is short by ${core.formatCurrency(Math.abs(runway.balance.difference), currency)}.`
+        : "";
       statusEl.setText(
         runway.target > 0
-          ? `Right now: keep ${core.formatCurrency(runway.target, this.plugin.settings.defaultCurrency)} available for the next ${runway.period} — ${runway.occurrences.length} bill${
+          ? `Right now: keep ${core.formatCurrency(runway.target, currency)} available for the next ${runway.period}, with ${runway.occurrences.length} bill${
               runway.occurrences.length === 1 ? "" : "s"
-            } due by ${runway.windowEnd}.`
+            } due by ${runway.windowEnd}.${balance}`
           : `No bills fall inside the next ${runway.period}, so there is nothing to set aside yet.`
       );
     } catch (error) {

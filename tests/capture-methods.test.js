@@ -2083,3 +2083,27 @@ test("a new trip note carries its own currency, not yen", async () => {
   assert.doesNotMatch(note, /JPY/);
   assert.deepEqual(await plugin.collectTakenTripTags(), ["2027/fiji"]);
 });
+
+test("the runway block says whether the chosen account covers it", async () => {
+  const { plugin, app } = await vaultWithBills();
+  plugin.settings.runwayMode = "bills";
+  plugin.settings.runwayPeriod = "1 month";
+  await app.vault.create("Daily/2026-09-19.md", "## Finance\n- [ ] #log/spending 0\n- $20.00 #log/balance/anz-plus\n");
+
+  const short = new StubEl();
+  await plugin.renderRunwayBlock("account: anz-plus", short, onSeptember20);
+  assert.match(short.allText(), /Short by \$14\.00/, "Claude's $34 is due on the 26th");
+  assert.match(short.allText(), /Anz Plus had \$20\.00 on 2026-09-19, which runs out around 2026-09-26/);
+
+  plugin.settings.runwayAccount = "anz-plus";
+  await app.vault.modify(app.vault.getAbstractFileByPath("Daily/2026-09-19.md"), "## Finance\n- [ ] #log/spending 0\n- $500.00 #log/balance/anz-plus\n");
+  plugin.invalidateIndexEntry("Daily/2026-09-19.md"); // Obsidian's modify event does this in the app
+  const covered = new StubEl();
+  await plugin.renderRunwayBlock("", covered, onSeptember20);
+  assert.match(covered.allText(), /Covered, with \$466\.00 to spare/);
+
+  plugin.settings.runwayAccount = "";
+  const none = new StubEl();
+  await plugin.renderRunwayBlock("", none, onSeptember20);
+  assert.match(none.allText(), /Choose the account this comes out of/);
+});

@@ -2708,12 +2708,23 @@ class FinanceTrackerPlugin extends Plugin {
           recurringPrefix,
         })
       : null;
-    return core.computeRunway(recurring, {
+    const runway = core.computeRunway(recurring, {
       referenceDate,
       period: this.settings.runwayPeriod,
       mode,
       monthlyDiscretionary: forecast?.monthlyDiscretionary || 0,
     });
+
+    // Against the account it comes out of, when one is chosen (the block's
+    // `account:`, else Settings → Runway) and has a balance snapshot.
+    const balances = core.summarizeBalanceSnapshots(entries);
+    const accountKey = core.normalizeCategoryPath(options.account || this.settings.runwayAccount || "");
+    const account = accountKey ? balances.accounts.find((item) => item.key === accountKey) : null;
+    runway.accountKey = accountKey;
+    runway.accountLabel = account?.label || (accountKey ? core.titleCaseSegment(accountKey.split("/").pop()) : "");
+    runway.knownAccounts = balances.accounts.map((item) => item.key);
+    runway.balance = account?.latest ? core.compareRunwayToBalance(runway, account.latest, { referenceDate }) : null;
+    return runway;
   }
 
   buildRecurringNoteContent() {
@@ -6503,7 +6514,7 @@ class FinanceTrackerPlugin extends Plugin {
     const config = parseConfigBlock(source);
     const referenceDate = this.getReferenceDateForSource(ctx.sourcePath);
     const currency = core.normalizeCurrency(config.currency || this.settings.defaultCurrency);
-    const runway = await this.computeRunwayState(referenceDate);
+    const runway = await this.computeRunwayState(referenceDate, { account: config.account });
 
     const wrapper = el.createDiv({ cls: "finance-tracker-dashboard" });
     const header = wrapper.createDiv({ cls: "finance-tracker-header" });
@@ -6549,6 +6560,8 @@ class FinanceTrackerPlugin extends Plugin {
       text: `${covers.charAt(0).toUpperCase()}${covers.slice(1)}, between today and ${runway.windowEnd}. Change the period or what counts in Settings → Runway.`,
     });
 
+    this.renderRunwayBalance(section, runway, currency);
+
     renderStatCards(section, [
       {
         label: `Next ${runway.period}`,
@@ -6588,6 +6601,47 @@ class FinanceTrackerPlugin extends Plugin {
           text: `Plus ${core.formatCurrency(runway.discretionary, currency)} of usual spending, from your average over the last 90 days.`,
         });
       }
+    }
+  }
+
+  // Whether the money is actually there. Runway on its own is a number to keep
+  // available; next to a balance it's an answer.
+  renderRunwayBalance(section, runway, currency) {
+    const compare = runway.balance;
+    const box = section.createDiv({ cls: "finance-runway-balance" });
+    if (!compare) {
+      box.addClass("is-empty");
+      box.setText(
+        runway.accountKey
+          ? `No balance snapshot for ${runway.accountLabel} yet. Run Snapshot balances to see whether you're covered.`
+          : runway.knownAccounts?.length
+            ? "Choose the account this comes out of in Settings → Runway (or add account: to this block) to see whether you're covered."
+            : "Run Snapshot balances, then choose that account in Settings → Runway, to see whether you're covered."
+      );
+      return;
+    }
+    const covered = compare.status === "covered";
+    box.addClass(covered ? "is-covered" : "is-short");
+    box.createDiv({
+      cls: "finance-runway-balance-headline",
+      text: covered
+        ? `Covered, with ${core.formatCurrency(compare.difference, currency)} to spare`
+        : `Short by ${core.formatCurrency(Math.abs(compare.difference), currency)}`,
+    });
+    const lasts = covered
+      ? `enough for about ${compare.daysCovered} days of outgoings`
+      : compare.runsOutOn
+        ? `which runs out around ${compare.runsOutOn}`
+        : `about ${compare.daysCovered} days of outgoings`;
+    box.createDiv({
+      cls: "finance-tracker-budget-meta",
+      text: `${runway.accountLabel} had ${core.formatCurrency(compare.balance, currency)} on ${compare.asOf}, ${lasts}.`,
+    });
+    if (compare.stale) {
+      box.createDiv({
+        cls: "finance-tracker-budget-meta is-warning",
+        text: `That snapshot is ${compare.ageDays} days old. Run Snapshot balances for a current answer.`,
+      });
     }
   }
 

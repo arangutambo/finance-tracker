@@ -3027,3 +3027,33 @@ test("goal keys and trip tags come from the name, unique and tag-safe", () => {
   assert.equal(core.deriveTripTag("New Zealand", { startDate: "2027-01-04" }), "2027/new-zealand");
   assert.equal(core.deriveTripTag("Japan", { startDate: "2026-10-01", existingTags: ["2026/japan"] }), "2026/japan-2");
 });
+
+test("runway against a balance: covered, short, and how many days it lasts", () => {
+  const runway = {
+    windowStart: "2026-09-17",
+    windowEnd: "2026-10-16",
+    windowDays: 30,
+    target: 1300,
+    bills: 1000,
+    discretionary: 300, // $10 a day
+    occurrences: [
+      { date: "2026-09-20", amount: 800, label: "Rent" },
+      { date: "2026-10-01", amount: 200, label: "Power" },
+    ],
+  };
+  const covered = core.compareRunwayToBalance(runway, { amount: 2600, date: "2026-09-15" }, { referenceDate: "2026-09-17" });
+  assert.equal(covered.status, "covered");
+  assert.equal(covered.difference, 1300);
+  assert.equal(covered.daysCovered, 60, "30 days in the window, then 1,300 more at about 43.33 a day");
+  assert.equal(covered.stale, false);
+
+  const short = core.compareRunwayToBalance(runway, { amount: 900, date: "2026-08-01" }, { referenceDate: "2026-09-17" });
+  assert.equal(short.status, "short");
+  assert.equal(short.difference, -400);
+  // $10 a day and rent of 800 on the 20th reach $900 on the 26th; the 27th is short
+  assert.equal(short.runsOutOn, "2026-09-27");
+  assert.equal(short.daysCovered, 10);
+  assert.equal(short.stale, true, "a snapshot from August is too old to trust");
+
+  assert.equal(core.compareRunwayToBalance(runway, null).status, "no-balance");
+});

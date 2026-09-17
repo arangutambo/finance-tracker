@@ -59,6 +59,8 @@ const DEFAULT_SETTINGS = {
   recurringSortOrder: "dueDate",
   runwayPeriod: "1 month",
   runwayMode: "spending",
+  // The account runway is compared with. Blank until chosen.
+  runwayAccount: "",
   excludedRecurringItems: [],
   // Bill suggestions dismissed with Ignore, by suggestion id.
   ignoredBillSuggestions: [],
