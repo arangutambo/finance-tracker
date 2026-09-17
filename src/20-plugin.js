@@ -204,6 +204,12 @@ class FinanceTrackerPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: "finance-tracker-convert-bills",
+      name: "Convert recurring payments to bill notes",
+      callback: () => this.openBillMigration(),
+    });
+
+    this.addCommand({
       id: "finance-tracker-tidy-recurring",
       name: "Tidy up recurring payments",
       callback: () => this.openRecurringCleanup(),
@@ -1670,6 +1676,18 @@ class FinanceTrackerPlugin extends Plugin {
     let written = 0;
     for (const change of plan?.files || []) {
       const file = this.app.vault.getAbstractFileByPath(change.path);
+      if (change.create) {
+        // A note this plan creates: written only if nothing is there yet, so
+        // re-applying an old plan can never overwrite a note since edited.
+        if (file) {
+          skipped.push(change.path);
+          continue;
+        }
+        await this.ensureFolder(change.path.split("/").slice(0, -1).join("/"));
+        await this.upsertFile(change.path, change.after);
+        written += 1;
+        continue;
+      }
       if (!(file instanceof TFile)) {
         skipped.push(change.path);
         continue;
@@ -5408,6 +5426,76 @@ class FinanceTrackerPlugin extends Plugin {
     await this.saveBill(next);
     this.refreshDailyBudgetView();
     return next;
+  }
+
+  // The move from the registry to bill notes. Planned from what the old model
+  // detected, with duplicates merged and removed bills kept as ended ones, and
+  // shown in full before a single note is created.
+  async planBillMigration(referenceDate = core.todayIsoLocal()) {
+    const entries = await this.collectAllTransactions();
+    const prefix = this.settings.recurringTagPrefix || "subscriptions";
+    const detected = core.detectRecurringPayments(entries, { prefix, referenceDate });
+    const applied = core.applyRecurringRegistry(detected, await this.loadRecurringRegistry(), referenceDate);
+    const planned = core.planBillsFromLegacy(applied.items, {
+      excluded: this.settings.excludedRecurringItems || [],
+      referenceDate,
+      defaultCurrency: this.settings.defaultCurrency,
+    });
+
+    const existing = new Set((await this.loadBills()).map((bill) => bill.id));
+    const files = [];
+    const samples = [];
+    const warnings = [];
+    for (const bill of planned) {
+      if (existing.has(bill.id)) continue;
+      const path = this.billNotePath(bill);
+      files.push({ path, before: "", after: this.buildBillNoteContent(bill), entries: 1, create: true });
+      if (bill.mergedFrom.length && samples.length < 5) {
+        samples.push({
+          before: [bill.id, ...bill.mergedFrom].join(", "),
+          after: `${bill.name} — one bill, ${bill.payments} payments`,
+        });
+      }
+      if (bill.retired) {
+        warnings.push({
+          line: `${bill.name} · ${cadenceLabel(bill.cadence)} · ${core.formatCurrency(bill.amount, bill.currency)}`,
+          reason: `ended ${bill.endDate || "(no payments)"} — kept with its history, not tracked as due`,
+        });
+      }
+    }
+
+    return {
+      planned,
+      plan: {
+        files,
+        samples,
+        warnings,
+        totals: { files: files.length, entries: files.length, warnings: warnings.length },
+      },
+    };
+  }
+
+  async openBillMigration() {
+    const { planned, plan } = await this.planBillMigration();
+    const live = planned.filter((bill) => !bill.retired).length;
+    const merged = planned.reduce((sum, bill) => sum + bill.mergedFrom.length, 0);
+    new RewritePreviewModal(this.app, this, {
+      title: "Convert recurring payments to bill notes",
+      intro: `${planned.length} bill${planned.length === 1 ? "" : "s"}: ${live} running, ${planned.length - live} ended.${
+        merged ? ` ${merged} duplicate wording${merged === 1 ? " is" : "s are"} merged into the bill they belong to.` : ""
+      } Each becomes a note in ${this.getBillsFolderPath()}; your daily notes are not touched.`,
+      plan,
+      warningsLabel: "Ended bills",
+      emptyText: "Every bill already has a note.",
+      applyLabel: `Create ${plan.totals.files} bill note${plan.totals.files === 1 ? "" : "s"}`,
+      onApply: async (approved) => {
+        const { written, skipped } = await this.applyNoteRewritePlan(approved);
+        this.refreshDailyBudgetView();
+        new Notice(
+          `Created ${written} bill note${written === 1 ? "" : "s"}${skipped.length ? `, ${skipped.length} already existed` : ""}.`
+        );
+      },
+    }).open();
   }
 
   // Registry-shaped patches from the existing UI, translated for a bill note.

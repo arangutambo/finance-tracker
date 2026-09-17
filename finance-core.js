@@ -4349,6 +4349,12 @@ function findBillForPayment(payment, items, options = {}) {
 //
 // A bill that was "removed completely" keeps its history and becomes an ended
 // bill rather than disappearing: cancelled is not the same as never happened.
+function carriedOverride(item) {
+  if (!item?.nextDue) return null;
+  const derived = item.lastDate ? nextRecurringDate(item.lastDate, item.cadence) : "";
+  return item.nextDue !== derived ? item.nextDue : null;
+}
+
 function planBillsFromLegacy(items, options = {}) {
   const excluded = new Set(options.excluded || []);
   const referenceDate = parseIsoDate(options.referenceDate) || todayIsoLocal();
@@ -4418,7 +4424,10 @@ function planBillsFromLegacy(items, options = {}) {
       // An ended bill stops at its last payment; a live one keeps the terms it had.
       endDate: retired ? primary.lastDate || null : primary.endDate || null,
       paymentsLeft: retired ? null : primary.paymentsLeft ?? null,
-      nextDueOverride: retired ? null : primary.usedOverride ? primary.nextDue : null,
+      // A registry override carries across: it usually records a skip or a
+      // correction the notes cannot show. The bill model clears it by itself
+      // once a payment overtakes it, so carrying it is safe.
+      nextDueOverride: retired ? null : carriedOverride(primary),
       skipped: [],
       startDate: group.firstDate || null,
       currency: primary.currency || options.defaultCurrency || "AUD",

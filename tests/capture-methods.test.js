@@ -1180,3 +1180,49 @@ test("Escape dismisses an open suggestion popup without closing the modal", asyn
   modal.onClose();
   assert.equal(handlers.length, 1, "the popup's handler is removed with the modal");
 });
+
+test("converting to bill notes merges duplicates, keeps ended bills, and is then the source of truth", async () => {
+  const { plugin, app, files } = makePlugin(billSettings({ excludedRecurringItems: ["urban-climb", "hbo-max-subscription"] }));
+  delete plugin.invalidateIndexEntry;
+  const week = (date) =>
+    app.vault.create(
+      `Daily/${date}.md`,
+      ["## Finance", "- [ ] #log/spending 60", "\t- $30.00 #log/spending/subscriptions/weekly", "\t\t- Urban Climb", "\t- $30.00 #log/spending/subscriptions/weekly", "\t\t- Urban Climb Subscription", ""].join("\n")
+    );
+  for (const date of ["2026-08-03", "2026-08-10", "2026-08-17"]) await week(date);
+  await app.vault.create(
+    "Daily/2026-07-03.md",
+    "## Finance\n- [ ] #log/spending 11.99\n\t- $11.99 #log/spending/subscriptions/monthly\n\t\t- HBO Max Subscription\n"
+  );
+
+  const { planned, plan } = await plugin.planBillMigration("2026-08-20");
+
+  assert.equal(planned.length, 2, "two wordings of one gym, plus HBO");
+  const climb = planned.find((bill) => bill.cadence === "weekly");
+  assert.equal(climb.mergedFrom.length, 1);
+  assert.equal(climb.retired, false);
+  assert.equal(planned.find((bill) => bill.cadence === "monthly").retired, true, "a removed bill comes across as ended");
+  assert.equal(plan.totals.files, 2);
+
+  await plugin.applyNoteRewritePlan(plan);
+
+  const notes = [...files.keys()].filter((path) => path.startsWith("Utility/Budgets/Bills/"));
+  assert.equal(notes.length, 2);
+  const bills = await plugin.loadBills();
+  assert.equal(bills.length, 2);
+
+  // From here, the bills are what the plugin reads.
+  const recurring = await plugin.detectRecurring("2026-08-20");
+  const live = recurring.items.filter((item) => item.active);
+  assert.equal(live.length, 1);
+  assert.equal(live[0].count, 6, "both wordings' payments belong to the one bill");
+  assert.equal(recurring.totals.monthly, core_round(30 * (52 / 12)));
+
+  // Applying again creates nothing and overwrites nothing.
+  const again = await plugin.planBillMigration("2026-08-20");
+  assert.equal(again.plan.totals.files, 0);
+});
+
+function core_round(value) {
+  return Number(Number(value).toFixed(2));
+}
