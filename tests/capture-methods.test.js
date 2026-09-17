@@ -1609,3 +1609,69 @@ test("ticker search offers what you already hold, and only asks Yahoo when Yahoo
   assert.deepEqual(searched.map((result) => result.symbol), ["VGS.AX"]);
   assert.equal(requests, 1);
 });
+
+// --- Portfolio block ------------------------------------------------------------------------
+
+test("the portfolio block renders holdings from typed prices", async () => {
+  const note = PORTFOLIO_NOTE.replace("price_overrides: ", "price_overrides: VAS.AX=100").replace("fx_rates: ", "fx_rates: USD=1.5");
+  const { plugin, app } = await vaultWithPortfolio({ priceSource: "manual" }, note);
+  await app.vault.create("Daily/2026-07-15.md", "## Finance\n- [ ] #log/spending 0\n- $8.20 #log/income/dividend/vas-ax\n");
+  let requests = 0;
+  requestUrlHandler = async () => {
+    requests += 1;
+    return { status: 200 };
+  };
+
+  const el = new StubEl();
+  await plugin.renderPortfolioBlock("", el, { sourcePath: "Utility/Finance/📈 Portfolio.md" });
+  const text = el.allText();
+
+  assert.equal(requests, 0);
+  assert.match(text, /Prices are the ones typed into this note's properties/);
+  assert.match(text, /Value \| \$1,000\.00 \| 1 unpriced/);
+  assert.match(text, /Holdings/);
+  assert.match(text, /VAS\.AX/);
+  assert.match(text, /No price for AAPL\. Type one into this note's price_overrides/);
+  assert.match(text, /Dividends, 12 months \| \$8\.20/);
+  assert.match(text, /Allocation/);
+  assert.match(text, /Trades \(2\)/);
+  assert.match(text, /not financial or tax advice/);
+});
+
+test("logging a trade appends a row the portfolio reads straight back", async () => {
+  const { plugin, files } = await vaultWithPortfolio({ priceSource: "manual" });
+
+  const modal = plugin.openLogTrade();
+  await modal.ready;
+  const field = (label) => modal.contentEl.find((node) => node.attrs["aria-label"] === label);
+  field("Trade type").value = "buy";
+  field("Trade date").value = "2026-09-15";
+  field("Ticker").value = "vgs.ax";
+  field("Units").value = "12";
+  field("Price").value = "135.20";
+  field("Brokerage").value = "9.50";
+  field("Currency").value = "AUD";
+  field("Account").value = "Pearler";
+  await modal.contentEl.click("Log trade");
+
+  const note = files.get("Utility/Finance/📈 Portfolio.md").content;
+  assert.match(note, /\| 2026-09-15 \| buy \| VGS\.AX \| 12 \| 135\.2 \| 9\.5 \| AUD \|  \| Pearler \|  \|/);
+  const lines = note.split("\n");
+  assert.equal(lines.indexOf("| 2026-09-15 | buy | VGS.AX | 12 | 135.2 | 9.5 | AUD |  | Pearler |  |"), lines.findIndex((line) => line.includes("AAPL")) + 1, "added at the end of the table, not below it");
+
+  const model = await plugin.buildPortfolioModel("2026-09-17");
+  const vgs = model.holdings.holdings.find((holding) => holding.ticker === "VGS.AX");
+  assert.equal(vgs.units, 12);
+  assert.equal(vgs.costAud, 1631.9);
+});
+
+test("logging a trade creates the portfolio note when there is none", async () => {
+  const made = makePlugin({ priceSource: "manual" });
+  const { plugin, files } = made;
+  await plugin.appendTrade({ date: "2026-09-15", type: "buy", ticker: "NDQ.AX", units: 20, price: 48, fees: 3, currency: "AUD" });
+
+  const note = files.get("Utility/Finance/📈 Portfolio.md").content;
+  assert.match(note, /```finance-portfolio/);
+  assert.match(note, /\| 2026-09-15 \| buy \| NDQ\.AX \| 20 \| 48 \| 3 \| AUD \|/);
+  assert.equal((await plugin.loadPortfolio()).trades.length, 1);
+});

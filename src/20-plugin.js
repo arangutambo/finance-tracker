@@ -94,6 +94,10 @@ class FinanceTrackerPlugin extends Plugin {
       await this.renderBillBlock(source, el, ctx);
     });
 
+    this.registerMarkdownCodeBlockProcessor(PORTFOLIO_BLOCK, async (source, el, ctx) => {
+      await this.renderPortfolioBlock(source, el, ctx);
+    });
+
     this.registerView(DAILY_BUDGET_VIEW, (leaf) => new DailyBudgetView(leaf, this));
     this.registerView(FINANCE_INBOX_VIEW, (leaf) => new FinanceInboxView(leaf, this));
 
@@ -205,6 +209,35 @@ class FinanceTrackerPlugin extends Plugin {
       id: "finance-tracker-repair-totals",
       name: "Repair daily note totals",
       callback: () => this.repairAllDailyNoteTotals(),
+    });
+
+    this.addCommand({
+      id: "finance-tracker-open-portfolio",
+      name: "Open portfolio",
+      callback: () => this.openPortfolioNote(),
+    });
+
+    this.addCommand({
+      id: "finance-tracker-log-trade",
+      name: "Log a trade",
+      callback: () => this.openLogTrade(),
+    });
+
+    this.addCommand({
+      id: "finance-tracker-refresh-prices",
+      name: "Refresh share prices",
+      callback: async () => {
+        if ((this.settings.priceSource || "manual") === "manual") {
+          new Notice("Prices are typed in by hand. Choose a sheet or Yahoo in settings to fetch them.");
+          return;
+        }
+        const result = await this.refreshPrices({ force: true });
+        new Notice(
+          result.skipped === "backoff"
+            ? `The price source is refusing requests; trying again after ${new Date(result.until).toLocaleTimeString()}.`
+            : result.error || `Updated ${result.updated || 0} price${result.updated === 1 ? "" : "s"}.`
+        );
+      },
     });
 
     this.addCommand({
@@ -3137,9 +3170,9 @@ class FinanceTrackerPlugin extends Plugin {
   // concentric duplicates separated by seams, which read as a broken chart. Now
   // a category that does not split simply extends to the full radius, and the
   // ring appears only over the categories that do.
-  renderPieChart(wrapper, hierarchy, currency, threshold = 0.08) {
+  renderPieChart(wrapper, hierarchy, currency, threshold = 0.08, options = {}) {
     const pieSection = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
-    pieSection.createEl("h4", { text: "Category proportions" });
+    pieSection.createEl("h4", { text: options.title || "Category proportions" });
 
     const total = hierarchy.groups.reduce((sum, group) => sum + group.total, 0);
     if (total <= 0) {

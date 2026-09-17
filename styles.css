@@ -1667,3 +1667,20 @@
 @media (max-width: 720px) {
   .finance-bill-spark { display: none; }
 }
+
+/* ---- Portfolio ---- */
+.finance-portfolio-scroll { overflow-x: auto; }
+.finance-portfolio-ticker { font-weight: 600; }
+.finance-portfolio-stale {
+  font-size: 0.75em;
+  color: var(--text-warning);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.finance-portfolio .is-positive { color: var(--text-success); }
+.finance-portfolio .is-negative { color: var(--text-error); }
+.finance-portfolio-detail.is-hidden { display: none; }
+.finance-portfolio tr.is-clickable { cursor: pointer; }
+.finance-portfolio-cost-line { stroke: var(--text-faint); stroke-dasharray: 4 3; }
+.finance-portfolio-source { margin-bottom: 8px; }
+.finance-portfolio-disclaimer { margin-top: 12px; font-style: italic; }
