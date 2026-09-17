@@ -7569,7 +7569,8 @@ class FinanceTrackerPlugin extends Plugin {
       .filter((file) => file.path.startsWith(budgetsPrefix))
       .filter((file) => !file.path.startsWith(archivePrefix))
       .filter((file) => file.path !== defaultBudgetPath)
-      .filter((file) => file.path !== recurringNotePath);
+      .filter((file) => file.path !== recurringNotePath)
+      .filter((file) => !file.path.startsWith(`${this.getBillsFolderPath()}/`));
   }
 
   async createOrOpenHolidayBudget(definition) {
@@ -7730,6 +7731,15 @@ class FinanceTrackerPlugin extends Plugin {
   // Logs a $0 entry dated on the due day: the cadence anchor advances, the
   // inferred amount is untouched, and the skip is visible in the daily note.
   async logRecurringSkip(item) {
+    if (item?.billId) {
+      // On the bill, not in a daily note: a skipped cycle is a fact about the
+      // bill, and $0 of spending is not spending.
+      const bill = await this.findBill(item.billId);
+      const skipped = Array.from(new Set([...(bill?.skipped || []), item.nextDue || core.todayIsoLocal()])).sort();
+      await this.updateBill(item.billId, { skipped });
+      return null;
+    }
+
     // The tag must name the bill. A bare `#log/spending/subscriptions/monthly`
     // skip line names no item, so the next parse can only fall back to the
     // line's own note text and invent a bill out of the marker.
@@ -8069,7 +8079,8 @@ class FinanceTrackerPlugin extends Plugin {
       .getMarkdownFiles()
       .filter((file) => file.path.startsWith(normalizePath(`${this.settings.budgetsFolderPath}/`)))
       .filter((file) => !file.path.startsWith(normalizePath(`${this.settings.budgetArchiveFolderPath}/`)))
-      .filter((file) => file.path !== this.getDefaultBudgetNotePath());
+      .filter((file) => file.path !== this.getDefaultBudgetNotePath())
+      .filter((file) => !file.path.startsWith(`${this.getBillsFolderPath()}/`));
     const goals = [];
     for (const file of files) {
       const content = await this.app.vault.cachedRead(file);
@@ -10517,7 +10528,10 @@ class FinanceTrackerPlugin extends Plugin {
   // every goal or trip note with planned and allocated tables.
   categoryReferenceFiles() {
     const budgetsPrefix = normalizePath(`${this.settings.budgetsFolderPath}/`);
-    return this.app.vault.getMarkdownFiles().filter((file) => file.path.startsWith(budgetsPrefix));
+    return this.app.vault
+      .getMarkdownFiles()
+      .filter((file) => file.path.startsWith(budgetsPrefix))
+      .filter((file) => !file.path.startsWith(`${this.getBillsFolderPath()}/`));
   }
 
   // Merchant rules point at categories too.
@@ -10579,18 +10593,172 @@ class FinanceTrackerPlugin extends Plugin {
     }
   }
 
+  // --- Bills -------------------------------------------------------------------
+  // One note per bill, in a Bills folder beside the budgets. Notes rather than a
+  // table because a bill has ten fields and a table with eleven columns is not
+  // hand-editable, and because Obsidian's own properties editor then works on
+  // them — including on a phone.
+
+  getBillsFolderPath() {
+    return normalizePath(`${this.settings.budgetsFolderPath}/Bills`);
+  }
+
+  async loadBills() {
+    const prefix = `${this.getBillsFolderPath()}/`;
+    const bills = [];
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      if (!file.path.startsWith(prefix)) continue;
+      const content = await this.app.vault.cachedRead(file);
+      const bill = core.parseBillDefinition(parseFrontmatter(content), {
+        defaultCurrency: this.settings.defaultCurrency,
+        notePath: file.path,
+      });
+      if (bill) bills.push(bill);
+    }
+    return bills.sort((left, right) => left.name.localeCompare(right.name));
+  }
+
+  async findBill(billId) {
+    const id = core.normalizeBillId(billId);
+    return (await this.loadBills()).find((bill) => bill.id === id) || null;
+  }
+
+  buildBillFrontmatter(bill) {
+    const value = (input) => (input === null || input === undefined ? "" : String(input));
+    return [
+      "---",
+      `bill_id: ${bill.id}`,
+      `bill_name: ${bill.name}`,
+      `aliases: [${(bill.aliases || []).join(", ")}]`,
+      `cadence: ${bill.cadence}`,
+      `due_rule: ${core.serializeBillDueRule(bill.dueRule)}`,
+      `amount: ${value(bill.amount)}`,
+      `amount_model: ${bill.amountModel || "fixed"}`,
+      `reminder_days: ${value(bill.reminderDays ?? 3)}`,
+      `active: ${bill.active === false ? "false" : "true"}`,
+      `auto_log: ${bill.autoLog ? "true" : "false"}`,
+      `next_amount: ${value(bill.nextAmount)}`,
+      `change_date: ${value(bill.changeDate)}`,
+      `end_date: ${value(bill.endDate)}`,
+      `payments_left: ${value(bill.paymentsLeft)}`,
+      `next_due: ${value(bill.nextDueOverride)}`,
+      `skipped: [${(bill.skipped || []).join(", ")}]`,
+      `start_date: ${value(bill.startDate)}`,
+      `currency: ${bill.currency || this.settings.defaultCurrency}`,
+      "---",
+    ].join("\n");
+  }
+
+  buildBillNoteContent(bill) {
+    return [
+      this.buildBillFrontmatter(bill),
+      "",
+      `# ${bill.name}`,
+      "",
+      "Everything about this bill lives in the properties above — edit them here or",
+      "from the Bills list. Payments are the entries tagged",
+      `\`#log/spending/${this.settings.recurringTagPrefix || "subscriptions"}/${bill.cadence}/${bill.id}\`, plus anything`,
+      "matching an alias.",
+      "",
+      "```finance-bill",
+      "```",
+      "",
+    ].join("\n");
+  }
+
+  billNotePath(bill) {
+    return normalizePath(`${this.getBillsFolderPath()}/${sanitizeFilePart(bill.name || bill.id)}.md`);
+  }
+
+  // Writes a bill note, keeping whatever the user has written below the
+  // properties — notes, a receipt, the phone number for cancelling.
+  async saveBill(bill) {
+    const path = bill.notePath || this.billNotePath(bill);
+    const existing = this.app.vault.getAbstractFileByPath(path);
+    if (existing instanceof TFile) {
+      const content = await this.app.vault.cachedRead(existing);
+      const body = content.replace(/^---\n[\s\S]*?\n---\n?/, "");
+      await _ftModify(this.app, existing, `${this.buildBillFrontmatter(bill)}\n${body}`);
+      return existing;
+    }
+    await this.ensureFolder(this.getBillsFolderPath());
+    return this.upsertFile(path, this.buildBillNoteContent(bill));
+  }
+
+  async updateBill(billId, patch = {}) {
+    const bill = await this.findBill(billId);
+    if (!bill) throw new Error(`No bill note found for ${billId}.`);
+    const next = { ...bill, ...patch };
+    await this.saveBill(next);
+    this.refreshDailyBudgetView();
+    return next;
+  }
+
+  // Registry-shaped patches from the existing UI, translated for a bill note.
+  billPatchFromItemPatch(patch = {}) {
+    const next = {};
+    if ("active" in patch) next.active = patch.active;
+    if ("autoLog" in patch) next.autoLog = patch.autoLog;
+    if ("variable" in patch) next.amountModel = patch.variable ? "variable" : "fixed";
+    if ("amount" in patch) next.amount = patch.amount;
+    if ("nextAmount" in patch) next.nextAmount = patch.nextAmount;
+    if ("changeDate" in patch) next.changeDate = patch.changeDate;
+    if ("nextDue" in patch) next.nextDueOverride = patch.nextDue;
+    if ("endDate" in patch) next.endDate = patch.endDate;
+    if ("paymentsLeft" in patch) next.paymentsLeft = patch.paymentsLeft;
+    return next;
+  }
+
+  // One entry point for every per-bill change, whichever model is in play.
+  async updateRecurringItem(item, patch = {}) {
+    if (item?.billId) {
+      await this.updateBill(item.billId, this.billPatchFromItemPatch(patch));
+      return;
+    }
+    await this.updateRecurringRegistryEntry(item, patch);
+  }
+
+  // Merging is how a duplicate is dealt with now: the loser's name becomes an
+  // alias of the winner, so its history joins up instead of being hidden.
+  async mergeBillInto(sourceItem, targetBillId) {
+    const target = await this.findBill(targetBillId);
+    if (!target) throw new Error("That bill no longer exists.");
+    const names = [sourceItem.billId, sourceItem.label, sourceItem.merchant, sourceItem.name].filter(Boolean);
+    const aliases = Array.from(new Set([...(target.aliases || []), ...names.map((name) => String(name).trim())]));
+    await this.saveBill({ ...target, aliases });
+
+    if (sourceItem.billId && sourceItem.notePath) {
+      const file = this.app.vault.getAbstractFileByPath(sourceItem.notePath);
+      // The merged bill's note is archived rather than deleted: it may hold
+      // notes of your own, and deleting a note is not this plugin's decision.
+      if (file instanceof TFile) {
+        const bill = await this.findBill(sourceItem.billId);
+        if (bill) await this.saveBill({ ...bill, active: false, endDate: bill.endDate || sourceItem.lastDate || core.todayIsoLocal() });
+      }
+    }
+    this.refreshDailyBudgetView();
+  }
+
   // --- Recurring payments -----------------------------------------------------
 
   async detectRecurring(referenceDate, prefix = "") {
     const entries = await this.collectAllTransactions();
     const today = referenceDate || core.todayIsoLocal();
-    const detected = core.detectRecurringPayments(entries, {
-      prefix: prefix || this.settings.recurringTagPrefix || "subscriptions",
-      referenceDate: today,
-    });
+    const activePrefix = prefix || this.settings.recurringTagPrefix || "subscriptions";
+
+    // Once there are bill notes, they are the source of truth and detection is
+    // only a source of suggestions. Until then — a fresh install, or one that
+    // has not run the migration — the old path still works exactly as it did.
+    const bills = await this.loadBills();
+    if (bills.length) {
+      const view = core.buildBillsView(bills, entries, { prefix: activePrefix, referenceDate: today });
+      return { ...view, items: this.sortRecurringItems(view.items) };
+    }
+
+    const detected = core.detectRecurringPayments(entries, { prefix: activePrefix, referenceDate: today });
     const applied = core.applyRecurringRegistry(detected, await this.loadRecurringRegistry(), today);
     const excluded = this.excludeRemovedRecurringItems(applied);
-    return { ...excluded, items: this.sortRecurringItems(excluded.items) };
+    return { ...excluded, items: this.sortRecurringItems(excluded.items), suggestions: [], unmatched: [] };
   }
 
   // Bills the user chose to "remove completely" from the Archived section
@@ -10780,6 +10948,20 @@ class FinanceTrackerPlugin extends Plugin {
   // reserve, Skip cycle, and the catch-up logger, so no path can advance one of
   // the two and forget the other.
   async advanceRecurringSchedule(item, patch = {}) {
+    if (item?.billId) {
+      // The payment that was just logged is what advances the schedule, so there
+      // is no anchor to write. Only a countdown, and an override that has now
+      // been overtaken, need saving.
+      const updates = {};
+      if (Number.isFinite(item.paymentsLeft) && item.paymentsLeft !== null) {
+        updates.paymentsLeft = Math.max(0, item.paymentsLeft - 1);
+      }
+      if (item.usedOverride) updates.nextDueOverride = null;
+      const billPatch = { ...updates, ...this.billPatchFromItemPatch(patch) };
+      if (Object.keys(billPatch).length) await this.updateBill(item.billId, billPatch);
+      return;
+    }
+
     const next = {};
     if (item.nextDue) next.nextDue = core.nextRecurringDate(item.nextDue, item.cadence);
     if (Number.isFinite(item.paymentsLeft) && item.paymentsLeft !== null) {
