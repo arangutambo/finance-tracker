@@ -17,6 +17,20 @@ class FinanceSuggest {
     this.items = [];
     this.highlighted = 0;
 
+    // Inside a modal, Obsidian handles Escape through the modal's key scope before
+    // the input ever sees the keydown — so Escape meant to dismiss the popup
+    // closed the whole modal instead, taking whatever was typed with it. Given
+    // the scope, the popup claims Escape while it is open and lets it through
+    // once it is not.
+    this.scope = options.scope || null;
+    if (this.scope && typeof this.scope.register === "function") {
+      this._escapeHandler = this.scope.register([], "Escape", () => {
+        if (!this.items.length) return true;
+        this.close();
+        return false;
+      });
+    }
+
     const host = input.parentElement;
     if (host) host.addClass("finance-suggest-host");
     this.popup = (host || input).createDiv({ cls: "finance-suggest-popup" });
@@ -109,6 +123,9 @@ class FinanceSuggest {
 
   destroy() {
     this.close();
+    if (this._escapeHandler && typeof this.scope?.unregister === "function") {
+      this.scope.unregister(this._escapeHandler);
+    }
     this.input.removeEventListener("input", this._onInput);
     this.input.removeEventListener("focus", this._onFocus);
     this.input.removeEventListener("blur", this._onBlur);
@@ -137,6 +154,7 @@ class CategoryPicker {
     this.suggest = new FinanceSuggest(this.input, {
       getItems: (query) => this.matches(query),
       onChoose: (item) => this.setValue(item.value),
+      scope: options.scope,
     });
     this.input.addEventListener("change", () => this.setValue(this.input.value, { silentInput: true }));
 

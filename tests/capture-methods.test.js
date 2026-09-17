@@ -1129,3 +1129,54 @@ test("the tidy-up plan covers notes and the registry's ghost rows", async () => 
   assert.ok(registry.includes("tmr-car-registration"), "a bill set up before its first payment keeps its row");
   assert.ok(registry.includes("urban-climb-sub"));
 });
+
+test("Escape dismisses an open suggestion popup without closing the modal", async () => {
+  // A stand-in for Obsidian's Scope: handlers registered last run first, and one
+  // returning false stops the key there.
+  const handlers = [];
+  const scope = {
+    register(_mods, key, fn) {
+      const handler = { key, fn };
+      handlers.unshift(handler);
+      return handler;
+    },
+    unregister(handler) {
+      handlers.splice(handlers.indexOf(handler), 1);
+    },
+  };
+  let modalClosed = false;
+  scope.register([], "Escape", () => {
+    modalClosed = true;
+    return false;
+  });
+  const pressEscape = () => {
+    for (const handler of handlers.filter((entry) => entry.key === "Escape")) {
+      if (handler.fn() === false) return;
+    }
+  };
+
+  const { plugin, app } = await inboxWithBacklog();
+  delete plugin.invalidateIndexEntry;
+  const entry = (await plugin.collectAllTransactions())[0];
+  const modal = plugin.openEditTransaction(entry);
+  // The factory opens it without a scope; let that finish and tear it down, then
+  // open it again with the scope attached, the way Obsidian constructs a modal.
+  await modal.ready;
+  modal.onClose();
+  modal.scope = scope;
+  modal.contentEl = new StubEl();
+  await modal.onOpen();
+  assert.equal(handlers.length, 3, "the modal's own handler plus one per suggestion popup");
+
+  const merchantInput = modal.contentEl.find((node) => node.tag === "input" && node.value === entry.merchant);
+  merchantInput.value = "rode";
+  await merchantInput.fire("input");
+
+  pressEscape();
+  assert.equal(modalClosed, false, "the first Escape only closes the popup");
+  pressEscape();
+  assert.equal(modalClosed, true, "the next one closes the modal");
+
+  modal.onClose();
+  assert.equal(handlers.length, 1, "the popup's handler is removed with the modal");
+});

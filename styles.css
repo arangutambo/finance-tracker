@@ -1635,3 +1635,8 @@
 .finance-recategorise-body { max-height: 45vh; overflow-y: auto; margin: 10px 0; }
 .finance-recategorise-input { margin-top: 6px; position: relative; }
 .finance-recategorise-input input { width: 100%; }
+
+/* Modals whose rows need room: the rename/split tool and the migration preview. */
+.modal.finance-wide-modal {
+  width: min(720px, 94vw);
+}

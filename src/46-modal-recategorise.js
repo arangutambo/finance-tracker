@@ -16,6 +16,7 @@ class RecategoriseModal extends Modal {
     const input = wrapper.createEl("input", { type: "text", attr: { placeholder: "food/takeaway", "aria-label": "New category" } });
     input.value = value;
     new FinanceSuggest(input, {
+      scope: this.scope,
       getItems: (query) => {
         const needle = core.normalizeCategoryPath(query);
         const out = this.known.categories
@@ -40,6 +41,9 @@ class RecategoriseModal extends Modal {
     // string with a space in it — and the throw happens before anything renders,
     // leaving an empty modal.
     contentEl.addClass("finance-edit", "finance-recategorise");
+    // Merchant rows carry a name, an amount, a count and a target box each; at
+    // Obsidian's default modal width they were squeezed into two lines apiece.
+    this.modalEl?.addClass("finance-wide-modal");
     contentEl.createEl("h3", { text: "Rename or split a category" });
     this.known = await this.plugin.collectKnownSuggestions();
 
@@ -48,6 +52,7 @@ class RecategoriseModal extends Modal {
     const input = row.createEl("input", { type: "text", attr: { placeholder: "transport", "aria-label": "Category to change" } });
     input.value = this.category;
     new FinanceSuggest(input, {
+      scope: this.scope,
       getItems: (query) => {
         const needle = core.normalizeCategoryPath(query);
         return this.known.categories

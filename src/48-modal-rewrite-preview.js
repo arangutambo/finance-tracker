@@ -13,6 +13,7 @@ class RewritePreviewModal extends Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("finance-rewrite-preview");
+    this.modalEl?.addClass("finance-wide-modal");
     contentEl.createEl("h3", { text: this.options.title || "Review changes" });
 
     const plan = this.options.plan || { files: [], totals: {}, warnings: [], samples: [] };

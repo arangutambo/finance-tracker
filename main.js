@@ -5072,6 +5072,20 @@ class FinanceSuggest {
     this.items = [];
     this.highlighted = 0;
 
+    // Inside a modal, Obsidian handles Escape through the modal's key scope before
+    // the input ever sees the keydown — so Escape meant to dismiss the popup
+    // closed the whole modal instead, taking whatever was typed with it. Given
+    // the scope, the popup claims Escape while it is open and lets it through
+    // once it is not.
+    this.scope = options.scope || null;
+    if (this.scope && typeof this.scope.register === "function") {
+      this._escapeHandler = this.scope.register([], "Escape", () => {
+        if (!this.items.length) return true;
+        this.close();
+        return false;
+      });
+    }
+
     const host = input.parentElement;
     if (host) host.addClass("finance-suggest-host");
     this.popup = (host || input).createDiv({ cls: "finance-suggest-popup" });
@@ -5164,6 +5178,9 @@ class FinanceSuggest {
 
   destroy() {
     this.close();
+    if (this._escapeHandler && typeof this.scope?.unregister === "function") {
+      this.scope.unregister(this._escapeHandler);
+    }
     this.input.removeEventListener("input", this._onInput);
     this.input.removeEventListener("focus", this._onFocus);
     this.input.removeEventListener("blur", this._onBlur);
@@ -5192,6 +5209,7 @@ class CategoryPicker {
     this.suggest = new FinanceSuggest(this.input, {
       getItems: (query) => this.matches(query),
       onChoose: (item) => this.setValue(item.value),
+      scope: options.scope,
     });
     this.input.addEventListener("change", () => this.setValue(this.input.value, { silentInput: true }));
 
@@ -12690,6 +12708,7 @@ class EditTransactionModal extends Modal {
     const picker = new CategoryPicker(contentEl, {
       categories: known.categories,
       value: entry.category === "uncategorized" ? "" : entry.category,
+      scope: this.scope,
     });
 
     const merchantRow = contentEl.createDiv({ cls: "finance-edit-row" });
@@ -12697,6 +12716,7 @@ class EditTransactionModal extends Modal {
     const merchantInput = merchantRow.createEl("input", { type: "text" });
     merchantInput.value = entry.merchant || "";
     const merchantSuggest = new FinanceSuggest(merchantInput, {
+      scope: this.scope,
       getItems: (query) => {
         const needle = String(query || "").toLowerCase();
         return known.merchants
@@ -12818,6 +12838,7 @@ class RecategoriseModal extends Modal {
     const input = wrapper.createEl("input", { type: "text", attr: { placeholder: "food/takeaway", "aria-label": "New category" } });
     input.value = value;
     new FinanceSuggest(input, {
+      scope: this.scope,
       getItems: (query) => {
         const needle = core.normalizeCategoryPath(query);
         const out = this.known.categories
@@ -12842,6 +12863,9 @@ class RecategoriseModal extends Modal {
     // string with a space in it — and the throw happens before anything renders,
     // leaving an empty modal.
     contentEl.addClass("finance-edit", "finance-recategorise");
+    // Merchant rows carry a name, an amount, a count and a target box each; at
+    // Obsidian's default modal width they were squeezed into two lines apiece.
+    this.modalEl?.addClass("finance-wide-modal");
     contentEl.createEl("h3", { text: "Rename or split a category" });
     this.known = await this.plugin.collectKnownSuggestions();
 
@@ -12850,6 +12874,7 @@ class RecategoriseModal extends Modal {
     const input = row.createEl("input", { type: "text", attr: { placeholder: "transport", "aria-label": "Category to change" } });
     input.value = this.category;
     new FinanceSuggest(input, {
+      scope: this.scope,
       getItems: (query) => {
         const needle = core.normalizeCategoryPath(query);
         return this.known.categories
@@ -12996,6 +13021,7 @@ class RewritePreviewModal extends Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("finance-rewrite-preview");
+    this.modalEl?.addClass("finance-wide-modal");
     contentEl.createEl("h3", { text: this.options.title || "Review changes" });
 
     const plan = this.options.plan || { files: [], totals: {}, warnings: [], samples: [] };

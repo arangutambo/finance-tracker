@@ -50,6 +50,7 @@ class EditTransactionModal extends Modal {
     const picker = new CategoryPicker(contentEl, {
       categories: known.categories,
       value: entry.category === "uncategorized" ? "" : entry.category,
+      scope: this.scope,
     });
 
     const merchantRow = contentEl.createDiv({ cls: "finance-edit-row" });
@@ -57,6 +58,7 @@ class EditTransactionModal extends Modal {
     const merchantInput = merchantRow.createEl("input", { type: "text" });
     merchantInput.value = entry.merchant || "";
     const merchantSuggest = new FinanceSuggest(merchantInput, {
+      scope: this.scope,
       getItems: (query) => {
         const needle = String(query || "").toLowerCase();
         return known.merchants
