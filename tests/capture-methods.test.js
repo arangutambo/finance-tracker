@@ -23,6 +23,7 @@ class StubTFile {
 }
 
 const notices = [];
+let lastMenu = null;
 
 // The plugin reaches for window.setTimeout in a few places (focusing an input,
 // scheduling the gist poll). Node has the timers but not the window.
@@ -51,6 +52,31 @@ const obsidianStub = {
     close() {
       this.closed = true;
       this.onClose?.();
+    }
+  },
+  // Obsidian's context menu. Records its items so a test can pick one.
+  Menu: class {
+    constructor() {
+      this.items = [];
+      lastMenu = this;
+    }
+    addItem(build) {
+      const item = {
+        title: "",
+        setTitle(value) { this.title = value; return this; },
+        setIcon() { return this; },
+        onClick(handler) { this.handler = handler; return this; },
+      };
+      build(item);
+      this.items.push(item);
+      return this;
+    }
+    addSeparator() { return this; }
+    showAtMouseEvent() {}
+    async choose(title) {
+      const item = this.items.find((entry) => entry.title === title);
+      if (!item) throw new Error(`no menu item "${title}" — saw: ${this.items.map((entry) => entry.title).join(", ")}`);
+      await item.handler();
     }
   },
   Notice: class {
@@ -1226,3 +1252,137 @@ test("converting to bill notes merges duplicates, keeps ended bills, and is then
 function core_round(value) {
   return Number(Number(value).toFixed(2));
 }
+
+// --- Bills list -------------------------------------------------------------------------
+
+function billDefinition(overrides) {
+  return {
+    aliases: [],
+    dueRule: { type: "after-last" },
+    amount: null,
+    amountModel: "fixed",
+    reminderDays: 3,
+    active: true,
+    autoLog: false,
+    nextAmount: null,
+    changeDate: null,
+    endDate: null,
+    paymentsLeft: null,
+    nextDueOverride: null,
+    skipped: [],
+    startDate: null,
+    currency: "AUD",
+    ...overrides,
+  };
+}
+
+async function vaultWithBills() {
+  const made = makePlugin(billSettings());
+  delete made.plugin.invalidateIndexEntry;
+  const { plugin, app } = made;
+  await plugin.saveBill(billDefinition({ id: "claude", name: "Claude", aliases: ["Claude AI Payment"], cadence: "monthly", amount: 34 }));
+  await plugin.saveBill(billDefinition({ id: "adobe", name: "Adobe", cadence: "monthly", amount: 18.99, endDate: "2026-07-15" }));
+  await app.vault.create("Daily/2026-08-26.md", "## Finance\n- [ ] #log/spending 34\n\t- $34.00 #log/spending/subscriptions/monthly\n\t\t- Claude AI Payment\n");
+  await app.vault.create("Daily/2026-07-15.md", "## Finance\n- [ ] #log/spending 18.99\n\t- $18.99 #log/spending/subscriptions/monthly/adobe\n");
+  for (const date of ["2026-06-03", "2026-07-03"]) {
+    await app.vault.create(`Daily/${date}.md`, "## Finance\n- [ ] #log/spending 11.99\n\t- $11.99 #log/spending/subscriptions/monthly\n\t\t- HBO Max Subscription\n");
+  }
+  return made;
+}
+
+// A block rendered "in" a daily note takes that note's date as today, so these
+// tests do not depend on when they run.
+const onSeptember20 = { sourcePath: "Daily/2026-09-20.md" };
+
+test("with bill notes, the recurring block becomes the bills list", async () => {
+  const { plugin } = await vaultWithBills();
+
+  const el = new StubEl();
+  await plugin.renderRecurringBlock("", el, onSeptember20);
+  const text = el.allText();
+
+  assert.match(text, /Bills/);
+  assert.match(text, /Running bills \| 1/);
+  assert.match(text, /Later this month \(1\)/);
+  assert.match(text, /Claude \| \$34\.00/);
+  assert.match(text, /Monthly · due 2026-09-26/, "the alias linked the bare-tagged payment to its bill");
+  assert.match(text, /Looks recurring \(1\)/);
+  assert.match(text, /HBO Max Subscription/);
+  assert.match(text, /Ended and paused \(1\)/);
+  assert.match(text, /ended 2026-07-15/);
+});
+
+test("skipping from the bill's menu records the skip on the bill, not in a daily note", async () => {
+  const { plugin, files } = await vaultWithBills();
+  const before = [...files.keys()].filter((path) => path.startsWith("Daily/")).map((path) => files.get(path).content).join("");
+
+  const el = new StubEl();
+  await plugin.renderRecurringBlock("", el, onSeptember20);
+  await el.click("⋯");
+  await lastMenu.choose("Skip this cycle");
+
+  const note = files.get("Utility/Budgets/Bills/claude.md").content;
+  assert.match(note, /skipped: \[2026-09-26\]/);
+  const after = [...files.keys()].filter((path) => path.startsWith("Daily/")).map((path) => files.get(path).content).join("");
+  assert.equal(after, before, "no $0 bullet anywhere");
+
+  const recurring = await plugin.detectRecurring("2026-09-27");
+  assert.equal(recurring.items.find((item) => item.billId === "claude").nextDue, "2026-10-26");
+});
+
+test("tracking a suggestion gives it a bill note, and ignoring one hides it", async () => {
+  const { plugin, files } = await vaultWithBills();
+
+  const el = new StubEl();
+  await plugin.renderRecurringBlock("", el, onSeptember20);
+  await el.click("Track");
+
+  assert.ok([...files.keys()].some((path) => /Bills\/hbo-max-subscription\.md$/.test(path)));
+  const recurring = await plugin.detectRecurring("2026-09-20");
+  const hbo = recurring.items.find((item) => item.label === "HBO Max Subscription");
+  assert.equal(hbo.count, 2, "its existing payments are linked straight away");
+  assert.equal(recurring.suggestions.length, 0);
+});
+
+test("merging a bill makes its name an alias of the other", async () => {
+  const { plugin, app } = await vaultWithBills();
+  await plugin.saveBill(billDefinition({ id: "claude-pro", name: "Claude Pro", cadence: "monthly", amount: 34 }));
+  await app.vault.create("Daily/2026-09-01.md", "## Finance\n- [ ] #log/spending 34\n\t- $34.00 #log/spending/subscriptions/monthly/claude-pro\n");
+
+  const before = await plugin.detectRecurring("2026-09-20");
+  const duplicate = before.items.find((item) => item.billId === "claude-pro");
+  await plugin.mergeBillInto(duplicate, "claude");
+
+  const after = await plugin.detectRecurring("2026-09-20");
+  const claude = after.items.find((item) => item.billId === "claude");
+  assert.equal(claude.count, 2, "the merged bill's payment now counts toward Claude");
+  assert.equal(after.items.some((item) => item.billId === "claude-pro"), false, "the merged bill is no longer a bill of its own");
+  // …but its note is kept, and says where it went.
+  const merged = (await plugin.loadBills({ includeMerged: true })).find((bill) => bill.id === "claude-pro");
+  assert.equal(merged.mergedInto, "claude");
+});
+
+test("a bill can be added by hand with a calendar due rule", async () => {
+  const { plugin, files } = await vaultWithBills();
+
+  const modal = plugin.openAddBill();
+  await modal.ready;
+  const field = (label) => modal.contentEl.find((node) => node.attrs["aria-label"] === label);
+  field("Bill name").value = "Car registration";
+  field("Cadence").value = "yearly";
+  field("Amount").value = "795.15";
+  field("Due rule").value = "day-of-month";
+  field("Day of month").value = "29";
+  field("First due date").value = "2027-08-29";
+  await modal.contentEl.click("Add bill");
+
+  const note = files.get("Utility/Budgets/Bills/car-registration.md");
+  assert.ok(note, "the note is created");
+  assert.match(note.content, /due_rule: day-of-month: 29/);
+  assert.match(note.content, /next_due: 2027-08-29/);
+
+  const recurring = await plugin.detectRecurring("2026-09-20");
+  const car = recurring.items.find((item) => item.billId === "car-registration");
+  assert.equal(car.nextDue, "2027-08-29", "a bill never paid starts from its first due date");
+  assert.equal(car.status, "upcoming");
+});

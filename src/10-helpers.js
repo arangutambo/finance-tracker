@@ -60,6 +60,8 @@ const DEFAULT_SETTINGS = {
   runwayPeriod: "1 month",
   runwayMode: "spending",
   excludedRecurringItems: [],
+  // Bill suggestions dismissed with Ignore, by suggestion id.
+  ignoredBillSuggestions: [],
   autoLogRecurring: false,
   quickAddUseNoteDate: false,
   tripModeActive: false,

@@ -200,7 +200,7 @@ class EditRecurringItemModal extends Modal {
           patch.endDate = null;
           patch.paymentsLeft = null;
         }
-        await this.plugin.updateRecurringRegistryEntry(item, patch);
+        await this.plugin.updateRecurringItem(item, patch);
         new Notice(`${item.label} updated`);
         this.close();
         if (typeof this.onSaved === "function") await this.onSaved();

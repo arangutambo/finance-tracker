@@ -731,7 +731,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
       currentCheckbox.checked = true;
       currentCheckbox.addEventListener("change", async () => {
         currentCheckbox.disabled = true;
-        await this.plugin.updateRecurringRegistryEntry(item, { active: currentCheckbox.checked });
+        await this.plugin.updateRecurringItem(item, { active: currentCheckbox.checked });
         await this.renderRecurringList(listEl);
       });
 
@@ -740,7 +740,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
       autoCheckbox.checked = item.autoLog !== false;
       autoCheckbox.addEventListener("change", async () => {
         autoCheckbox.disabled = true;
-        await this.plugin.updateRecurringRegistryEntry(item, { autoLog: autoCheckbox.checked });
+        await this.plugin.updateRecurringItem(item, { autoLog: autoCheckbox.checked });
         autoCheckbox.disabled = false;
       });
     }

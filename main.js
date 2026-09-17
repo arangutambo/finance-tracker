@@ -1,6 +1,6 @@
 "use strict";
 
-const { ItemView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, normalizePath, requestUrl } = require("obsidian");
+const { ItemView, Menu, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, normalizePath, requestUrl } = require("obsidian");
 
 const core = (() => {
   const DAY_MS = 24 * 60 * 60 * 1000;
@@ -4004,6 +4004,9 @@ const core = (() => {
       nextDueOverride: parseIsoDate(fm.next_due || fm.next_due_override || ""),
       skipped: parseListValue(fm.skipped).map((date) => parseIsoDate(date)).filter(Boolean),
       startDate: parseIsoDate(fm.start_date || ""),
+      // Set when this bill was merged into another. It then stops being a bill of
+      // its own, so its payments fall through to the bill that now carries its name.
+      mergedInto: normalizeBillId(fm.merged_into || ""),
       currency: normalizeCurrency(fm.currency || options.defaultCurrency || "AUD"),
       notePath: options.notePath || "",
     };
@@ -4649,6 +4652,8 @@ const DEFAULT_SETTINGS = {
   runwayPeriod: "1 month",
   runwayMode: "spending",
   excludedRecurringItems: [],
+  // Bill suggestions dismissed with Ignore, by suggestion id.
+  ignoredBillSuggestions: [],
   autoLogRecurring: false,
   quickAddUseNoteDate: false,
   tripModeActive: false,
@@ -10648,7 +10653,7 @@ class FinanceTrackerPlugin extends Plugin {
     return normalizePath(`${this.settings.budgetsFolderPath}/Bills`);
   }
 
-  async loadBills() {
+  async loadBills(options = {}) {
     const prefix = `${this.getBillsFolderPath()}/`;
     const bills = [];
     for (const file of this.app.vault.getMarkdownFiles()) {
@@ -10658,7 +10663,9 @@ class FinanceTrackerPlugin extends Plugin {
         defaultCurrency: this.settings.defaultCurrency,
         notePath: file.path,
       });
-      if (bill) bills.push(bill);
+      // A merged bill's note is kept as a record, but it no longer claims
+      // payments — the bill it was merged into does, through the alias.
+      if (bill && (!bill.mergedInto || options.includeMerged)) bills.push(bill);
     }
     return bills.sort((left, right) => left.name.localeCompare(right.name));
   }
@@ -10690,6 +10697,7 @@ class FinanceTrackerPlugin extends Plugin {
       `skipped: [${(bill.skipped || []).join(", ")}]`,
       `start_date: ${value(bill.startDate)}`,
       `currency: ${bill.currency || this.settings.defaultCurrency}`,
+      ...(bill.mergedInto ? [`merged_into: ${bill.mergedInto}`] : []),
       "---",
     ].join("\n");
   }
@@ -10848,7 +10856,7 @@ class FinanceTrackerPlugin extends Plugin {
       // notes of your own, and deleting a note is not this plugin's decision.
       if (file instanceof TFile) {
         const bill = await this.findBill(sourceItem.billId);
-        if (bill) await this.saveBill({ ...bill, active: false, endDate: bill.endDate || sourceItem.lastDate || core.todayIsoLocal() });
+        if (bill) await this.saveBill({ ...bill, active: false, mergedInto: target.id });
       }
     }
     this.refreshDailyBudgetView();
@@ -10867,7 +10875,7 @@ class FinanceTrackerPlugin extends Plugin {
     const bills = await this.loadBills();
     if (bills.length) {
       const view = core.buildBillsView(bills, entries, { prefix: activePrefix, referenceDate: today });
-      return { ...view, items: this.sortRecurringItems(view.items) };
+      return { ...view, billsMode: true, items: this.sortRecurringItems(view.items) };
     }
 
     const detected = core.detectRecurringPayments(entries, { prefix: activePrefix, referenceDate: today });
@@ -11416,6 +11424,13 @@ class FinanceTrackerPlugin extends Plugin {
     const prefix = core.normalizeCategoryPath(config.prefix || this.settings.recurringTagPrefix || "subscriptions") || "subscriptions";
     const recurring = await this.detectRecurring(referenceDate, prefix);
 
+    // Bill notes get the new list. The old one stays for vaults that have not
+    // converted, so nothing changes for anyone until they choose it.
+    if (recurring.billsMode) {
+      await this.renderBillsBlock(source, el, ctx, recurring);
+      return;
+    }
+
     const manage = /^(?:true|yes|1)$/i.test(String(config.manage || ""));
     const entries = await this.collectAllTransactions();
     const runway = await this.computeRunwayState(referenceDate, { recurring, entries });
@@ -11510,7 +11525,7 @@ class FinanceTrackerPlugin extends Plugin {
           // Moves only this occurrence; the cadence itself is untouched.
           addAction(actions, "Push a week", async () => {
             const nextDue = core.addDays(item.nextDue, 7);
-            await this.updateRecurringRegistryEntry(item, { nextDue });
+            await this.updateRecurringItem(item, { nextDue });
             new Notice(`${item.label} now due ${nextDue}`);
             await rerender();
           }, { errorPrefix: `Rescheduling ${item.label}`, tooltip: "Push just this occurrence back a week, keeping the cadence" });
@@ -11533,11 +11548,11 @@ class FinanceTrackerPlugin extends Plugin {
           new EditRecurringItemModal(this.app, this, item, rerender).open();
         }, { opensModal: true });
         addAction(stateActions, "Pause", async () => {
-          await this.updateRecurringRegistryEntry(item, { active: false });
+          await this.updateRecurringItem(item, { active: false });
           await rerender();
         }, { errorPrefix: `Pausing ${item.label}` });
         addToggleAction(stateActions, "Auto-log", item.autoLog !== false, async (checked) => {
-          await this.updateRecurringRegistryEntry(item, { autoLog: checked });
+          await this.updateRecurringItem(item, { autoLog: checked });
         });
       }
     }
@@ -11568,7 +11583,7 @@ class FinanceTrackerPlugin extends Plugin {
         // A finished bill needs its terms cleared before it can run again, so
         // Resume is only the obvious next step for one that was merely paused.
         addAction(actions, item.finished ? "Restart" : "Resume", async () => {
-          await this.updateRecurringRegistryEntry(item, {
+          await this.updateRecurringItem(item, {
             active: true,
             ...(item.finished ? { endDate: null, paymentsLeft: null } : {}),
           });
@@ -12319,6 +12334,366 @@ class FinanceTrackerPlugin extends Plugin {
     await this.renderSavingsActivity(wrapper, allEntries, currency, range, referenceDate);
   }
 }
+
+// --- Bills list -----------------------------------------------------------------
+// Plugin methods for the bill-notes model, kept out of the main class body, which
+// was already six thousand lines. Attached to the prototype so they read exactly
+// like any other method.
+
+Object.assign(FinanceTrackerPlugin.prototype, {
+  // Which heading a bill sits under. "Due soon" uses the bill's own reminder
+  // window, so a bill you want a week's notice for shows up a week out.
+  billGroupFor(item, referenceDate) {
+    if (item.status === "overdue" || item.status === "due") return "overdue";
+    if (!item.nextDue) return "later";
+    const lead = Math.max(Number(item.reminderDays) || 0, 3);
+    if (item.daysUntilDue !== null && item.daysUntilDue <= lead) return "soon";
+    if (item.nextDue.slice(0, 7) === referenceDate.slice(0, 7)) return "month";
+    return "later";
+  },
+
+  // Tiny inline price history: the amounts already exist, and a bill creeping up
+  // is exactly the thing a list of today's prices hides.
+  renderBillSparkline(host, amounts) {
+    const values = (amounts || []).filter((value) => Number(value) > 0);
+    if (values.length < 2) return;
+    const width = 64;
+    const height = 18;
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const span = max - min || 1;
+    const points = values
+      .map((value, index) => {
+        const x = (index / (values.length - 1)) * (width - 2) + 1;
+        const y = height - 2 - ((value - min) / span) * (height - 4);
+        return `${x.toFixed(1)},${y.toFixed(1)}`;
+      })
+      .join(" ");
+    const svg = host.createSvg("svg", {
+      cls: ["finance-bill-spark"],
+      attr: { viewBox: `0 0 ${width} ${height}`, width, height, role: "img", "aria-label": "Recent amounts" },
+    });
+    svg.createSvg("polyline", { cls: ["finance-bill-spark-line"], attr: { points } });
+  },
+
+  async renderBillsBlock(source, el, ctx, recurring) {
+    const config = parseConfigBlock(source);
+    const referenceDate = this.getReferenceDateForSource(ctx.sourcePath);
+    const currency = core.normalizeCurrency(config.currency || this.settings.defaultCurrency);
+    const rerender = () => this.renderRecurringBlock(source, el, ctx);
+    const dueNext30Days = core.fromCents(
+      core.sumRecurringDueWithin(recurring, referenceDate, core.addDays(referenceDate, 30)).totalCents
+    );
+
+    const wrapper = el.createDiv({ cls: "finance-tracker-dashboard finance-bills" });
+    const header = wrapper.createDiv({ cls: "finance-tracker-header" });
+    header.createEl("h3", { text: config.title || "Bills" });
+    const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
+    addAction(headerActions, "Add bill", () => this.openAddBill({ onSaved: rerender }), { opensModal: true });
+    addAction(
+      headerActions,
+      "Log all due",
+      async () => {
+        await this.logDueRecurringPayments({ notify: true });
+        await rerender();
+      },
+      { primary: true, errorPrefix: "Logging due bills" }
+    );
+
+    const live = recurring.items.filter((item) => item.active);
+    renderStatCards(wrapper, [
+      { label: "Per month", value: core.formatCurrency(recurring.totals.monthly, currency) },
+      { label: "Per year", value: core.formatCurrency(recurring.totals.yearly, currency) },
+      { label: "Due next 30 days", value: core.formatCurrency(dueNext30Days, currency) },
+      { label: "Running bills", value: String(live.length) },
+    ]);
+
+    const groups = [
+      ["overdue", "Overdue"],
+      ["soon", "Due soon"],
+      ["month", "Later this month"],
+      ["later", "Later"],
+    ];
+    for (const [key, title] of groups) {
+      const items = live.filter((item) => this.billGroupFor(item, referenceDate) === key);
+      if (!items.length) continue;
+      const section = wrapper.createDiv({ cls: `finance-tracker-chart-card finance-bills-group is-${key}` });
+      section.createEl("h4", { text: `${title} (${items.length})` });
+      for (const item of items) this.renderBillRow(section, item, { currency, referenceDate, rerender, live });
+    }
+
+    this.renderRecurringCalendar(wrapper, recurring, currency, referenceDate, {
+      months: core.parseNumber(config.months),
+      weeks: core.parseNumber(config.weeks),
+    });
+
+    const ignored = new Set(this.settings.ignoredBillSuggestions || []);
+    const suggestions = (recurring.suggestions || []).filter((suggestion) => !ignored.has(suggestion.id));
+    if (suggestions.length) {
+      const section = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-bills-suggestions" });
+      section.createEl("h4", { text: `Looks recurring (${suggestions.length})` });
+      section.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: "Logged under a bill tag, but no bill claims them. Track one to give it a note, or add it to an existing bill.",
+      });
+      for (const suggestion of suggestions) this.renderBillSuggestion(section, suggestion, { currency, rerender, live });
+    }
+
+    const ended = recurring.items.filter((item) => !item.active);
+    if (ended.length) {
+      const details = wrapper.createEl("details", { cls: "finance-tracker-chart-card finance-tracker-archived" });
+      details.createEl("summary", { text: `Ended and paused (${ended.length})` });
+      for (const item of ended) this.renderEndedBill(details, item, { currency, rerender, live });
+    }
+
+    const runway = await this.computeRunwayState(referenceDate, { recurring, entries: await this.collectAllTransactions() });
+    this.renderRunwaySection(wrapper, runway, currency);
+  },
+
+  renderBillRow(host, item, context) {
+    const { currency, rerender, live } = context;
+    const row = host.createDiv({ cls: "finance-tracker-budget-card finance-bill-row" });
+    if (item.status === "overdue") row.addClass("is-overdue");
+
+    const top = row.createDiv({ cls: "finance-bill-row-top" });
+    const title = renderRowTitle(top, item.label, core.formatCurrency(item.nextDueAmount ?? item.lastAmount, currency));
+    title.addClass("finance-bill-row-title");
+    this.renderBillSparkline(top, item.recentAmounts);
+
+    const when =
+      item.status === "overdue"
+        ? `overdue since ${item.nextDue}`
+        : item.status === "due"
+          ? "due today"
+          : item.daysUntilDue === 1
+            ? "due tomorrow"
+            : `due ${item.nextDue}`;
+    const bits = [cadenceLabel(item.cadence), when];
+    if (item.variable) bits.push("varies");
+    if (item.nextAmount > 0 && item.changeDate) bits.push(`${core.formatCurrency(item.nextAmount, currency)} from ${item.changeDate}`);
+    if (item.endDate) bits.push(`ends ${item.endDate}`);
+    if (Number.isFinite(item.paymentsLeft) && item.paymentsLeft !== null) bits.push(`${item.paymentsLeft} left`);
+    row.createDiv({ cls: "finance-tracker-budget-meta", text: bits.join(" · ") });
+
+    const actions = row.createDiv({ cls: "finance-tracker-header-actions" });
+    const isDue = item.status === "overdue" || item.status === "due";
+    addAction(
+      actions,
+      "Mark paid",
+      async () => {
+        if (item.variable) {
+          new LogVariableBillModal(this.app, this, item, rerender).open();
+          return;
+        }
+        const date = await this.logRecurringNow(item);
+        new Notice(`Logged ${item.label} for ${date}`);
+        await rerender();
+      },
+      { primary: isDue, errorPrefix: `Logging ${item.label}`, opensModal: item.variable }
+    );
+
+    // Everything else is one tap away rather than five buttons wide.
+    const more = actions.createEl("button", { cls: "finance-bill-more", text: "⋯", attr: { "aria-label": "More actions" } });
+    more.addEventListener("click", (event) => this.openBillMenu(event, item, { rerender, live }));
+  },
+
+  openBillMenu(event, item, context) {
+    const { rerender, live } = context;
+    const menu = new Menu();
+    const add = (title, icon, run) =>
+      menu.addItem((menuItem) =>
+        menuItem
+          .setTitle(title)
+          .setIcon(icon)
+          .onClick(async () => {
+            try {
+              await run();
+              await rerender();
+            } catch (error) {
+              new Notice(`${title} failed: ${error.message}`);
+            }
+          })
+      );
+
+    if (item.nextDue) {
+      add("Push a week", "calendar-plus", async () => {
+        const nextDue = core.addDays(item.nextDue, 7);
+        await this.updateRecurringItem(item, { nextDue });
+        new Notice(`${item.label} now due ${nextDue}`);
+      });
+      add("Skip this cycle", "skip-forward", async () => {
+        await this.logRecurringSkip(item);
+        new Notice(`Skipped ${item.label} for ${item.nextDue}`);
+      });
+    }
+    menu.addItem((menuItem) =>
+      menuItem.setTitle("Edit").setIcon("pencil").onClick(() => new EditRecurringItemModal(this.app, this, item, rerender).open())
+    );
+    if (item.billId) {
+      menu.addItem((menuItem) =>
+        menuItem
+          .setTitle("Merge into another bill…")
+          .setIcon("merge")
+          .onClick(() => this.openMergeBill(item, live, rerender))
+      );
+      menu.addItem((menuItem) =>
+        menuItem
+          .setTitle("Open note")
+          .setIcon("file-text")
+          .onClick(async () => {
+            const file = this.app.vault.getAbstractFileByPath(item.notePath);
+            if (file instanceof TFile) await this.app.workspace.getLeaf(true).openFile(file);
+          })
+      );
+    }
+    menu.addSeparator();
+    add("Pause", "pause", () => this.updateRecurringItem(item, { active: false }));
+    add("End now", "square", () => this.updateRecurringItem(item, { endDate: item.lastDate || core.todayIsoLocal() }));
+
+    if (typeof menu.showAtMouseEvent === "function" && event) menu.showAtMouseEvent(event);
+    return menu;
+  },
+
+  renderBillSuggestion(host, suggestion, context) {
+    const { currency, rerender, live } = context;
+    const card = host.createDiv({ cls: "finance-tracker-budget-card" });
+    renderRowTitle(card, suggestion.name, core.formatCurrency(suggestion.lastAmount, currency));
+    card.createDiv({
+      cls: "finance-tracker-budget-meta",
+      text: `${cadenceLabel(suggestion.cadence)} · ${suggestion.count} payment${suggestion.count === 1 ? "" : "s"} · last ${suggestion.lastDate}`,
+    });
+    const actions = card.createDiv({ cls: "finance-tracker-header-actions" });
+    addAction(
+      actions,
+      "Track",
+      async () => {
+        await this.createBillFromSuggestion(suggestion);
+        new Notice(`Now tracking ${suggestion.name}.`);
+        await rerender();
+      },
+      { primary: true, errorPrefix: "Tracking" }
+    );
+    if (live.length) {
+      addAction(
+        actions,
+        "Add to a bill…",
+        () => this.openMergeBill({ label: suggestion.name, merchant: suggestion.merchants[0], name: suggestion.id }, live, rerender),
+        { opensModal: true }
+      );
+    }
+    addAction(
+      actions,
+      "Ignore",
+      async () => {
+        this.settings.ignoredBillSuggestions = Array.from(new Set([...(this.settings.ignoredBillSuggestions || []), suggestion.id]));
+        await this.saveSettings();
+        await rerender();
+      },
+      { errorPrefix: "Ignoring" }
+    );
+  },
+
+  renderEndedBill(host, item, context) {
+    const { currency, rerender, live } = context;
+    const row = host.createDiv({ cls: "finance-tracker-budget-card finance-tracker-recurring-row is-paused" });
+    renderRowTitle(row, item.label, core.formatCurrency(item.lastAmount, currency));
+    const reason =
+      item.finishedReason === "end-date"
+        ? `ended ${item.endDate}`
+        : item.finishedReason === "payments"
+          ? "all payments made"
+          : "paused";
+    row.createDiv({
+      cls: "finance-tracker-budget-meta",
+      text: `${cadenceLabel(item.cadence)} · ${reason} · ${item.count} payment${item.count === 1 ? "" : "s"}`,
+    });
+    const actions = row.createDiv({ cls: "finance-tracker-header-actions" });
+    addAction(
+      actions,
+      item.finished ? "Restart" : "Resume",
+      async () => {
+        await this.updateRecurringItem(item, { active: true, ...(item.finished ? { endDate: null, paymentsLeft: null } : {}) });
+        await rerender();
+      },
+      { primary: !item.finished, errorPrefix: `Resuming ${item.label}` }
+    );
+    if (item.billId && live.length) {
+      addAction(actions, "Merge into…", () => this.openMergeBill(item, live, rerender), { opensModal: true });
+    }
+  },
+
+  async createBillFromSuggestion(suggestion) {
+    const bill = {
+      id: core.normalizeBillId(suggestion.name) || suggestion.id,
+      name: suggestion.name,
+      aliases: Array.from(new Set([suggestion.id, ...(suggestion.merchants || [])])).filter(
+        (alias) => core.normalizeBillId(alias) !== core.normalizeBillId(suggestion.name)
+      ),
+      cadence: suggestion.cadence,
+      dueRule: { type: "after-last" },
+      amount: suggestion.lastAmount,
+      amountModel: "fixed",
+      reminderDays: 3,
+      active: true,
+      autoLog: false,
+      nextAmount: null,
+      changeDate: null,
+      endDate: null,
+      paymentsLeft: null,
+      nextDueOverride: null,
+      skipped: [],
+      startDate: suggestion.firstDate || null,
+      currency: this.settings.defaultCurrency,
+    };
+    await this.saveBill(bill);
+    return bill;
+  },
+
+  // A bill added by hand. With a first due date and no payments yet, that date is
+  // the schedule's starting point; the override clears itself on the first
+  // payment, like any other.
+  async addBill({ name, cadence, amount = null, dueRule = { type: "after-last" }, firstDue = null }) {
+    const id = core.normalizeBillId(name);
+    if (!id) throw new Error("Give the bill a name.");
+    if (!core.normalizeCadence(cadence)) throw new Error("Pick how often it is paid.");
+    if (await this.findBill(id)) throw new Error(`There is already a bill called ${name}.`);
+    const bill = {
+      id,
+      name: String(name).trim(),
+      aliases: [],
+      cadence: core.normalizeCadence(cadence),
+      dueRule,
+      amount,
+      amountModel: "fixed",
+      reminderDays: 3,
+      active: true,
+      autoLog: false,
+      nextAmount: null,
+      changeDate: null,
+      endDate: null,
+      paymentsLeft: null,
+      nextDueOverride: firstDue,
+      skipped: [],
+      startDate: null,
+      currency: this.settings.defaultCurrency,
+    };
+    await this.saveBill(bill);
+    this.refreshDailyBudgetView();
+    return bill;
+  },
+
+  openMergeBill(item, live, onDone) {
+    const modal = new MergeBillModal(this.app, this, item, live, onDone);
+    modal.open();
+    return modal;
+  },
+
+  openAddBill(options = {}) {
+    const modal = new AddBillModal(this.app, this, options);
+    modal.open();
+    return modal;
+  },
+});
 
 class DailyBudgetView extends ItemView {
   constructor(leaf, plugin) {
@@ -13412,7 +13787,7 @@ class EditRecurringItemModal extends Modal {
           patch.endDate = null;
           patch.paymentsLeft = null;
         }
-        await this.plugin.updateRecurringRegistryEntry(item, patch);
+        await this.plugin.updateRecurringItem(item, patch);
         new Notice(`${item.label} updated`);
         this.close();
         if (typeof this.onSaved === "function") await this.onSaved();
@@ -13476,6 +13851,182 @@ class LogVariableBillModal extends Modal {
   }
 
   onClose() {
+    this.contentEl.empty();
+  }
+}
+
+// Merging replaces "Remove completely" as the answer to a duplicate. Removing
+// hid a bill's name while its payments went on existing, uncounted; merging
+// makes the name an alias of the bill it really was, so the history joins up.
+class MergeBillModal extends Modal {
+  constructor(app, plugin, item, bills, onDone) {
+    super(app);
+    this.plugin = plugin;
+    this.item = item;
+    this.bills = (bills || []).filter((bill) => bill.billId && bill.billId !== item.billId);
+    this.onDone = onDone;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("finance-edit");
+    contentEl.createEl("h3", { text: `Merge ${this.item.label} into…` });
+    contentEl.createEl("p", {
+      cls: "finance-edit-hint",
+      text: "Its name becomes an alias of the bill you pick, so its payments count toward that one. Your daily notes do not change.",
+    });
+
+    const search = contentEl.createEl("input", { type: "text", attr: { placeholder: "Find a bill", "aria-label": "Find a bill" } });
+    const list = contentEl.createDiv({ cls: "finance-tracker-holiday-results" });
+
+    const render = () => {
+      list.empty();
+      const needle = String(search.value || "").toLowerCase();
+      const matches = this.bills.filter((bill) => !needle || bill.label.toLowerCase().includes(needle));
+      if (!matches.length) {
+        list.createDiv({ cls: "finance-tracker-empty", text: "No bill matches." });
+        return;
+      }
+      for (const bill of matches) {
+        const row = list.createDiv({ cls: "finance-tracker-holiday-result" });
+        row.createDiv({ cls: "finance-tracker-holiday-result-title", text: bill.label });
+        row.createDiv({
+          cls: "finance-tracker-holiday-result-path",
+          text: `${cadenceLabel(bill.cadence)} · ${core.formatCurrency(bill.lastAmount, this.plugin.settings.defaultCurrency)} · ${bill.count} payment${bill.count === 1 ? "" : "s"}`,
+        });
+        row.addEventListener("click", async () => {
+          try {
+            await this.plugin.mergeBillInto(this.item, bill.billId);
+            new Notice(`${this.item.label} now counts toward ${bill.label}.`);
+            this.close();
+            if (typeof this.onDone === "function") await this.onDone();
+          } catch (error) {
+            new Notice(`Merge failed: ${error.message}`);
+          }
+        });
+      }
+    };
+    search.addEventListener("input", render);
+    render();
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+// Adding a bill by hand, for one that has not been logged yet — the car
+// registration due next August — or one you would rather set up than wait for.
+class AddBillModal extends Modal {
+  constructor(app, plugin, options = {}) {
+    super(app);
+    this.plugin = plugin;
+    this.onSaved = options.onSaved;
+  }
+
+  async onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("finance-edit");
+    contentEl.createEl("h3", { text: "Add a bill" });
+    const known = await this.plugin.collectKnownSuggestions();
+
+    const row = (label) => {
+      const element = contentEl.createDiv({ cls: "finance-edit-row" });
+      element.createEl("label", { text: label });
+      return element;
+    };
+
+    const nameInput = row("Name").createEl("input", { type: "text", attr: { placeholder: "Claude", "aria-label": "Bill name" } });
+    this.nameSuggest = new FinanceSuggest(nameInput, {
+      scope: this.scope,
+      getItems: (query) => {
+        const needle = String(query || "").toLowerCase();
+        if (!needle) return [];
+        return known.merchants
+          .filter((merchant) => merchant.name.toLowerCase().includes(needle))
+          .slice(0, 6)
+          .map((merchant) => ({ value: merchant.name, label: merchant.name, kind: "merchant" }));
+      },
+    });
+
+    const cadenceSelect = row("How often").createEl("select", { attr: { "aria-label": "Cadence" } });
+    for (const [value, label] of [["weekly", "Weekly"], ["fortnightly", "Fortnightly"], ["monthly", "Monthly"], ["quarterly", "Quarterly"], ["yearly", "Yearly"]]) {
+      cadenceSelect.createEl("option", { text: label, value });
+    }
+    cadenceSelect.value = "monthly";
+
+    const amountInput = row("Amount").createEl("input", {
+      type: "number",
+      attr: { step: "0.01", inputmode: "decimal", placeholder: "34.00", "aria-label": "Amount" },
+    });
+
+    const dueSelect = row("Due").createEl("select", { attr: { "aria-label": "Due rule" } });
+    for (const [value, label] of [["after-last", "Counted from the last payment"], ["day-of-month", "On a day of the month"], ["nth-weekday", "On a weekday of the month"]]) {
+      dueSelect.createEl("option", { text: label, value });
+    }
+    dueSelect.value = "after-last";
+
+    const dayRow = row("Day");
+    const dayInput = dayRow.createEl("input", { type: "number", attr: { min: "1", max: "31", placeholder: "26", "aria-label": "Day of month" } });
+    const weekdayRow = row("Which");
+    const ordinalSelect = weekdayRow.createEl("select", { attr: { "aria-label": "Which weekday" } });
+    for (const [value, label] of [["1", "First"], ["2", "Second"], ["3", "Third"], ["4", "Fourth"], ["-1", "Last"]]) {
+      ordinalSelect.createEl("option", { text: label, value });
+    }
+    const weekdaySelect = weekdayRow.createEl("select", { attr: { "aria-label": "Weekday" } });
+    ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"].forEach((label, index) => {
+      weekdaySelect.createEl("option", { text: label, value: String(index) });
+    });
+
+    const syncDueRows = () => {
+      dayRow.toggleClass("is-hidden", dueSelect.value !== "day-of-month");
+      weekdayRow.toggleClass("is-hidden", dueSelect.value !== "nth-weekday");
+    };
+    dueSelect.addEventListener("change", syncDueRows);
+    syncDueRows();
+
+    const firstDueInput = row("First due").createEl("input", { type: "date", attr: { "aria-label": "First due date" } });
+    contentEl.createEl("p", {
+      cls: "finance-edit-hint",
+      text: "Optional. Set it for a bill that has never been paid, so it knows when to start.",
+    });
+
+    const buttons = contentEl.createDiv({ cls: "finance-edit-buttons" });
+    const save = buttons.createEl("button", { text: "Add bill", cls: "mod-cta" });
+    save.addEventListener("click", async () => {
+      save.disabled = true;
+      try {
+        const name = nameInput.value.trim();
+        if (!name) throw new Error("Give the bill a name.");
+        const dueRule =
+          dueSelect.value === "day-of-month"
+            ? { type: "day-of-month", day: Math.min(31, Math.max(1, Number(dayInput.value) || 1)) }
+            : dueSelect.value === "nth-weekday"
+              ? { type: "nth-weekday", ordinal: Number(ordinalSelect.value), weekday: Number(weekdaySelect.value) }
+              : { type: "after-last" };
+        const amount = core.parseNumber(amountInput.value);
+        const bill = await this.plugin.addBill({
+          name,
+          cadence: cadenceSelect.value,
+          amount: Number.isFinite(amount) && amount > 0 ? amount : null,
+          dueRule,
+          firstDue: core.parseIsoDate(firstDueInput.value) || null,
+        });
+        new Notice(`Added ${bill.name}.`);
+        this.close();
+        if (typeof this.onSaved === "function") await this.onSaved();
+      } catch (error) {
+        new Notice(error.message);
+        save.disabled = false;
+      }
+    });
+    window.setTimeout(() => nameInput.focus(), 0);
+  }
+
+  onClose() {
+    this.nameSuggest?.destroy();
     this.contentEl.empty();
   }
 }
@@ -15293,7 +15844,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
       currentCheckbox.checked = true;
       currentCheckbox.addEventListener("change", async () => {
         currentCheckbox.disabled = true;
-        await this.plugin.updateRecurringRegistryEntry(item, { active: currentCheckbox.checked });
+        await this.plugin.updateRecurringItem(item, { active: currentCheckbox.checked });
         await this.renderRecurringList(listEl);
       });
 
@@ -15302,7 +15853,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
       autoCheckbox.checked = item.autoLog !== false;
       autoCheckbox.addEventListener("change", async () => {
         autoCheckbox.disabled = true;
-        await this.plugin.updateRecurringRegistryEntry(item, { autoLog: autoCheckbox.checked });
+        await this.plugin.updateRecurringItem(item, { autoLog: autoCheckbox.checked });
         autoCheckbox.disabled = false;
       });
     }

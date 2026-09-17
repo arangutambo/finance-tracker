@@ -1640,3 +1640,30 @@
 .modal.finance-wide-modal {
   width: min(720px, 94vw);
 }
+
+/* ---- Bills list ---- */
+.finance-bills-group.is-overdue h4 { color: var(--text-error); }
+.finance-bill-row-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.finance-bill-row-top .finance-bill-row-title { flex: 1 1 auto; min-width: 0; }
+.finance-bill-spark { flex: 0 0 auto; opacity: 0.85; }
+.finance-bill-spark-line {
+  fill: none;
+  stroke: var(--interactive-accent);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+.finance-bill-more {
+  min-width: 2.2em;
+  font-size: 1.1em;
+  line-height: 1;
+}
+.finance-edit-row.is-hidden { display: none; }
+
+@media (max-width: 720px) {
+  .finance-bill-spark { display: none; }
+}

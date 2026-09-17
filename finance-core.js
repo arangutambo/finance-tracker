@@ -4001,6 +4001,9 @@ function parseBillDefinition(frontmatter, options = {}) {
     nextDueOverride: parseIsoDate(fm.next_due || fm.next_due_override || ""),
     skipped: parseListValue(fm.skipped).map((date) => parseIsoDate(date)).filter(Boolean),
     startDate: parseIsoDate(fm.start_date || ""),
+    // Set when this bill was merged into another. It then stops being a bill of
+    // its own, so its payments fall through to the bill that now carries its name.
+    mergedInto: normalizeBillId(fm.merged_into || ""),
     currency: normalizeCurrency(fm.currency || options.defaultCurrency || "AUD"),
     notePath: options.notePath || "",
   };

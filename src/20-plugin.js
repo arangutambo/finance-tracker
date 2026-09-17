@@ -5337,7 +5337,7 @@ class FinanceTrackerPlugin extends Plugin {
     return normalizePath(`${this.settings.budgetsFolderPath}/Bills`);
   }
 
-  async loadBills() {
+  async loadBills(options = {}) {
     const prefix = `${this.getBillsFolderPath()}/`;
     const bills = [];
     for (const file of this.app.vault.getMarkdownFiles()) {
@@ -5347,7 +5347,9 @@ class FinanceTrackerPlugin extends Plugin {
         defaultCurrency: this.settings.defaultCurrency,
         notePath: file.path,
       });
-      if (bill) bills.push(bill);
+      // A merged bill's note is kept as a record, but it no longer claims
+      // payments — the bill it was merged into does, through the alias.
+      if (bill && (!bill.mergedInto || options.includeMerged)) bills.push(bill);
     }
     return bills.sort((left, right) => left.name.localeCompare(right.name));
   }
@@ -5379,6 +5381,7 @@ class FinanceTrackerPlugin extends Plugin {
       `skipped: [${(bill.skipped || []).join(", ")}]`,
       `start_date: ${value(bill.startDate)}`,
       `currency: ${bill.currency || this.settings.defaultCurrency}`,
+      ...(bill.mergedInto ? [`merged_into: ${bill.mergedInto}`] : []),
       "---",
     ].join("\n");
   }
@@ -5537,7 +5540,7 @@ class FinanceTrackerPlugin extends Plugin {
       // notes of your own, and deleting a note is not this plugin's decision.
       if (file instanceof TFile) {
         const bill = await this.findBill(sourceItem.billId);
-        if (bill) await this.saveBill({ ...bill, active: false, endDate: bill.endDate || sourceItem.lastDate || core.todayIsoLocal() });
+        if (bill) await this.saveBill({ ...bill, active: false, mergedInto: target.id });
       }
     }
     this.refreshDailyBudgetView();
@@ -5556,7 +5559,7 @@ class FinanceTrackerPlugin extends Plugin {
     const bills = await this.loadBills();
     if (bills.length) {
       const view = core.buildBillsView(bills, entries, { prefix: activePrefix, referenceDate: today });
-      return { ...view, items: this.sortRecurringItems(view.items) };
+      return { ...view, billsMode: true, items: this.sortRecurringItems(view.items) };
     }
 
     const detected = core.detectRecurringPayments(entries, { prefix: activePrefix, referenceDate: today });
@@ -6105,6 +6108,13 @@ class FinanceTrackerPlugin extends Plugin {
     const prefix = core.normalizeCategoryPath(config.prefix || this.settings.recurringTagPrefix || "subscriptions") || "subscriptions";
     const recurring = await this.detectRecurring(referenceDate, prefix);
 
+    // Bill notes get the new list. The old one stays for vaults that have not
+    // converted, so nothing changes for anyone until they choose it.
+    if (recurring.billsMode) {
+      await this.renderBillsBlock(source, el, ctx, recurring);
+      return;
+    }
+
     const manage = /^(?:true|yes|1)$/i.test(String(config.manage || ""));
     const entries = await this.collectAllTransactions();
     const runway = await this.computeRunwayState(referenceDate, { recurring, entries });
@@ -6199,7 +6209,7 @@ class FinanceTrackerPlugin extends Plugin {
           // Moves only this occurrence; the cadence itself is untouched.
           addAction(actions, "Push a week", async () => {
             const nextDue = core.addDays(item.nextDue, 7);
-            await this.updateRecurringRegistryEntry(item, { nextDue });
+            await this.updateRecurringItem(item, { nextDue });
             new Notice(`${item.label} now due ${nextDue}`);
             await rerender();
           }, { errorPrefix: `Rescheduling ${item.label}`, tooltip: "Push just this occurrence back a week, keeping the cadence" });
@@ -6222,11 +6232,11 @@ class FinanceTrackerPlugin extends Plugin {
           new EditRecurringItemModal(this.app, this, item, rerender).open();
         }, { opensModal: true });
         addAction(stateActions, "Pause", async () => {
-          await this.updateRecurringRegistryEntry(item, { active: false });
+          await this.updateRecurringItem(item, { active: false });
           await rerender();
         }, { errorPrefix: `Pausing ${item.label}` });
         addToggleAction(stateActions, "Auto-log", item.autoLog !== false, async (checked) => {
-          await this.updateRecurringRegistryEntry(item, { autoLog: checked });
+          await this.updateRecurringItem(item, { autoLog: checked });
         });
       }
     }
@@ -6257,7 +6267,7 @@ class FinanceTrackerPlugin extends Plugin {
         // A finished bill needs its terms cleared before it can run again, so
         // Resume is only the obvious next step for one that was merely paused.
         addAction(actions, item.finished ? "Restart" : "Resume", async () => {
-          await this.updateRecurringRegistryEntry(item, {
+          await this.updateRecurringItem(item, {
             active: true,
             ...(item.finished ? { endDate: null, paymentsLeft: null } : {}),
           });
