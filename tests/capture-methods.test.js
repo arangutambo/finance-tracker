@@ -146,6 +146,13 @@ function makePlugin(overrides = {}) {
       delete: async (file) => {
         files.delete(file.path);
       },
+      rename: async (file, nextPath) => {
+        files.delete(file.path);
+        file.path = nextPath;
+        file.name = nextPath.split("/").pop();
+        file.basename = file.name.replace(/\.md$/, "");
+        files.set(nextPath, file);
+      },
       createFolder: async () => {},
       on: () => ({}),
     },
@@ -1929,4 +1936,113 @@ test("the hub Reviews tab steps back a week and copies a frozen review", async (
   }
   assert.match(copied, /^## Finance review: week of 7 Sep 2026/);
   assert.ok(notices.some((message) => /Review copied/.test(message)));
+});
+
+
+// --- Goal and trip prompts ------------------------------------------------------------
+
+const IPHONE_GOAL = [
+  "---",
+  "goal_name: iPhone",
+  "goal_key: iphone",
+  "target_amount: 2000",
+  "starting_balance: 0",
+  "due_date: 2026-09-18",
+  "active: true",
+  "currency: AUD",
+  "---",
+  "",
+  "# iPhone",
+  "",
+].join("\n");
+
+async function vaultWithGoal(note = IPHONE_GOAL) {
+  const made = makePlugin({ ...billSettings(), promptSnoozes: {}, dismissedPrompts: [] });
+  delete made.plugin.invalidateIndexEntry;
+  await made.app.vault.create("Utility/Budgets/iPhone.md", note);
+  return made;
+}
+
+test("a goal due tomorrow prompts, and Not now hides it for the day", async () => {
+  const { plugin } = await vaultWithGoal();
+
+  const el = new StubEl();
+  const shown = await plugin.renderGoalPrompts(el, { referenceDate: "2026-09-17", rerender: async () => {} });
+  assert.equal(shown, 1);
+  assert.match(el.allText(), /iPhone is due tomorrow/);
+  assert.match(el.allText(), /\$0\.00 of \$2,000\.00 saved/);
+
+  await el.click("Not now");
+  assert.deepEqual(plugin.settings.promptSnoozes, { "goal-due-soon:iphone:2026-09-18": "2026-09-17" });
+  assert.equal(await plugin.renderGoalPrompts(new StubEl(), { referenceDate: "2026-09-17" }), 0);
+  assert.equal(await plugin.renderGoalPrompts(new StubEl(), { referenceDate: "2026-09-18" }), 1, "due today is a new prompt");
+});
+
+test("a due goal can be given a new due date from its prompt", async () => {
+  const { plugin, files } = await vaultWithGoal();
+
+  const el = new StubEl();
+  await plugin.renderGoalPrompts(el, { referenceDate: "2026-09-18", rerender: async () => {} });
+  assert.match(el.allText(), /iPhone is due today/);
+  await el.click("New due date");
+
+  // the prompt opened the modal through openGoalDueDate; drive it directly
+  const modal = plugin.openGoalDueDate({ goalName: "iPhone", goalKey: "iphone", dueDate: "2026-09-18", file: files.get("Utility/Budgets/iPhone.md") });
+  await modal.ready;
+  const input = modal.contentEl.find((node) => node.attrs["aria-label"] === "Due date");
+  input.value = "2026-12-24";
+  await input.fire("input");
+  await modal.contentEl.click("Save");
+
+  assert.match(files.get("Utility/Budgets/iPhone.md").content, /due_date: 2026-12-24/);
+  assert.equal(modal.closed, true);
+});
+
+test("archiving from a prompt asks first, then archives the note", async () => {
+  const { plugin, files } = await vaultWithGoal();
+  const goal = (await plugin.collectSavingsGoalDefinitions())[0];
+
+  const modal = plugin.confirmArchiveGoal(goal);
+  await modal.ready;
+  assert.match(modal.contentEl.allText(), /Archive iPhone\?/);
+  assert.match(modal.contentEl.allText(), /File recovery/);
+  assert.ok(files.has("Utility/Budgets/iPhone.md"), "nothing happens before confirming");
+
+  await modal.contentEl.click("Archive");
+  assert.ok(!files.has("Utility/Budgets/iPhone.md"));
+  const archived = files.get("Utility/Budgets/Archive/iPhone.md");
+  assert.ok(archived);
+  assert.match(archived.content, /archived: \d{4}-\d{2}-\d{2}/);
+});
+
+test("a withdrawal is logged against the goal with what it was spent on", async () => {
+  const { plugin, files } = await vaultWithGoal();
+
+  const modal = plugin.openContribute({ mode: "withdraw" });
+  await modal.ready;
+  assert.match(modal.contentEl.allText(), /Withdraw from a goal/);
+  const goalInput = modal.contentEl.find((node) => node.attrs["aria-label"] === "Goal");
+  assert.equal(goalInput.value, "iPhone", "the only goal is filled in");
+  const amount = modal.contentEl.find((node) => node.attrs["aria-label"] === "Amount");
+  amount.value = "80";
+  await amount.fire("input");
+  modal.picker.setValue("shopping/electronics");
+  await modal.contentEl.click("Log withdrawal");
+
+  const today = [...files.values()].find((file) => file.path.startsWith("Daily/"));
+  assert.match(today.content, /- \$80\.00 #log\/spending\/goal\/iphone\/shopping\/electronics/);
+  assert.match(today.content, /Withdrawal from iPhone/);
+
+  const contribute = plugin.openContribute({ goalKey: "iphone" });
+  await contribute.ready;
+  await contribute.contentEl.click("Withdraw");
+  assert.match(contribute.contentEl.allText(), /Log withdrawal/);
+  await contribute.contentEl.click("Contribute");
+  const unknown = contribute.contentEl.find((node) => node.attrs["aria-label"] === "Goal");
+  unknown.value = "Holiday fund";
+  const contributeAmount = contribute.contentEl.find((node) => node.attrs["aria-label"] === "Amount");
+  contributeAmount.value = "10";
+  await contributeAmount.fire("input");
+  await contribute.contentEl.click("Log contribution");
+  assert.ok(notices.includes("Choose one of your goals first."));
 });

@@ -181,7 +181,7 @@ class FinanceTrackerPlugin extends Plugin {
     this.addCommand({
       id: "finance-tracker-contribute-goal",
       name: "Contribute to a goal",
-      callback: () => new ContributeGoalModal(this.app, this).open(),
+      callback: () => this.openContribute(),
     });
 
     this.addCommand({
@@ -2191,18 +2191,7 @@ class FinanceTrackerPlugin extends Plugin {
   async startTrip() {
     await new Promise((resolve) => {
       new HolidayBudgetModal(this.app, this, async (file) => {
-        if (file instanceof TFile) {
-          const meta = await this.readHolidayBudgetFile(file);
-          if (!meta?.holidayKey) {
-            new Notice("That note has no trip tag. Add trip_tag to its frontmatter first.");
-          } else {
-            this.settings.activeTripGoalPath = file.path;
-            this.settings.tripModeActive = true;
-            await this.saveSettings();
-            new Notice(`Trip mode on: ${meta.holidayName || meta.holidayKey}`);
-            this.refreshDailyBudgetView();
-          }
-        }
+        if (file instanceof TFile) await this.startTripFor(file);
         resolve();
       }).open();
     });
@@ -2648,6 +2637,18 @@ class FinanceTrackerPlugin extends Plugin {
   async logGoalContribution(goalKey, goalName, amount, date, note = "") {
     const lines = [`- ${core.formatCurrency(amount, this.settings.defaultCurrency)} #log/income/${core.normalizeCategoryPath(goalKey)}`];
     lines.push(`\t- ${String(note || "").replace(/\s+/g, " ").trim() || `Contribution to ${goalName || goalKey}`}`);
+    const file = await this.appendFinanceLines(date || core.todayIsoLocal(), lines);
+    this.refreshDailyBudgetView();
+    return file;
+  }
+
+  // Logs money taken out of a goal (`- $X #log/spending/goal/<goalKey>/<category>`).
+  // It counts against the goal's balance, not toward home spending.
+  async logGoalWithdrawal(goalKey, goalName, amount, date, note = "", category = "") {
+    const categoryPath = core.normalizeCategoryPath(category || "");
+    const tag = `#log/spending/goal/${core.normalizeCategoryPath(goalKey)}${categoryPath ? `/${categoryPath}` : ""}`;
+    const lines = [`- ${core.formatCurrency(amount, this.settings.defaultCurrency)} ${tag}`];
+    lines.push(`\t- ${String(note || "").replace(/\s+/g, " ").trim() || `Withdrawal from ${goalName || goalKey}`}`);
     const file = await this.appendFinanceLines(date || core.todayIsoLocal(), lines);
     this.refreshDailyBudgetView();
     return file;
@@ -4331,6 +4332,8 @@ class FinanceTrackerPlugin extends Plugin {
         complete: "Target reached",
         overdue: "Past due date",
         "on-track": "On track",
+        saving: "Saving",
+        "not-started": "Nothing saved yet",
       };
       cardData.push({ label: "Set aside / week", value: core.formatCurrency(fund.requiredPerWeek, currency) });
       cardData.push({
@@ -4757,6 +4760,9 @@ class FinanceTrackerPlugin extends Plugin {
     }
 
     renderStatCards(wrapper, summaryCards);
+
+    // Goals and trips that need a decision today: due, done, starting, over.
+    await this.renderGoalPrompts(wrapper, { referenceDate });
 
     // Mini pie chart (sidebar-friendly: SVG centred + compact legend below)
     const hierarchy = core.buildHierarchicalCategoryGroups(spendEntries, "primary");
@@ -6940,7 +6946,7 @@ class FinanceTrackerPlugin extends Plugin {
     const header = wrapper.createDiv({ cls: "finance-tracker-header" });
     header.createEl("h3", { text: config.title || "Savings goals" });
     const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
-    addAction(headerActions, "Contribute", () => new ContributeGoalModal(this.app, this).open(), {
+    addAction(headerActions, "Contribute", () => this.openContribute({ onDone: () => this.renderGoalsBlock(source, el, ctx) }), {
       primary: true,
       opensModal: true,
     });
@@ -7012,7 +7018,15 @@ class FinanceTrackerPlugin extends Plugin {
       }
       if (goal.dueDate) bits.push(`due ${goal.dueDate}`);
       if (summary.sinkingFund) {
-        const paceLabels = { ahead: "ahead of pace", behind: "behind pace", complete: "target reached", overdue: "past due", "on-track": "on track" };
+        const paceLabels = {
+          ahead: "ahead of pace",
+          behind: "behind pace",
+          complete: "target reached",
+          overdue: "past due",
+          "on-track": "on track",
+          saving: "saving",
+          "not-started": "nothing saved yet",
+        };
         bits.push(paceLabels[summary.sinkingFund.status] || summary.sinkingFund.status);
       }
       if (bits.length) card.createDiv({ cls: "finance-tracker-budget-meta", text: bits.join(" · ") });
@@ -7023,7 +7037,7 @@ class FinanceTrackerPlugin extends Plugin {
       addAction(
         card.createDiv({ cls: "finance-tracker-header-actions" }),
         "Contribute",
-        () => new ContributeGoalModal(this.app, this, { goalKey: goal.goalKey, onDone: () => this.renderGoalsBlock(source, el, ctx) }).open(),
+        () => this.openContribute({ goalKey: goal.goalKey, onDone: () => this.renderGoalsBlock(source, el, ctx) }),
         { primary: true, opensModal: true }
       );
     }

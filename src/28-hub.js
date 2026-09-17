@@ -140,6 +140,8 @@ Object.assign(FinanceTrackerPlugin.prototype, {
 
   async renderHubGoals(host, view) {
     const toolbar = host.createDiv({ cls: "finance-hub-toolbar" });
+    addAction(toolbar, "Contribute", () => this.openContribute({ onDone: () => view.refresh() }), { primary: true, opensModal: true });
+    addAction(toolbar, "Withdraw", () => this.openContribute({ mode: "withdraw", onDone: () => view.refresh() }), { opensModal: true });
     addAction(toolbar, "New goal", () => new SavingsGoalModal(this.app, this, async () => view.refresh()).open(), {
       opensModal: true,
     });
@@ -149,6 +151,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
       await view.refresh();
     }, { errorPrefix: "Trip mode" });
 
+    await this.renderGoalPrompts(host, { rerender: () => view.refresh() });
     await this.renderGoalsBlock("", host.createDiv(), { sourcePath: "" });
 
     const today = core.todayIsoLocal();

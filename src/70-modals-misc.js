@@ -170,3 +170,83 @@ class ExportFolderModal extends Modal {
   }
 }
 
+
+// A yes/no for anything that moves or rewrites a note. The body says what will
+// happen and how to undo it; the action runs only on the confirm button.
+class FinanceConfirmModal extends Modal {
+  constructor(app, options = {}) {
+    super(app);
+    this.options = options;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: this.options.title || "Are you sure?" });
+    for (const paragraph of [].concat(this.options.body || [])) {
+      contentEl.createEl("p", { cls: "finance-tracker-settings-section-copy", text: paragraph });
+    }
+    const actions = contentEl.createDiv({ cls: "finance-tracker-settings-actions" });
+    actions.createEl("button", { text: "Cancel" }).addEventListener("click", () => this.close());
+    const confirm = actions.createEl("button", { text: this.options.confirmLabel || "Confirm", cls: "mod-cta" });
+    confirm.addEventListener("click", async () => {
+      confirm.disabled = true;
+      try {
+        await this.options.onConfirm?.();
+        this.close();
+      } catch (error) {
+        new Notice(`${this.options.confirmLabel || "That"} failed: ${error.message}`);
+        confirm.disabled = false;
+      }
+    });
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+class GoalDueDateModal extends Modal {
+  constructor(app, options = {}) {
+    super(app);
+    this.options = options;
+    this.value = options.dueDate || "";
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: `New due date for ${this.options.name}` });
+    contentEl.createEl("p", {
+      cls: "finance-tracker-settings-section-copy",
+      text: "Changes due_date in the goal note. The weekly set-aside is worked out again from the new date.",
+    });
+    const input = contentEl.createEl("input", { type: "date", attr: { "aria-label": "Due date" } });
+    input.addClass("finance-tracker-holiday-input");
+    input.value = this.value;
+    input.addEventListener("input", () => {
+      this.value = input.value;
+    });
+    const actions = contentEl.createDiv({ cls: "finance-tracker-settings-actions" });
+    actions.createEl("button", { text: "Cancel" }).addEventListener("click", () => this.close());
+    const save = actions.createEl("button", { text: "Save", cls: "mod-cta" });
+    save.addEventListener("click", async () => {
+      if (!core.parseIsoDate(this.value)) {
+        new Notice("Pick a date first.");
+        return;
+      }
+      save.disabled = true;
+      try {
+        await this.options.onSave?.(this.value);
+        this.close();
+      } catch (error) {
+        new Notice(`Saving the due date failed: ${error.message}`);
+        save.disabled = false;
+      }
+    });
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}

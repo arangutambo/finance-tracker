@@ -2646,9 +2646,112 @@ const core = (() => {
       const elapsed = Math.min(daysBetweenInclusive(anchorDate, referenceDate) - 1, totalSpan);
       expectedByNow = roundCurrencyAmount((targetAmount * elapsed) / Math.max(totalSpan, 1));
       status = currentSaved >= expectedByNow ? "ahead" : "behind";
+    } else if (status === "on-track") {
+      // With nothing to measure pace from there is no pace to be on. This used to
+      // fall through to "on track", which is how a goal with $0 of $2,000 saved,
+      // due tomorrow, described itself.
+      status = currentSaved > 0 ? "saving" : "not-started";
     }
 
     return { currentSaved, daysLeft, expectedByNow, remaining, requiredPerWeek, status, targetAmount, weeksLeft };
+  }
+
+  // --- Goal and trip prompts ------------------------------------------------------
+  // Moments a goal or trip needs a decision: a goal reaching its target or its due
+  // date, a trip starting or ending. Each prompt has a key that includes the date
+  // it is about, so dismissing "iPhone is due 18 Sep" doesn't also silence the
+  // same goal once its due date moves. "Not now" hides a prompt for the rest of
+  // the day; dismissing hides that key for good.
+
+  const GOAL_DUE_SOON_DAYS = 3;
+
+  function buildGoalPrompts(goals, options = {}) {
+    const referenceDate = parseIsoDate(options.referenceDate) || todayIsoLocal();
+    const dismissed = new Set(options.dismissed || []);
+    const snoozed = options.snoozed || {};
+    const currency = options.currency || "AUD";
+    const prompts = [];
+    const add = (prompt) => {
+      if (dismissed.has(prompt.key) || snoozed[prompt.key] === referenceDate) return;
+      prompts.push(prompt);
+    };
+
+    for (const goal of goals || []) {
+      if (!goal || goal.archivedDate) continue;
+      const key = normalizeCategoryPath(goal.goalKey || "");
+      if (!key) continue;
+      const name = goal.goalName || titleCaseSegment(key);
+      const money = (value) => formatCurrency(value, goal.currency || currency);
+
+      if (goal.goalType === "holiday") {
+        const start = parseIsoDate(goal.startDate || "");
+        const end = parseIsoDate(goal.endDate || "");
+        if (start && start <= referenceDate && (!end || referenceDate <= end) && !goal.tripModeOn) {
+          add({
+            key: `trip-start:${key}:${start}`,
+            kind: "trip-start",
+            goal,
+            title: start === referenceDate ? `${name} starts today` : `${name} is under way`,
+            detail: "Turn on trip mode so captures go to the trip, in its currency.",
+          });
+        }
+        if (end && referenceDate > end && goal.tripModeOn) {
+          add({
+            key: `trip-end:${key}:${end}`,
+            kind: "trip-end",
+            goal,
+            title: `${name} ended ${end}`,
+            detail: "Trip mode is still on, so new captures are still going to the trip.",
+          });
+        } else if (end && referenceDate > end && !goal.tripModeOn) {
+          add({
+            key: `trip-archive:${key}:${end}`,
+            kind: "trip-archive",
+            goal,
+            title: `${name} is over`,
+            detail: "Archiving writes a summary of what it cost into the note and moves it to the archive folder.",
+          });
+        }
+        continue;
+      }
+
+      const target = Number(goal.targetAmount) || 0;
+      const saved = Number(goal.currentSaved) || 0;
+      const due = parseIsoDate(goal.dueDate || "");
+      if (target > 0 && saved >= target) {
+        add({
+          key: `goal-complete:${key}:${target}`,
+          kind: "goal-complete",
+          goal,
+          title: `${name} reached its target`,
+          detail: `${money(saved)} saved of ${money(target)}.`,
+        });
+        continue;
+      }
+      if (!due) continue;
+      const progress = target > 0 ? `${money(saved)} of ${money(target)} saved` : `${money(saved)} saved`;
+      if (due <= referenceDate) {
+        add({
+          key: `goal-due:${key}:${due}`,
+          kind: "goal-due",
+          goal,
+          title: due === referenceDate ? `${name} is due today` : `${name} was due ${due}`,
+          detail: `${progress}. Archive it if it's done, or give it a new due date.`,
+        });
+      } else if (daysBetweenInclusive(referenceDate, due) - 1 <= GOAL_DUE_SOON_DAYS) {
+        const days = daysBetweenInclusive(referenceDate, due) - 1;
+        add({
+          key: `goal-due-soon:${key}:${due}`,
+          kind: "goal-due-soon",
+          goal,
+          title: `${name} is due ${days === 1 ? "tomorrow" : `in ${days} days`}`,
+          detail: `${progress}.`,
+        });
+      }
+    }
+
+    const order = ["trip-end", "trip-start", "goal-due", "goal-complete", "goal-due-soon", "trip-archive"];
+    return prompts.sort((left, right) => order.indexOf(left.kind) - order.indexOf(right.kind));
   }
 
   // --- Split expenses ----------------------------------------------------------
@@ -5600,6 +5703,7 @@ const core = (() => {
     detectRecurringPayments,
     parseGoalDefinition,
     computeSinkingFund,
+    buildGoalPrompts,
     parseOwedChildLine,
     buildOwedChildLine,
     buildOwedSharesFromTokens,
@@ -5794,6 +5898,10 @@ const DEFAULT_SETTINGS = {
   autoLogRecurring: false,
   quickAddUseNoteDate: false,
   tripModeActive: false,
+  // Goal and trip prompts: key → the day "Not now" was pressed, and keys
+  // dismissed for good.
+  promptSnoozes: {},
+  dismissedPrompts: [],
   activeTripGoalPath: "",
   schemaVersion: 1,
 };
@@ -6648,7 +6756,7 @@ class FinanceTrackerPlugin extends Plugin {
     this.addCommand({
       id: "finance-tracker-contribute-goal",
       name: "Contribute to a goal",
-      callback: () => new ContributeGoalModal(this.app, this).open(),
+      callback: () => this.openContribute(),
     });
 
     this.addCommand({
@@ -8658,18 +8766,7 @@ class FinanceTrackerPlugin extends Plugin {
   async startTrip() {
     await new Promise((resolve) => {
       new HolidayBudgetModal(this.app, this, async (file) => {
-        if (file instanceof TFile) {
-          const meta = await this.readHolidayBudgetFile(file);
-          if (!meta?.holidayKey) {
-            new Notice("That note has no trip tag. Add trip_tag to its frontmatter first.");
-          } else {
-            this.settings.activeTripGoalPath = file.path;
-            this.settings.tripModeActive = true;
-            await this.saveSettings();
-            new Notice(`Trip mode on: ${meta.holidayName || meta.holidayKey}`);
-            this.refreshDailyBudgetView();
-          }
-        }
+        if (file instanceof TFile) await this.startTripFor(file);
         resolve();
       }).open();
     });
@@ -9115,6 +9212,18 @@ class FinanceTrackerPlugin extends Plugin {
   async logGoalContribution(goalKey, goalName, amount, date, note = "") {
     const lines = [`- ${core.formatCurrency(amount, this.settings.defaultCurrency)} #log/income/${core.normalizeCategoryPath(goalKey)}`];
     lines.push(`\t- ${String(note || "").replace(/\s+/g, " ").trim() || `Contribution to ${goalName || goalKey}`}`);
+    const file = await this.appendFinanceLines(date || core.todayIsoLocal(), lines);
+    this.refreshDailyBudgetView();
+    return file;
+  }
+
+  // Logs money taken out of a goal (`- $X #log/spending/goal/<goalKey>/<category>`).
+  // It counts against the goal's balance, not toward home spending.
+  async logGoalWithdrawal(goalKey, goalName, amount, date, note = "", category = "") {
+    const categoryPath = core.normalizeCategoryPath(category || "");
+    const tag = `#log/spending/goal/${core.normalizeCategoryPath(goalKey)}${categoryPath ? `/${categoryPath}` : ""}`;
+    const lines = [`- ${core.formatCurrency(amount, this.settings.defaultCurrency)} ${tag}`];
+    lines.push(`\t- ${String(note || "").replace(/\s+/g, " ").trim() || `Withdrawal from ${goalName || goalKey}`}`);
     const file = await this.appendFinanceLines(date || core.todayIsoLocal(), lines);
     this.refreshDailyBudgetView();
     return file;
@@ -10798,6 +10907,8 @@ class FinanceTrackerPlugin extends Plugin {
         complete: "Target reached",
         overdue: "Past due date",
         "on-track": "On track",
+        saving: "Saving",
+        "not-started": "Nothing saved yet",
       };
       cardData.push({ label: "Set aside / week", value: core.formatCurrency(fund.requiredPerWeek, currency) });
       cardData.push({
@@ -11224,6 +11335,9 @@ class FinanceTrackerPlugin extends Plugin {
     }
 
     renderStatCards(wrapper, summaryCards);
+
+    // Goals and trips that need a decision today: due, done, starting, over.
+    await this.renderGoalPrompts(wrapper, { referenceDate });
 
     // Mini pie chart (sidebar-friendly: SVG centred + compact legend below)
     const hierarchy = core.buildHierarchicalCategoryGroups(spendEntries, "primary");
@@ -13407,7 +13521,7 @@ class FinanceTrackerPlugin extends Plugin {
     const header = wrapper.createDiv({ cls: "finance-tracker-header" });
     header.createEl("h3", { text: config.title || "Savings goals" });
     const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
-    addAction(headerActions, "Contribute", () => new ContributeGoalModal(this.app, this).open(), {
+    addAction(headerActions, "Contribute", () => this.openContribute({ onDone: () => this.renderGoalsBlock(source, el, ctx) }), {
       primary: true,
       opensModal: true,
     });
@@ -13479,7 +13593,15 @@ class FinanceTrackerPlugin extends Plugin {
       }
       if (goal.dueDate) bits.push(`due ${goal.dueDate}`);
       if (summary.sinkingFund) {
-        const paceLabels = { ahead: "ahead of pace", behind: "behind pace", complete: "target reached", overdue: "past due", "on-track": "on track" };
+        const paceLabels = {
+          ahead: "ahead of pace",
+          behind: "behind pace",
+          complete: "target reached",
+          overdue: "past due",
+          "on-track": "on track",
+          saving: "saving",
+          "not-started": "nothing saved yet",
+        };
         bits.push(paceLabels[summary.sinkingFund.status] || summary.sinkingFund.status);
       }
       if (bits.length) card.createDiv({ cls: "finance-tracker-budget-meta", text: bits.join(" · ") });
@@ -13490,7 +13612,7 @@ class FinanceTrackerPlugin extends Plugin {
       addAction(
         card.createDiv({ cls: "finance-tracker-header-actions" }),
         "Contribute",
-        () => new ContributeGoalModal(this.app, this, { goalKey: goal.goalKey, onDone: () => this.renderGoalsBlock(source, el, ctx) }).open(),
+        () => this.openContribute({ goalKey: goal.goalKey, onDone: () => this.renderGoalsBlock(source, el, ctx) }),
         { primary: true, opensModal: true }
       );
     }
@@ -13750,6 +13872,181 @@ class FinanceTrackerPlugin extends Plugin {
   }
 }
 
+// --- Goals and trips ------------------------------------------------------------------
+// Prompts for the moments a goal or trip needs a decision, and the small flows
+// they lead into. The decisions themselves (archive, trip mode, contribute)
+// are the existing ones; this only makes them turn up when they're due.
+
+Object.assign(FinanceTrackerPlugin.prototype, {
+  async collectGoalPrompts(referenceDate = core.todayIsoLocal()) {
+    const goals = await this.collectSavingsGoalDefinitions();
+    const tripPath = this.settings.tripModeActive ? normalizePath(this.settings.activeTripGoalPath || "") : "";
+    const inputs = [];
+    for (const goal of goals) {
+      if (goal.isLegacyRunwayNote) continue;
+      let summary = null;
+      if (goal.goalType !== "holiday") summary = await this.buildSavingsGoalSummary(goal, referenceDate);
+      inputs.push({
+        ...goal,
+        currentSaved: summary ? summary.currentSaved : 0,
+        targetAmount: summary ? summary.targetAmount : goal.targetAmount,
+        tripModeOn: Boolean(tripPath && goal.file?.path === tripPath),
+      });
+    }
+    return core.buildGoalPrompts(inputs, {
+      referenceDate,
+      currency: this.settings.defaultCurrency,
+      dismissed: this.settings.dismissedPrompts || [],
+      snoozed: this.settings.promptSnoozes || {},
+    });
+  },
+
+  // Renders nothing when nothing is waiting. Returns how many prompts it showed.
+  async renderGoalPrompts(host, options = {}) {
+    const referenceDate = options.referenceDate || core.todayIsoLocal();
+    const prompts = await this.collectGoalPrompts(referenceDate);
+    if (!prompts.length) return 0;
+    const rerender = options.rerender || (async () => this.refreshDailyBudgetView());
+
+    const card = host.createDiv({ cls: "finance-tracker-chart-card finance-prompts" });
+    for (const prompt of prompts) {
+      const row = card.createDiv({ cls: "finance-prompt" });
+      row.addClass(`is-${prompt.kind}`);
+      row.createDiv({ cls: "finance-prompt-title", text: prompt.title });
+      row.createDiv({ cls: "finance-tracker-budget-meta", text: prompt.detail });
+      const actions = row.createDiv({ cls: "finance-tracker-header-actions" });
+      for (const action of this.goalPromptActions(prompt, rerender)) {
+        addAction(actions, action.label, action.run, {
+          primary: action.primary,
+          opensModal: action.opensModal,
+          errorPrefix: action.label,
+        });
+      }
+      addAction(
+        actions,
+        "Not now",
+        async () => {
+          await this.snoozePrompt(prompt.key, referenceDate);
+          await rerender();
+        },
+        { tooltip: "Hide this until tomorrow" }
+      );
+      addAction(
+        actions,
+        "Dismiss",
+        async () => {
+          await this.dismissPrompt(prompt.key);
+          await rerender();
+        },
+        { tooltip: "Don't ask about this again" }
+      );
+    }
+    return prompts.length;
+  },
+
+  goalPromptActions(prompt, rerender) {
+    const goal = prompt.goal;
+    const archive = { label: goal.goalType === "holiday" ? "Archive trip" : "Archive goal", primary: true, opensModal: true, run: () => this.confirmArchiveGoal(goal, rerender) };
+    const newDueDate = { label: "New due date", opensModal: true, run: () => this.openGoalDueDate(goal, rerender) };
+    switch (prompt.kind) {
+      case "trip-start":
+        return [{ label: "Start trip mode", primary: true, run: async () => { await this.startTripFor(goal.file); await rerender(); } }];
+      case "trip-end":
+        return [{ label: "End trip mode", primary: true, run: async () => { await this.endTrip(); await rerender(); } }];
+      case "trip-archive":
+      case "goal-complete":
+        return [archive];
+      case "goal-due":
+        return [archive, newDueDate];
+      case "goal-due-soon":
+        return [
+          { label: "Contribute", primary: true, opensModal: true, run: () => this.openContribute({ goalKey: goal.goalKey, onDone: rerender }) },
+          newDueDate,
+        ];
+      default:
+        return [];
+    }
+  },
+
+  async snoozePrompt(key, date = core.todayIsoLocal()) {
+    // Only today's snoozes matter, so older ones are dropped rather than kept
+    // in data.json forever.
+    const kept = Object.entries(this.settings.promptSnoozes || {}).filter(([, day]) => day >= date);
+    this.settings.promptSnoozes = Object.fromEntries([...kept, [key, date]]);
+    await this.saveSettings();
+  },
+
+  async dismissPrompt(key) {
+    this.settings.dismissedPrompts = Array.from(new Set([...(this.settings.dismissedPrompts || []), key]));
+    await this.saveSettings();
+  },
+
+  async startTripFor(file) {
+    if (!(file instanceof TFile)) return false;
+    const meta = await this.readHolidayBudgetFile(file);
+    if (!meta?.holidayKey) {
+      new Notice("That note has no trip tag. Add trip_tag to its frontmatter first.");
+      return false;
+    }
+    this.settings.activeTripGoalPath = file.path;
+    this.settings.tripModeActive = true;
+    await this.saveSettings();
+    new Notice(`Trip mode on: ${meta.holidayName || meta.holidayKey}`);
+    this.refreshDailyBudgetView();
+    return true;
+  },
+
+  openContribute(options = {}) {
+    const modal = new ContributeGoalModal(this.app, this, options);
+    modal.open();
+    return modal;
+  },
+
+  confirmArchiveGoal(goal, onDone) {
+    const name = goal.goalName || goal.goalKey;
+    const modal = new FinanceConfirmModal(this.app, {
+      title: `Archive ${name}?`,
+      body: [
+        "A summary of what was saved and spent is added to the end of the note, it's marked archived, and it moves to the archive folder.",
+        "It leaves the goal lists, capture routing and the forecast. To undo, move it back and delete the archived line; File recovery keeps the version from before.",
+      ],
+      confirmLabel: "Archive",
+      onConfirm: async () => {
+        if (!(goal.file instanceof TFile)) throw new Error("the goal note could not be found");
+        const path = await this.archiveGoalNote(goal.file);
+        new Notice(`Archived ${name} to ${path}.`);
+        this.refreshDailyBudgetView();
+        if (typeof onDone === "function") await onDone();
+      },
+    });
+    modal.open();
+    return modal;
+  },
+
+  openGoalDueDate(goal, onDone) {
+    const modal = new GoalDueDateModal(this.app, {
+      name: goal.goalName || goal.goalKey,
+      dueDate: goal.dueDate || "",
+      onSave: async (date) => {
+        await this.setGoalDueDate(goal, date);
+        if (typeof onDone === "function") await onDone();
+      },
+    });
+    modal.open();
+    return modal;
+  },
+
+  async setGoalDueDate(goal, date) {
+    const due = core.parseIsoDate(date);
+    if (!due) throw new Error("that isn't a date");
+    if (!(goal.file instanceof TFile)) throw new Error("the goal note could not be found");
+    const content = await this.app.vault.read(goal.file);
+    const next = updateFrontmatterValue(content, "due_date", due);
+    if (next !== content) await _ftModify(this.app, goal.file, next);
+    new Notice(`${goal.goalName || goal.goalKey} is now due ${due}.`);
+    this.refreshDailyBudgetView();
+  },
+});
 // --- Bills list -----------------------------------------------------------------
 // Plugin methods for the bill-notes model, kept out of the main class body, which
 // was already six thousand lines. Attached to the prototype so they read exactly
@@ -15134,6 +15431,8 @@ Object.assign(FinanceTrackerPlugin.prototype, {
 
   async renderHubGoals(host, view) {
     const toolbar = host.createDiv({ cls: "finance-hub-toolbar" });
+    addAction(toolbar, "Contribute", () => this.openContribute({ onDone: () => view.refresh() }), { primary: true, opensModal: true });
+    addAction(toolbar, "Withdraw", () => this.openContribute({ mode: "withdraw", onDone: () => view.refresh() }), { opensModal: true });
     addAction(toolbar, "New goal", () => new SavingsGoalModal(this.app, this, async () => view.refresh()).open(), {
       opensModal: true,
     });
@@ -15143,6 +15442,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
       await view.refresh();
     }, { errorPrefix: "Trip mode" });
 
+    await this.renderGoalPrompts(host, { rerender: () => view.refresh() });
     await this.renderGoalsBlock("", host.createDiv(), { sourcePath: "" });
 
     const today = core.todayIsoLocal();
@@ -17729,96 +18029,157 @@ class SetupWizardModal extends Modal {
   }
 }
 
+// Contributions and withdrawals share one dialog: the same goal, amount and
+// date, differing only in the tag written and, for a withdrawal, what the money
+// was spent on. The goal is typed with autocomplete rather than picked from a
+// dropdown, which on a phone meant scrolling a native picker of every goal.
 class ContributeGoalModal extends Modal {
   constructor(app, plugin, options = {}) {
     super(app);
     this.plugin = plugin;
     this.goalKey = core.normalizeCategoryPath(options.goalKey || "");
+    this.mode = options.mode === "withdraw" ? "withdraw" : "contribute";
     this.onDone = options.onDone;
     this.form = { amount: "", date: core.todayIsoLocal(), note: "" };
+    this.goals = [];
+  }
+
+  findGoal(text) {
+    const needle = String(text || "").trim().toLowerCase();
+    if (!needle) return null;
+    return (
+      this.goals.find((goal) => goal.goalName.toLowerCase() === needle) ||
+      this.goals.find((goal) => goal.goalKey === core.normalizeCategoryPath(needle)) ||
+      null
+    );
   }
 
   async onOpen() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl("h2", { text: "Contribute to savings goal" });
-    contentEl.createEl("p", {
-      cls: "finance-tracker-settings-section-copy",
-      text: "Logs a contribution bullet like `- $150.00 #log/income/roadbike` into the chosen day's note. If the money stays in one account, that's fine — the goal is a virtual envelope tracked entirely in your notes.",
-    });
+    this.titleEl?.setText?.("");
+    const heading = contentEl.createEl("h2");
+    const copy = contentEl.createEl("p", { cls: "finance-tracker-settings-section-copy" });
 
-    const goals = await this.plugin.collectSavingsGoalDefinitions();
-    if (!goals.length) {
-      contentEl.createDiv({ cls: "finance-tracker-empty", text: "No goal notes yet — create one first." });
+    this.goals = (await this.plugin.collectSavingsGoalDefinitions()).filter((goal) => !goal.isLegacyRunwayNote);
+    if (!this.goals.length) {
+      heading.setText("Contribute to a goal");
+      contentEl.createDiv({ cls: "finance-tracker-empty", text: "No goals yet. Create one with New goal in the hub, or the Create savings goal command." });
       return;
     }
-    if (!this.goalKey || !goals.some((goal) => goal.goalKey === this.goalKey)) {
-      this.goalKey = goals[0].goalKey;
+    const known = await this.plugin.collectKnownSuggestions();
+
+    const modeRow = contentEl.createDiv({ cls: "finance-hub-chips finance-goal-mode" });
+    const modeButtons = {};
+    for (const [key, label] of [["contribute", "Contribute"], ["withdraw", "Withdraw"]]) {
+      modeButtons[key] = modeRow.createEl("button", { cls: "finance-hub-chip", text: label });
+      modeButtons[key].addEventListener("click", () => {
+        this.mode = key;
+        sync();
+      });
     }
 
-    new Setting(contentEl)
-      .setName("Goal")
-      .addDropdown((dropdown) => {
-        for (const goal of goals) {
-          dropdown.addOption(goal.goalKey, `${goal.goalName}${goal.goalType === "holiday" ? " (trip)" : ""}`);
-        }
-        dropdown.setValue(this.goalKey).onChange((value) => {
-          this.goalKey = value;
-        });
-      });
+    const goalRow = contentEl.createDiv({ cls: "finance-edit-row" });
+    goalRow.createEl("label", { cls: "finance-edit-label", text: "Goal" });
+    const goalInput = goalRow.createEl("input", { type: "text", attr: { placeholder: "Start typing a goal", "aria-label": "Goal" } });
+    const preset = this.goals.find((goal) => goal.goalKey === this.goalKey) || (this.goals.length === 1 ? this.goals[0] : null);
+    goalInput.value = preset ? preset.goalName : "";
+    this.goalSuggest = new FinanceSuggest(goalInput, {
+      scope: this.scope,
+      getItems: (query) => {
+        const needle = String(query || "").trim().toLowerCase();
+        return this.goals
+          .filter((goal) => !needle || goal.goalName.toLowerCase().includes(needle) || goal.goalKey.includes(core.normalizeCategoryPath(needle)))
+          .map((goal) => ({ value: goal.goalName, label: goal.goalName, kind: goal.goalType === "holiday" ? "trip" : "goal", hint: goal.goalKey }));
+      },
+    });
 
-    new Setting(contentEl)
-      .setName("Amount")
-      .addText((text) => {
-        text.inputEl.type = "number";
-        text.inputEl.step = "0.01";
-        text.setPlaceholder("150").onChange((value) => {
-          this.form.amount = value;
-        });
-        window.setTimeout(() => text.inputEl.focus(), 0);
-      });
+    const amountRow = contentEl.createDiv({ cls: "finance-edit-row" });
+    amountRow.createEl("label", { cls: "finance-edit-label", text: "Amount" });
+    const amountInput = amountRow.createEl("input", {
+      type: "number",
+      attr: { step: "0.01", min: "0", inputmode: "decimal", placeholder: "150", "aria-label": "Amount" },
+    });
+    amountInput.addEventListener("input", () => {
+      this.form.amount = amountInput.value;
+    });
 
-    new Setting(contentEl)
-      .setName("Date")
-      .addText((text) => {
-        text.inputEl.type = "date";
-        text.setValue(this.form.date).onChange((value) => {
-          this.form.date = core.parseIsoDate(value) || core.todayIsoLocal();
-        });
-      });
+    const categoryLabel = contentEl.createEl("label", { cls: "finance-edit-label", text: "Spent on" });
+    const categoryHost = contentEl.createDiv({ cls: "finance-contribute-category" });
+    const picker = new CategoryPicker(categoryHost, { categories: known.categories, value: "", scope: this.scope });
+    this.picker = picker;
 
-    new Setting(contentEl)
-      .setName("Note")
-      .setDesc("Optional — defaults to \"Contribution to <goal>\".")
-      .addText((text) => {
-        text.setPlaceholder("Payday transfer").onChange((value) => {
-          this.form.note = value;
-        });
-      });
+    const dateRow = contentEl.createDiv({ cls: "finance-edit-row" });
+    dateRow.createEl("label", { cls: "finance-edit-label", text: "Date" });
+    const dateInput = dateRow.createEl("input", { type: "date", attr: { "aria-label": "Date" } });
+    dateInput.value = this.form.date;
+    dateInput.addEventListener("input", () => {
+      this.form.date = core.parseIsoDate(dateInput.value) || core.todayIsoLocal();
+    });
+
+    const noteRow = contentEl.createDiv({ cls: "finance-edit-row" });
+    noteRow.createEl("label", { cls: "finance-edit-label", text: "Note" });
+    const noteInput = noteRow.createEl("input", { type: "text", attr: { placeholder: "Optional", "aria-label": "Note" } });
+    noteInput.addEventListener("input", () => {
+      this.form.note = noteInput.value;
+    });
 
     const actions = contentEl.createDiv({ cls: "finance-tracker-settings-actions" });
-    const saveButton = actions.createEl("button", { text: "Log contribution", cls: "mod-cta" });
+    const saveButton = actions.createEl("button", { cls: "mod-cta" });
+
+    const sync = () => {
+      const withdrawing = this.mode === "withdraw";
+      heading.setText(withdrawing ? "Withdraw from a goal" : "Contribute to a goal");
+      copy.setText(
+        withdrawing
+          ? "Logs spending paid from the goal, like `- $80.00 #log/spending/goal/roadbike/repairs`. It lowers what the goal has saved and stays out of your home spending."
+          : "Logs a contribution like `- $150.00 #log/income/roadbike`. The goal is an envelope tracked in your notes, so no money has to move between accounts."
+      );
+      for (const [key, button] of Object.entries(modeButtons)) {
+        button.toggleClass("is-active", key === this.mode);
+        button.setAttribute("aria-pressed", String(key === this.mode));
+      }
+      categoryLabel.toggleClass("is-hidden", !withdrawing);
+      categoryHost.toggleClass("is-hidden", !withdrawing);
+      saveButton.setText(withdrawing ? "Log withdrawal" : "Log contribution");
+    };
+    sync();
+
     saveButton.addEventListener("click", async () => {
+      const goal = this.findGoal(goalInput.value);
+      if (!goal) {
+        new Notice("Choose one of your goals first.");
+        return;
+      }
       const amount = core.parseNumber(this.form.amount);
       if (!Number.isFinite(amount) || amount <= 0) {
-        new Notice("Enter a contribution amount first.");
+        new Notice("Enter an amount first.");
         return;
       }
       saveButton.disabled = true;
       try {
-        const goal = goals.find((item) => item.goalKey === this.goalKey);
-        await this.plugin.logGoalContribution(this.goalKey, goal?.goalName || this.goalKey, amount, this.form.date, this.form.note);
-        new Notice(`Logged ${core.formatCurrency(amount, this.plugin.settings.defaultCurrency)} to ${goal?.goalName || this.goalKey}`);
+        const money = core.formatCurrency(amount, goal.currency || this.plugin.settings.defaultCurrency);
+        if (this.mode === "withdraw") {
+          await this.plugin.logGoalWithdrawal(goal.goalKey, goal.goalName, amount, this.form.date, this.form.note, picker.getValue());
+          new Notice(`Logged ${money} taken from ${goal.goalName}`);
+        } else {
+          await this.plugin.logGoalContribution(goal.goalKey, goal.goalName, amount, this.form.date, this.form.note);
+          new Notice(`Logged ${money} to ${goal.goalName}`);
+        }
         if (typeof this.onDone === "function") await this.onDone();
         this.close();
       } catch (error) {
-        new Notice(`Contribution failed: ${error.message}`);
+        new Notice(`${this.mode === "withdraw" ? "Withdrawal" : "Contribution"} failed: ${error.message}`);
         saveButton.disabled = false;
       }
     });
+
+    window.setTimeout(() => (preset ? amountInput : goalInput).focus(), 0);
   }
 
   onClose() {
+    this.goalSuggest?.destroy();
+    this.picker?.destroy?.();
     this.contentEl.empty();
   }
 }
@@ -18138,6 +18499,86 @@ class ExportFolderModal extends Modal {
   }
 }
 
+
+// A yes/no for anything that moves or rewrites a note. The body says what will
+// happen and how to undo it; the action runs only on the confirm button.
+class FinanceConfirmModal extends Modal {
+  constructor(app, options = {}) {
+    super(app);
+    this.options = options;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: this.options.title || "Are you sure?" });
+    for (const paragraph of [].concat(this.options.body || [])) {
+      contentEl.createEl("p", { cls: "finance-tracker-settings-section-copy", text: paragraph });
+    }
+    const actions = contentEl.createDiv({ cls: "finance-tracker-settings-actions" });
+    actions.createEl("button", { text: "Cancel" }).addEventListener("click", () => this.close());
+    const confirm = actions.createEl("button", { text: this.options.confirmLabel || "Confirm", cls: "mod-cta" });
+    confirm.addEventListener("click", async () => {
+      confirm.disabled = true;
+      try {
+        await this.options.onConfirm?.();
+        this.close();
+      } catch (error) {
+        new Notice(`${this.options.confirmLabel || "That"} failed: ${error.message}`);
+        confirm.disabled = false;
+      }
+    });
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+class GoalDueDateModal extends Modal {
+  constructor(app, options = {}) {
+    super(app);
+    this.options = options;
+    this.value = options.dueDate || "";
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: `New due date for ${this.options.name}` });
+    contentEl.createEl("p", {
+      cls: "finance-tracker-settings-section-copy",
+      text: "Changes due_date in the goal note. The weekly set-aside is worked out again from the new date.",
+    });
+    const input = contentEl.createEl("input", { type: "date", attr: { "aria-label": "Due date" } });
+    input.addClass("finance-tracker-holiday-input");
+    input.value = this.value;
+    input.addEventListener("input", () => {
+      this.value = input.value;
+    });
+    const actions = contentEl.createDiv({ cls: "finance-tracker-settings-actions" });
+    actions.createEl("button", { text: "Cancel" }).addEventListener("click", () => this.close());
+    const save = actions.createEl("button", { text: "Save", cls: "mod-cta" });
+    save.addEventListener("click", async () => {
+      if (!core.parseIsoDate(this.value)) {
+        new Notice("Pick a date first.");
+        return;
+      }
+      save.disabled = true;
+      try {
+        await this.options.onSave?.(this.value);
+        this.close();
+      } catch (error) {
+        new Notice(`Saving the due date failed: ${error.message}`);
+        save.disabled = false;
+      }
+    });
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
 class FinanceTrackerSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);

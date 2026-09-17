@@ -72,6 +72,10 @@ const DEFAULT_SETTINGS = {
   autoLogRecurring: false,
   quickAddUseNoteDate: false,
   tripModeActive: false,
+  // Goal and trip prompts: key → the day "Not now" was pressed, and keys
+  // dismissed for good.
+  promptSnoozes: {},
+  dismissedPrompts: [],
   activeTripGoalPath: "",
   schemaVersion: 1,
 };

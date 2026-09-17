@@ -2956,3 +2956,61 @@ test("period titles read like headings", () => {
   assert.equal(core.describePeriodTitle({ period: "year", start: "2026-01-01", end: "2026-12-31" }), "2026");
   assert.equal(core.describePeriodTitle({ period: "month", start: "2026-09-05", end: "2026-09-14" }), "5 Sep 2026 to 14 Sep 2026");
 });
+
+// --- Goal and trip prompts ------------------------------------------------------------
+
+test("a goal with nothing to measure pace from is not called on track", () => {
+  const empty = core.computeSinkingFund({ targetAmount: 2000, currentSaved: 0, dueDate: "2026-09-18", referenceDate: "2026-09-17" });
+  assert.equal(empty.status, "not-started");
+  const started = core.computeSinkingFund({ targetAmount: 2000, currentSaved: 300, dueDate: "2026-12-18", referenceDate: "2026-09-17" });
+  assert.equal(started.status, "saving");
+  const paced = core.computeSinkingFund({
+    targetAmount: 2000,
+    currentSaved: 0,
+    dueDate: "2026-09-18",
+    referenceDate: "2026-09-17",
+    anchorDate: "2026-08-01",
+  });
+  assert.equal(paced.status, "behind");
+});
+
+test("goal prompts: due today, due soon, target reached", () => {
+  const goals = [
+    { goalKey: "iphone", goalName: "iPhone", goalType: "general", targetAmount: 2000, currentSaved: 0, dueDate: "2026-09-18" },
+    { goalKey: "bike", goalName: "Bike", goalType: "general", targetAmount: 900, currentSaved: 950, dueDate: "2026-12-01" },
+    { goalKey: "laptop", goalName: "Laptop", goalType: "general", targetAmount: 3000, currentSaved: 1000, dueDate: "2027-03-01" },
+    { goalKey: "old", goalName: "Old", goalType: "general", targetAmount: 100, currentSaved: 0, dueDate: "2026-01-01", archivedDate: "2026-02-01" },
+  ];
+  const tomorrow = core.buildGoalPrompts(goals, { referenceDate: "2026-09-17" });
+  assert.deepEqual(tomorrow.map((prompt) => prompt.kind), ["goal-complete", "goal-due-soon"]);
+  assert.equal(tomorrow[1].title, "iPhone is due tomorrow");
+  assert.match(tomorrow[1].detail, /\$0\.00 of \$2,000\.00 saved/);
+
+  const onTheDay = core.buildGoalPrompts(goals, { referenceDate: "2026-09-18" });
+  const due = onTheDay.find((prompt) => prompt.kind === "goal-due");
+  assert.equal(due.title, "iPhone is due today");
+  assert.equal(due.key, "goal-due:iphone:2026-09-18");
+
+  const later = core.buildGoalPrompts(goals, { referenceDate: "2026-09-25" });
+  assert.equal(later.find((prompt) => prompt.kind === "goal-due").title, "iPhone was due 2026-09-18");
+});
+
+test("goal prompts can be snoozed for the day or dismissed for good", () => {
+  const goals = [{ goalKey: "iphone", goalName: "iPhone", targetAmount: 2000, currentSaved: 0, dueDate: "2026-09-18" }];
+  const key = "goal-due:iphone:2026-09-18";
+  assert.equal(core.buildGoalPrompts(goals, { referenceDate: "2026-09-18", snoozed: { [key]: "2026-09-18" } }).length, 0);
+  assert.equal(core.buildGoalPrompts(goals, { referenceDate: "2026-09-19", snoozed: { [key]: "2026-09-18" } }).length, 1, "back the next day");
+  assert.equal(core.buildGoalPrompts(goals, { referenceDate: "2026-09-19", dismissed: [key] }).length, 0);
+  const moved = [{ ...goals[0], dueDate: "2026-10-18" }];
+  assert.equal(core.buildGoalPrompts(moved, { referenceDate: "2026-10-18", dismissed: [key] }).length, 1, "a new due date asks again");
+});
+
+test("trip prompts: start, end while trip mode is on, archive once it's off", () => {
+  const trip = { goalKey: "japan", goalName: "Japan", goalType: "holiday", startDate: "2026-10-01", endDate: "2026-10-14" };
+  assert.equal(core.buildGoalPrompts([trip], { referenceDate: "2026-09-30" }).length, 0);
+  const starting = core.buildGoalPrompts([trip], { referenceDate: "2026-10-01" });
+  assert.deepEqual(starting.map((prompt) => [prompt.kind, prompt.title]), [["trip-start", "Japan starts today"]]);
+  assert.equal(core.buildGoalPrompts([{ ...trip, tripModeOn: true }], { referenceDate: "2026-10-05" }).length, 0);
+  assert.equal(core.buildGoalPrompts([{ ...trip, tripModeOn: true }], { referenceDate: "2026-10-15" })[0].kind, "trip-end");
+  assert.equal(core.buildGoalPrompts([trip], { referenceDate: "2026-10-15" })[0].kind, "trip-archive");
+});

@@ -555,96 +555,157 @@ class SetupWizardModal extends Modal {
   }
 }
 
+// Contributions and withdrawals share one dialog: the same goal, amount and
+// date, differing only in the tag written and, for a withdrawal, what the money
+// was spent on. The goal is typed with autocomplete rather than picked from a
+// dropdown, which on a phone meant scrolling a native picker of every goal.
 class ContributeGoalModal extends Modal {
   constructor(app, plugin, options = {}) {
     super(app);
     this.plugin = plugin;
     this.goalKey = core.normalizeCategoryPath(options.goalKey || "");
+    this.mode = options.mode === "withdraw" ? "withdraw" : "contribute";
     this.onDone = options.onDone;
     this.form = { amount: "", date: core.todayIsoLocal(), note: "" };
+    this.goals = [];
+  }
+
+  findGoal(text) {
+    const needle = String(text || "").trim().toLowerCase();
+    if (!needle) return null;
+    return (
+      this.goals.find((goal) => goal.goalName.toLowerCase() === needle) ||
+      this.goals.find((goal) => goal.goalKey === core.normalizeCategoryPath(needle)) ||
+      null
+    );
   }
 
   async onOpen() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl("h2", { text: "Contribute to savings goal" });
-    contentEl.createEl("p", {
-      cls: "finance-tracker-settings-section-copy",
-      text: "Logs a contribution bullet like `- $150.00 #log/income/roadbike` into the chosen day's note. If the money stays in one account, that's fine — the goal is a virtual envelope tracked entirely in your notes.",
-    });
+    this.titleEl?.setText?.("");
+    const heading = contentEl.createEl("h2");
+    const copy = contentEl.createEl("p", { cls: "finance-tracker-settings-section-copy" });
 
-    const goals = await this.plugin.collectSavingsGoalDefinitions();
-    if (!goals.length) {
-      contentEl.createDiv({ cls: "finance-tracker-empty", text: "No goal notes yet — create one first." });
+    this.goals = (await this.plugin.collectSavingsGoalDefinitions()).filter((goal) => !goal.isLegacyRunwayNote);
+    if (!this.goals.length) {
+      heading.setText("Contribute to a goal");
+      contentEl.createDiv({ cls: "finance-tracker-empty", text: "No goals yet. Create one with New goal in the hub, or the Create savings goal command." });
       return;
     }
-    if (!this.goalKey || !goals.some((goal) => goal.goalKey === this.goalKey)) {
-      this.goalKey = goals[0].goalKey;
+    const known = await this.plugin.collectKnownSuggestions();
+
+    const modeRow = contentEl.createDiv({ cls: "finance-hub-chips finance-goal-mode" });
+    const modeButtons = {};
+    for (const [key, label] of [["contribute", "Contribute"], ["withdraw", "Withdraw"]]) {
+      modeButtons[key] = modeRow.createEl("button", { cls: "finance-hub-chip", text: label });
+      modeButtons[key].addEventListener("click", () => {
+        this.mode = key;
+        sync();
+      });
     }
 
-    new Setting(contentEl)
-      .setName("Goal")
-      .addDropdown((dropdown) => {
-        for (const goal of goals) {
-          dropdown.addOption(goal.goalKey, `${goal.goalName}${goal.goalType === "holiday" ? " (trip)" : ""}`);
-        }
-        dropdown.setValue(this.goalKey).onChange((value) => {
-          this.goalKey = value;
-        });
-      });
+    const goalRow = contentEl.createDiv({ cls: "finance-edit-row" });
+    goalRow.createEl("label", { cls: "finance-edit-label", text: "Goal" });
+    const goalInput = goalRow.createEl("input", { type: "text", attr: { placeholder: "Start typing a goal", "aria-label": "Goal" } });
+    const preset = this.goals.find((goal) => goal.goalKey === this.goalKey) || (this.goals.length === 1 ? this.goals[0] : null);
+    goalInput.value = preset ? preset.goalName : "";
+    this.goalSuggest = new FinanceSuggest(goalInput, {
+      scope: this.scope,
+      getItems: (query) => {
+        const needle = String(query || "").trim().toLowerCase();
+        return this.goals
+          .filter((goal) => !needle || goal.goalName.toLowerCase().includes(needle) || goal.goalKey.includes(core.normalizeCategoryPath(needle)))
+          .map((goal) => ({ value: goal.goalName, label: goal.goalName, kind: goal.goalType === "holiday" ? "trip" : "goal", hint: goal.goalKey }));
+      },
+    });
 
-    new Setting(contentEl)
-      .setName("Amount")
-      .addText((text) => {
-        text.inputEl.type = "number";
-        text.inputEl.step = "0.01";
-        text.setPlaceholder("150").onChange((value) => {
-          this.form.amount = value;
-        });
-        window.setTimeout(() => text.inputEl.focus(), 0);
-      });
+    const amountRow = contentEl.createDiv({ cls: "finance-edit-row" });
+    amountRow.createEl("label", { cls: "finance-edit-label", text: "Amount" });
+    const amountInput = amountRow.createEl("input", {
+      type: "number",
+      attr: { step: "0.01", min: "0", inputmode: "decimal", placeholder: "150", "aria-label": "Amount" },
+    });
+    amountInput.addEventListener("input", () => {
+      this.form.amount = amountInput.value;
+    });
 
-    new Setting(contentEl)
-      .setName("Date")
-      .addText((text) => {
-        text.inputEl.type = "date";
-        text.setValue(this.form.date).onChange((value) => {
-          this.form.date = core.parseIsoDate(value) || core.todayIsoLocal();
-        });
-      });
+    const categoryLabel = contentEl.createEl("label", { cls: "finance-edit-label", text: "Spent on" });
+    const categoryHost = contentEl.createDiv({ cls: "finance-contribute-category" });
+    const picker = new CategoryPicker(categoryHost, { categories: known.categories, value: "", scope: this.scope });
+    this.picker = picker;
 
-    new Setting(contentEl)
-      .setName("Note")
-      .setDesc("Optional — defaults to \"Contribution to <goal>\".")
-      .addText((text) => {
-        text.setPlaceholder("Payday transfer").onChange((value) => {
-          this.form.note = value;
-        });
-      });
+    const dateRow = contentEl.createDiv({ cls: "finance-edit-row" });
+    dateRow.createEl("label", { cls: "finance-edit-label", text: "Date" });
+    const dateInput = dateRow.createEl("input", { type: "date", attr: { "aria-label": "Date" } });
+    dateInput.value = this.form.date;
+    dateInput.addEventListener("input", () => {
+      this.form.date = core.parseIsoDate(dateInput.value) || core.todayIsoLocal();
+    });
+
+    const noteRow = contentEl.createDiv({ cls: "finance-edit-row" });
+    noteRow.createEl("label", { cls: "finance-edit-label", text: "Note" });
+    const noteInput = noteRow.createEl("input", { type: "text", attr: { placeholder: "Optional", "aria-label": "Note" } });
+    noteInput.addEventListener("input", () => {
+      this.form.note = noteInput.value;
+    });
 
     const actions = contentEl.createDiv({ cls: "finance-tracker-settings-actions" });
-    const saveButton = actions.createEl("button", { text: "Log contribution", cls: "mod-cta" });
+    const saveButton = actions.createEl("button", { cls: "mod-cta" });
+
+    const sync = () => {
+      const withdrawing = this.mode === "withdraw";
+      heading.setText(withdrawing ? "Withdraw from a goal" : "Contribute to a goal");
+      copy.setText(
+        withdrawing
+          ? "Logs spending paid from the goal, like `- $80.00 #log/spending/goal/roadbike/repairs`. It lowers what the goal has saved and stays out of your home spending."
+          : "Logs a contribution like `- $150.00 #log/income/roadbike`. The goal is an envelope tracked in your notes, so no money has to move between accounts."
+      );
+      for (const [key, button] of Object.entries(modeButtons)) {
+        button.toggleClass("is-active", key === this.mode);
+        button.setAttribute("aria-pressed", String(key === this.mode));
+      }
+      categoryLabel.toggleClass("is-hidden", !withdrawing);
+      categoryHost.toggleClass("is-hidden", !withdrawing);
+      saveButton.setText(withdrawing ? "Log withdrawal" : "Log contribution");
+    };
+    sync();
+
     saveButton.addEventListener("click", async () => {
+      const goal = this.findGoal(goalInput.value);
+      if (!goal) {
+        new Notice("Choose one of your goals first.");
+        return;
+      }
       const amount = core.parseNumber(this.form.amount);
       if (!Number.isFinite(amount) || amount <= 0) {
-        new Notice("Enter a contribution amount first.");
+        new Notice("Enter an amount first.");
         return;
       }
       saveButton.disabled = true;
       try {
-        const goal = goals.find((item) => item.goalKey === this.goalKey);
-        await this.plugin.logGoalContribution(this.goalKey, goal?.goalName || this.goalKey, amount, this.form.date, this.form.note);
-        new Notice(`Logged ${core.formatCurrency(amount, this.plugin.settings.defaultCurrency)} to ${goal?.goalName || this.goalKey}`);
+        const money = core.formatCurrency(amount, goal.currency || this.plugin.settings.defaultCurrency);
+        if (this.mode === "withdraw") {
+          await this.plugin.logGoalWithdrawal(goal.goalKey, goal.goalName, amount, this.form.date, this.form.note, picker.getValue());
+          new Notice(`Logged ${money} taken from ${goal.goalName}`);
+        } else {
+          await this.plugin.logGoalContribution(goal.goalKey, goal.goalName, amount, this.form.date, this.form.note);
+          new Notice(`Logged ${money} to ${goal.goalName}`);
+        }
         if (typeof this.onDone === "function") await this.onDone();
         this.close();
       } catch (error) {
-        new Notice(`Contribution failed: ${error.message}`);
+        new Notice(`${this.mode === "withdraw" ? "Withdrawal" : "Contribution"} failed: ${error.message}`);
         saveButton.disabled = false;
       }
     });
+
+    window.setTimeout(() => (preset ? amountInput : goalInput).focus(), 0);
   }
 
   onClose() {
+    this.goalSuggest?.destroy();
+    this.picker?.destroy?.();
     this.contentEl.empty();
   }
 }

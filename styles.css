@@ -1799,3 +1799,19 @@
   .finance-hub-body { padding: 8px 10px 24px; }
   .finance-hub-toolbar { gap: 6px; }
 }
+
+/* ---- Goal and trip prompts ---- */
+.finance-prompts { border-left: 3px solid var(--interactive-accent); }
+.finance-prompt + .finance-prompt {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+.finance-prompt-title { font-weight: var(--font-semibold); }
+.finance-prompt .finance-tracker-header-actions { margin-top: 6px; flex-wrap: wrap; }
+.finance-prompt.is-goal-due .finance-prompt-title,
+.finance-prompt.is-trip-end .finance-prompt-title { color: var(--text-warning); }
+
+.finance-goal-mode { margin-bottom: 10px; }
+.finance-edit-label.is-hidden,
+.finance-contribute-category.is-hidden { display: none; }

@@ -2643,9 +2643,112 @@ function computeSinkingFund(input = {}) {
     const elapsed = Math.min(daysBetweenInclusive(anchorDate, referenceDate) - 1, totalSpan);
     expectedByNow = roundCurrencyAmount((targetAmount * elapsed) / Math.max(totalSpan, 1));
     status = currentSaved >= expectedByNow ? "ahead" : "behind";
+  } else if (status === "on-track") {
+    // With nothing to measure pace from there is no pace to be on. This used to
+    // fall through to "on track", which is how a goal with $0 of $2,000 saved,
+    // due tomorrow, described itself.
+    status = currentSaved > 0 ? "saving" : "not-started";
   }
 
   return { currentSaved, daysLeft, expectedByNow, remaining, requiredPerWeek, status, targetAmount, weeksLeft };
+}
+
+// --- Goal and trip prompts ------------------------------------------------------
+// Moments a goal or trip needs a decision: a goal reaching its target or its due
+// date, a trip starting or ending. Each prompt has a key that includes the date
+// it is about, so dismissing "iPhone is due 18 Sep" doesn't also silence the
+// same goal once its due date moves. "Not now" hides a prompt for the rest of
+// the day; dismissing hides that key for good.
+
+const GOAL_DUE_SOON_DAYS = 3;
+
+function buildGoalPrompts(goals, options = {}) {
+  const referenceDate = parseIsoDate(options.referenceDate) || todayIsoLocal();
+  const dismissed = new Set(options.dismissed || []);
+  const snoozed = options.snoozed || {};
+  const currency = options.currency || "AUD";
+  const prompts = [];
+  const add = (prompt) => {
+    if (dismissed.has(prompt.key) || snoozed[prompt.key] === referenceDate) return;
+    prompts.push(prompt);
+  };
+
+  for (const goal of goals || []) {
+    if (!goal || goal.archivedDate) continue;
+    const key = normalizeCategoryPath(goal.goalKey || "");
+    if (!key) continue;
+    const name = goal.goalName || titleCaseSegment(key);
+    const money = (value) => formatCurrency(value, goal.currency || currency);
+
+    if (goal.goalType === "holiday") {
+      const start = parseIsoDate(goal.startDate || "");
+      const end = parseIsoDate(goal.endDate || "");
+      if (start && start <= referenceDate && (!end || referenceDate <= end) && !goal.tripModeOn) {
+        add({
+          key: `trip-start:${key}:${start}`,
+          kind: "trip-start",
+          goal,
+          title: start === referenceDate ? `${name} starts today` : `${name} is under way`,
+          detail: "Turn on trip mode so captures go to the trip, in its currency.",
+        });
+      }
+      if (end && referenceDate > end && goal.tripModeOn) {
+        add({
+          key: `trip-end:${key}:${end}`,
+          kind: "trip-end",
+          goal,
+          title: `${name} ended ${end}`,
+          detail: "Trip mode is still on, so new captures are still going to the trip.",
+        });
+      } else if (end && referenceDate > end && !goal.tripModeOn) {
+        add({
+          key: `trip-archive:${key}:${end}`,
+          kind: "trip-archive",
+          goal,
+          title: `${name} is over`,
+          detail: "Archiving writes a summary of what it cost into the note and moves it to the archive folder.",
+        });
+      }
+      continue;
+    }
+
+    const target = Number(goal.targetAmount) || 0;
+    const saved = Number(goal.currentSaved) || 0;
+    const due = parseIsoDate(goal.dueDate || "");
+    if (target > 0 && saved >= target) {
+      add({
+        key: `goal-complete:${key}:${target}`,
+        kind: "goal-complete",
+        goal,
+        title: `${name} reached its target`,
+        detail: `${money(saved)} saved of ${money(target)}.`,
+      });
+      continue;
+    }
+    if (!due) continue;
+    const progress = target > 0 ? `${money(saved)} of ${money(target)} saved` : `${money(saved)} saved`;
+    if (due <= referenceDate) {
+      add({
+        key: `goal-due:${key}:${due}`,
+        kind: "goal-due",
+        goal,
+        title: due === referenceDate ? `${name} is due today` : `${name} was due ${due}`,
+        detail: `${progress}. Archive it if it's done, or give it a new due date.`,
+      });
+    } else if (daysBetweenInclusive(referenceDate, due) - 1 <= GOAL_DUE_SOON_DAYS) {
+      const days = daysBetweenInclusive(referenceDate, due) - 1;
+      add({
+        key: `goal-due-soon:${key}:${due}`,
+        kind: "goal-due-soon",
+        goal,
+        title: `${name} is due ${days === 1 ? "tomorrow" : `in ${days} days`}`,
+        detail: `${progress}.`,
+      });
+    }
+  }
+
+  const order = ["trip-end", "trip-start", "goal-due", "goal-complete", "goal-due-soon", "trip-archive"];
+  return prompts.sort((left, right) => order.indexOf(left.kind) - order.indexOf(right.kind));
 }
 
 // --- Split expenses ----------------------------------------------------------
@@ -5597,6 +5700,7 @@ module.exports = {
   detectRecurringPayments,
   parseGoalDefinition,
   computeSinkingFund,
+  buildGoalPrompts,
   parseOwedChildLine,
   buildOwedChildLine,
   buildOwedSharesFromTokens,
