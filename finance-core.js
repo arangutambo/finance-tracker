@@ -4930,6 +4930,139 @@ function computeXirr(cashflows) {
   return null;
 }
 
+// --- Price sources ----------------------------------------------------------------
+//
+// Where share prices come from is a setting, not an assumption. Free sources for
+// Australian shares are thin: Yahoo is free and covers the ASX but is unofficial
+// and rate-limits; a Google Sheet using GOOGLEFINANCE is reliable and yours, but
+// needs setting up once; and a price typed by hand always works. These parsers
+// turn each source's response into one shape, so the rest of the plugin never
+// knows which it was.
+//
+//   quote:   { price, previousClose, currency, name, type, exchange, time }
+//   history: [{ date, close }] ascending
+//   dividends: [{ date, amount }]
+
+function isoFromUnixSeconds(seconds) {
+  const value = Number(seconds);
+  if (!Number.isFinite(value)) return "";
+  return todayIsoLocal(new Date(value * 1000));
+}
+
+// query1.finance.yahoo.com/v8/finance/chart/<SYMBOL>?range=…&interval=1d&events=div
+function parseYahooChart(json) {
+  const result = json?.chart?.result?.[0];
+  if (!result) {
+    const message = json?.chart?.error?.description || "no chart data";
+    return { error: message };
+  }
+  const meta = result.meta || {};
+  const timestamps = result.timestamp || [];
+  const closes = result.indicators?.quote?.[0]?.close || [];
+  const history = [];
+  timestamps.forEach((seconds, index) => {
+    const close = Number(closes[index]);
+    if (close > 0) history.push({ date: isoFromUnixSeconds(seconds), close: Number(close.toFixed(4)) });
+  });
+  const dividends = Object.values(result.events?.dividends || {})
+    .map((dividend) => ({ date: isoFromUnixSeconds(dividend.date), amount: Number(dividend.amount) }))
+    .filter((dividend) => dividend.date && dividend.amount > 0)
+    .sort((left, right) => left.date.localeCompare(right.date));
+
+  const price = Number(meta.regularMarketPrice);
+  return {
+    quote: price > 0
+      ? {
+          currency: normalizeCurrency(meta.currency || "", ""),
+          exchange: meta.exchangeName || meta.fullExchangeName || "",
+          name: meta.longName || meta.shortName || meta.symbol || "",
+          previousClose: Number(meta.chartPreviousClose ?? meta.previousClose) || null,
+          price,
+          time: isoFromUnixSeconds(meta.regularMarketTime),
+          type: meta.instrumentType || "",
+        }
+      : null,
+    history,
+    dividends,
+  };
+}
+
+// query2.finance.yahoo.com/v1/finance/search?q=…
+function parseYahooSearch(json) {
+  return (json?.quotes || [])
+    .filter((quote) => quote?.symbol && ["EQUITY", "ETF", "MUTUALFUND", "INDEX"].includes(String(quote.quoteType || "").toUpperCase()))
+    .map((quote) => ({
+      exchange: quote.exchDisp || quote.exchange || "",
+      name: quote.longname || quote.shortname || quote.symbol,
+      symbol: normalizeTicker(quote.symbol),
+      type: String(quote.quoteType || "").toUpperCase(),
+    }));
+}
+
+// A published Google Sheet, as CSV: one row per ticker, headed Ticker and Price,
+// optionally Currency, Name and Previous close. Exchange-rate rows use a ticker
+// like USDAUD and give the AUD value of one unit as the price.
+function parseSheetPrices(csvText) {
+  const rows = parseCsvRows(csvText);
+  if (rows.length < 2) return { quotes: {}, fx: {} };
+  const header = rows[0].map((cell) => normalizeWhitespace(cell).toLowerCase());
+  const column = (...names) => header.findIndex((name) => names.includes(name));
+  const tickerCol = column("ticker", "symbol", "code");
+  const priceCol = column("price", "last", "close");
+  const currencyCol = column("currency", "ccy");
+  const nameCol = column("name", "description");
+  const previousCol = column("previous close", "previousclose", "prev close", "closeyest");
+  if (tickerCol < 0 || priceCol < 0) return { quotes: {}, fx: {}, error: "The sheet needs Ticker and Price columns." };
+
+  const quotes = {};
+  const fx = {};
+  for (const cells of rows.slice(1)) {
+    const ticker = normalizeTicker(cells[tickerCol]);
+    const price = parseNumber(cells[priceCol]);
+    if (!ticker || !(price > 0)) continue;
+    const fxMatch = ticker.match(/^([A-Z]{3})AUD$/);
+    if (fxMatch) {
+      fx[fxMatch[1]] = price;
+      continue;
+    }
+    quotes[ticker] = {
+      currency: normalizeCurrency(currencyCol >= 0 ? cells[currencyCol] : "", tickerMarket(ticker) === "US" ? "USD" : "AUD"),
+      name: nameCol >= 0 ? normalizeWhitespace(cells[nameCol]) : "",
+      previousClose: previousCol >= 0 ? parseNumber(cells[previousCol]) || null : null,
+      price,
+    };
+  }
+  return { quotes, fx };
+}
+
+// The formula a sheet row needs, so setting one up is copy and paste.
+function sheetFormulaForTicker(ticker) {
+  const symbol = normalizeTicker(ticker);
+  if (/^[A-Z]{3}AUD$/.test(symbol)) return `=GOOGLEFINANCE("CURRENCY:${symbol}")`;
+  if (symbol.endsWith(".AX")) return `=GOOGLEFINANCE("ASX:${symbol.slice(0, -3)}")`;
+  return `=GOOGLEFINANCE("${symbol}")`;
+}
+
+// Which cached quotes are too old to trust as current. Shown with a stale badge
+// rather than dropped: yesterday's price is still far better than none.
+function markStaleQuotes(quotes, options = {}) {
+  const now = Number(options.now) || Date.now();
+  const maxAgeMs = Math.max(1, Number(options.maxAgeMinutes) || 60) * 60 * 1000;
+  const out = {};
+  for (const [ticker, quote] of Object.entries(quotes || {})) {
+    const fetched = Date.parse(quote?.fetchedAt || "");
+    out[ticker] = { ...quote, stale: quote?.source !== "manual" && (!Number.isFinite(fetched) || now - fetched > maxAgeMs) };
+  }
+  return out;
+}
+
+// Exponential backoff after a refusal: 2, 4, 8 … minutes, capped at six hours.
+function nextBackoff(previousFailures, now = Date.now()) {
+  const failures = Math.max(1, Number(previousFailures) + 1 || 1);
+  const minutes = Math.min(360, Math.pow(2, failures));
+  return { failures, until: new Date(now + minutes * 60 * 1000).toISOString(), minutes };
+}
+
 module.exports = {
   RECURRING_CADENCES,
   RECURRING_REGISTRY_COLUMNS,
@@ -4949,6 +5082,12 @@ module.exports = {
   unitsHeldOn,
   buildPortfolioValueSeries,
   computeXirr,
+  parseYahooChart,
+  parseYahooSearch,
+  parseSheetPrices,
+  sheetFormulaForTicker,
+  markStaleQuotes,
+  nextBackoff,
   planBillsFromLegacy,
   parseBillDueRule,
   serializeBillDueRule,

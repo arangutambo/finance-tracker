@@ -2647,3 +2647,99 @@ test("computeXirr annualises dated cash flows", () => {
   assert.equal(core.computeXirr([{ date: "2025-01-01", amount: -1000 }, { date: "2026-01-01", amount: 1100 }]), 0.1);
   assert.equal(core.computeXirr([{ date: "2025-01-01", amount: -1000 }]), null, "one flow has no return");
 });
+
+// Shaped exactly like the responses verified on 15 September 2026.
+const YAHOO_CHART_FIXTURE = {
+  chart: {
+    result: [
+      {
+        meta: {
+          currency: "AUD",
+          symbol: "VAS.AX",
+          exchangeName: "ASX",
+          instrumentType: "ETF",
+          longName: "Vanguard Australian Shares Index ETF",
+          regularMarketPrice: 103.42,
+          chartPreviousClose: 102.9,
+          regularMarketTime: 1789621200,
+        },
+        timestamp: [1789362000, 1789448400, 1789534800],
+        indicators: { quote: [{ close: [102.5, null, 103.42] }] },
+        events: { dividends: { 1782820800: { amount: 1.0327, date: 1782820800 } } },
+      },
+    ],
+    error: null,
+  },
+};
+
+test("parseYahooChart reads the quote, closes and dividends", () => {
+  const parsed = core.parseYahooChart(YAHOO_CHART_FIXTURE);
+  assert.equal(parsed.quote.price, 103.42);
+  assert.equal(parsed.quote.previousClose, 102.9);
+  assert.equal(parsed.quote.currency, "AUD");
+  assert.equal(parsed.quote.type, "ETF");
+  assert.equal(parsed.history.length, 2, "a missing close is skipped, not read as zero");
+  assert.equal(parsed.dividends.length, 1);
+  assert.equal(parsed.dividends[0].amount, 1.0327);
+
+  assert.deepEqual(core.parseYahooChart({ chart: { result: null, error: { description: "No data found" } } }), { error: "No data found" });
+  assert.deepEqual(core.parseYahooChart("Too Many Requests"), { error: "no chart data" });
+});
+
+test("parseYahooSearch keeps listed securities and drops the rest", () => {
+  const results = core.parseYahooSearch({
+    quotes: [
+      { symbol: "VAS.AX", longname: "Vanguard Australian Shares Index ETF", exchange: "ASX", exchDisp: "Australian", quoteType: "ETF" },
+      { symbol: "VAP.AX", shortname: "VANGUARD AUSTRALIAN PROPERTY", exchange: "ASX", quoteType: "ETF" },
+      { symbol: "AUDUSD=X", shortname: "AUD/USD", quoteType: "CURRENCY" },
+    ],
+  });
+  assert.deepEqual(results.map((result) => result.symbol), ["VAS.AX", "VAP.AX"]);
+  assert.equal(results[0].exchange, "Australian");
+});
+
+test("parseSheetPrices reads a published sheet, exchange rates included", () => {
+  const csv = [
+    "Ticker,Price,Currency,Name,Previous close",
+    "VAS.AX,103.42,AUD,Vanguard Australian Shares,102.90",
+    "AAPL,229.1,USD,Apple Inc,227.5",
+    "USDAUD,1.512,,,",
+    "BAD,#N/A,,,",
+  ].join("\n");
+  const { quotes, fx } = core.parseSheetPrices(csv);
+  assert.equal(quotes["VAS.AX"].price, 103.42);
+  assert.equal(quotes.AAPL.currency, "USD");
+  assert.equal(quotes.AAPL.previousClose, 227.5);
+  assert.deepEqual(fx, { USD: 1.512 });
+  assert.equal(quotes.BAD, undefined, "an error cell is not a price");
+  assert.match(core.parseSheetPrices("Symbol,Name\nVAS.AX,x").error || "", /Ticker and Price/);
+});
+
+test("sheetFormulaForTicker writes the GOOGLEFINANCE formula for each kind of row", () => {
+  assert.equal(core.sheetFormulaForTicker("VAS.AX"), '=GOOGLEFINANCE("ASX:VAS")');
+  assert.equal(core.sheetFormulaForTicker("AAPL"), '=GOOGLEFINANCE("AAPL")');
+  assert.equal(core.sheetFormulaForTicker("USDAUD"), '=GOOGLEFINANCE("CURRENCY:USDAUD")');
+});
+
+test("old fetched quotes are marked stale, typed prices never are", () => {
+  const now = Date.parse("2026-09-17T10:00:00Z");
+  const quotes = core.markStaleQuotes(
+    {
+      "VAS.AX": { price: 1, source: "yahoo", fetchedAt: "2026-09-17T09:30:00Z" },
+      AAPL: { price: 1, source: "sheet", fetchedAt: "2026-09-16T09:00:00Z" },
+      NDQ: { price: 1, source: "manual" },
+    },
+    { now, maxAgeMinutes: 60 }
+  );
+  assert.equal(quotes["VAS.AX"].stale, false);
+  assert.equal(quotes.AAPL.stale, true);
+  assert.equal(quotes.NDQ.stale, false);
+});
+
+test("backoff doubles after each refusal, up to six hours", () => {
+  const now = Date.parse("2026-09-17T10:00:00Z");
+  assert.equal(core.nextBackoff(0, now).minutes, 2);
+  assert.equal(core.nextBackoff(3, now).minutes, 16);
+  assert.equal(core.nextBackoff(20, now).minutes, 360);
+  assert.equal(core.nextBackoff(0, now).until, "2026-09-17T10:02:00.000Z");
+});

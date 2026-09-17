@@ -62,6 +62,13 @@ const DEFAULT_SETTINGS = {
   excludedRecurringItems: [],
   // Bill suggestions dismissed with Ignore, by suggestion id.
   ignoredBillSuggestions: [],
+  // Portfolio. Prices are typed in unless another source is chosen: "sheet"
+  // (a published Google Sheet) or "yahoo". Both are opt-in network use.
+  portfolioNotePath: "Utility/Finance/📈 Portfolio.md",
+  priceSource: "manual",
+  priceSheetUrl: "",
+  priceRefreshMinutes: 60,
+  marketCache: {},
   autoLogRecurring: false,
   quickAddUseNoteDate: false,
   tripModeActive: false,

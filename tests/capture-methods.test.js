@@ -1461,3 +1461,151 @@ test("auto-log catches a bill note up on missed cycles, and stops", async () => 
   // Nothing left due, so a second pass logs nothing.
   assert.equal(await plugin.logDueRecurringPayments({ notify: false, autoOnly: true, referenceDate: "2026-09-21" }), 0);
 });
+
+// --- Portfolio prices --------------------------------------------------------------------
+
+const PORTFOLIO_NOTE = [
+  "---",
+  "price_overrides: ",
+  "fx_rates: ",
+  "---",
+  "",
+  "## Trades",
+  "",
+  "| Date | Type | Ticker | Units | Price | Fees | Currency | AUD cost | Account | Note |",
+  "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | --- | --- |",
+  "| 2026-03-02 | buy | VAS.AX | 10 | 98 | 9.5 | AUD | | Pearler | |",
+  "| 2026-06-10 | buy | AAPL | 5 | 190 | 2 | USD | 1455.20 | Stake | |",
+  "",
+].join("\n");
+
+async function vaultWithPortfolio(overrides = {}, note = PORTFOLIO_NOTE) {
+  const made = makePlugin({ priceRefreshMinutes: 60, marketCache: {}, ...overrides });
+  delete made.plugin.invalidateIndexEntry;
+  made.plugin._yahooThrottleMs = 0;
+  await made.app.vault.create("Utility/Finance/📈 Portfolio.md", note);
+  return made;
+}
+
+function chartFor(symbol, price, previousClose, currency = "AUD") {
+  return {
+    chart: {
+      result: [
+        {
+          meta: { symbol, currency, regularMarketPrice: price, chartPreviousClose: previousClose, instrumentType: "ETF", longName: `${symbol} name`, regularMarketTime: 1789621200 },
+          timestamp: [1789362000, 1789534800],
+          indicators: { quote: [{ close: [previousClose, price] }] },
+          events: {},
+        },
+      ],
+      error: null,
+    },
+  };
+}
+
+test("with typed prices, the portfolio makes no network requests at all", async () => {
+  const note = PORTFOLIO_NOTE.replace("price_overrides: ", "price_overrides: VAS.AX=100, AAPL=200").replace("fx_rates: ", "fx_rates: USD=1.5");
+  const { plugin } = await vaultWithPortfolio({ priceSource: "manual" }, note);
+  let requests = 0;
+  requestUrlHandler = async () => {
+    requests += 1;
+    return { status: 200, json: {}, text: "" };
+  };
+
+  assert.deepEqual(await plugin.refreshPrices({ force: true }), { skipped: "manual" });
+  const model = await plugin.buildPortfolioModel("2026-09-17");
+
+  assert.equal(requests, 0);
+  assert.equal(model.value.totals.valueAud, 2500, "10 × $100 + 5 × US$200 × 1.5");
+  assert.equal(model.value.rows.find((row) => row.ticker === "AAPL").priceSource, "manual");
+});
+
+test("prices refresh from a published Google Sheet", async () => {
+  const { plugin } = await vaultWithPortfolio({ priceSource: "sheet", priceSheetUrl: "https://docs.google.com/spreadsheets/d/e/abc/pub?output=csv" });
+  const seen = [];
+  requestUrlHandler = async (options) => {
+    seen.push(options.url);
+    return { status: 200, text: "Ticker,Price,Currency,Name\nVAS.AX,103.5,AUD,Vanguard Australian Shares\nAAPL,229,USD,Apple\nUSDAUD,1.52,," };
+  };
+
+  const result = await plugin.refreshPrices({ force: true });
+
+  assert.equal(result.updated, 2);
+  assert.deepEqual(seen, ["https://docs.google.com/spreadsheets/d/e/abc/pub?output=csv"]);
+  const model = await plugin.buildPortfolioModel("2026-09-17");
+  const aapl = model.value.rows.find((row) => row.ticker === "AAPL");
+  assert.equal(aapl.valueAud, 1740.4, "5 × US$229 × 1.52");
+  assert.equal(aapl.priceSource, "sheet");
+  // Inside the refresh interval, nothing is fetched again.
+  assert.deepEqual(await plugin.refreshPrices(), { skipped: "fresh" });
+});
+
+test("prices refresh from Yahoo, exchange rates included", async () => {
+  const { plugin } = await vaultWithPortfolio({ priceSource: "yahoo" });
+  const seen = [];
+  requestUrlHandler = async (options) => {
+    const url = decodeURIComponent(options.url);
+    seen.push(url);
+    if (url.includes("VAS.AX")) return { status: 200, json: chartFor("VAS.AX", 103.42, 102.9) };
+    if (url.includes("AAPL")) return { status: 200, json: chartFor("AAPL", 229.1, 227.5, "USD") };
+    if (url.includes("AUDUSD=X")) return { status: 200, json: chartFor("AUDUSD=X", 0.66, 0.655, "USD") };
+    return { status: 404, json: null };
+  };
+
+  const result = await plugin.refreshPrices({ force: true });
+
+  assert.equal(result.updated, 2);
+  assert.equal(seen.filter((url) => url.includes("AUDUSD=X")).length, 1, "one exchange rate for the one foreign currency");
+  const model = await plugin.buildPortfolioModel("2026-09-17");
+  assert.equal(model.cache.fx.USD, 1.515152, "AUD per US dollar is the inverse of AUDUSD");
+  assert.equal(model.value.rows.find((row) => row.ticker === "VAS.AX").valueAud, 1034.2);
+  assert.ok(model.cache.history["VAS.AX"].length > 0, "closes are kept for the value chart");
+});
+
+test("a source that refuses is backed off, and cached prices are still shown", async () => {
+  const { plugin } = await vaultWithPortfolio({
+    priceSource: "yahoo",
+    marketCache: {
+      quotes: { "VAS.AX": { price: 101, currency: "AUD", source: "yahoo", fetchedAt: "2026-09-10T00:00:00Z" } },
+      fx: { USD: 1.5 },
+    },
+  });
+  let requests = 0;
+  requestUrlHandler = async () => {
+    requests += 1;
+    return { status: 429, json: null, text: "Too Many Requests" };
+  };
+
+  const first = await plugin.refreshPrices({ force: true });
+  assert.equal(first.refused, true);
+  assert.equal(requests, 1, "it stops at the first refusal instead of trying every ticker");
+  assert.ok(Date.parse(plugin.settings.marketCache.backoffUntil) > Date.now());
+
+  // Even a forced refresh waits out the backoff.
+  const second = await plugin.refreshPrices({ force: true });
+  assert.equal(second.skipped, "backoff");
+  assert.equal(requests, 1);
+
+  const model = await plugin.buildPortfolioModel("2026-09-17");
+  const vas = model.value.rows.find((row) => row.ticker === "VAS.AX");
+  assert.equal(vas.valueAud, 1010);
+  assert.equal(vas.stale, true, "an old cached price is shown, and marked as old");
+});
+
+test("ticker search offers what you already hold, and only asks Yahoo when Yahoo is the source", async () => {
+  const { plugin } = await vaultWithPortfolio({ priceSource: "manual" });
+  let requests = 0;
+  requestUrlHandler = async () => {
+    requests += 1;
+    return { status: 200, json: { quotes: [{ symbol: "VGS.AX", longname: "Vanguard MSCI Index International Shares", quoteType: "ETF", exchange: "ASX" }] } };
+  };
+
+  const own = await plugin.searchTickers("va");
+  assert.deepEqual(own.map((result) => result.symbol), ["VAS.AX"]);
+  assert.equal(requests, 0);
+
+  plugin.settings.priceSource = "yahoo";
+  const searched = await plugin.searchTickers("vanguard");
+  assert.deepEqual(searched.map((result) => result.symbol), ["VGS.AX"]);
+  assert.equal(requests, 1);
+});
