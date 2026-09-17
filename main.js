@@ -4714,6 +4714,7 @@ const NETWORTH_BLOCK = "networth-dashboard";
 const QUERY_BLOCK = "finance-query";
 const GOALS_BLOCK = "finance-goals";
 const RUNWAY_BLOCK = "finance-runway";
+const BILL_BLOCK = "finance-bill";
 const DAILY_BUDGET_VIEW = "finance-tracker-daily";
 const FINANCE_INBOX_VIEW = "finance-tracker-inbox";
 // Cadence display names live in core.RECURRING_CADENCES alongside the maths;
@@ -5406,6 +5407,10 @@ class FinanceTrackerPlugin extends Plugin {
       await this.renderRunwayBlock(source, el, ctx);
     });
 
+    this.registerMarkdownCodeBlockProcessor(BILL_BLOCK, async (source, el, ctx) => {
+      await this.renderBillBlock(source, el, ctx);
+    });
+
     this.registerView(DAILY_BUDGET_VIEW, (leaf) => new DailyBudgetView(leaf, this));
     this.registerView(FINANCE_INBOX_VIEW, (leaf) => new FinanceInboxView(leaf, this));
 
@@ -6008,6 +6013,19 @@ class FinanceTrackerPlugin extends Plugin {
       return { skipped: true, reason: "cross-method-duplicate", duplicateOf, expense };
     }
 
+    // A bill first: a capture on the right day, for the right amount, from a
+    // merchant a bill knows, is that bill's payment — more specific than any
+    // merchant rule, and it moves the bill's schedule on.
+    let matchedBill = null;
+    if ((!expense.category || expense.category === "uncategorized") && expense.merchant && options.matchBills !== false) {
+      try {
+        matchedBill = await this.matchCaptureToBill(expense);
+      } catch (error) {
+        console.warn("[finance-tracker] bill matching failed", error);
+      }
+      if (matchedBill) expense.category = core.normalizeCategoryPath(matchedBill.category);
+    }
+
     if ((!expense.category || expense.category === "uncategorized") && expense.merchant) {
       const guessed = await this.guessCategoryForMerchant(expense.merchant);
       if (guessed) expense.category = guessed;
@@ -6068,11 +6086,37 @@ class FinanceTrackerPlugin extends Plugin {
       await this.app.workspace.getLeaf(true).openFile(file);
     }
 
+    if (matchedBill) {
+      this._lastBillMatch = {
+        amount: expense.amount,
+        category: core.normalizeCategoryPath(expense.category),
+        date: expense.date,
+        merchant: expense.merchant || "",
+      };
+      const message = `Filed under ${matchedBill.label}.`;
+      if (typeof createFragment === "function") {
+        new Notice(
+          createFragment((fragment) => {
+            fragment.appendText(`${message} `);
+            const undo = fragment.createEl("a", { text: "Undo", href: "#" });
+            undo.addEventListener("click", async (event) => {
+              event.preventDefault();
+              const undone = await this.undoLastBillMatch();
+              new Notice(undone ? "Moved back to uncategorised." : "That entry has changed since, so it was left alone.");
+            });
+          }),
+          10000
+        );
+      } else {
+        new Notice(message);
+      }
+    }
+
     if (options.notify) {
       new Notice(`Logged ${core.formatCurrency(expense.amount, expense.currency)} to ${expense.date}`);
     }
 
-    return { skipped: false, file, expense };
+    return { skipped: false, file, expense, bill: matchedBill };
   }
 
   // The rolling record of what each transport has captured. It is kept in
@@ -6222,6 +6266,7 @@ class FinanceTrackerPlugin extends Plugin {
   async loadMerchantHistory() {
     if (this._merchantHistory) return this._merchantHistory;
     const history = new Map();
+    const recurringPrefix = core.normalizeCategoryPath(this.settings.recurringTagPrefix || "subscriptions") || "subscriptions";
     for (const entry of await this.collectAllTransactions()) {
       if (entry.entryType === "balance" || entry.isIncome || entry.isGoalContribution) continue;
       // `entry.category` already has any trip prefix split off into holidayKey,
@@ -6229,6 +6274,11 @@ class FinanceTrackerPlugin extends Plugin {
       // and the capture path re-applies the trip prefix only if a trip is on.
       const category = core.normalizeCategoryPath(entry.category || "");
       if (!category || category === "uncategorized") continue;
+      // A bill category is not something to learn from a merchant name. Whether a
+      // charge from Claude is the monthly subscription depends on its amount and
+      // date, which bill matching checks; a merchant rule would file a one-off
+      // $340 purchase as the $34 bill and invent a payment.
+      if (category === recurringPrefix || category.startsWith(`${recurringPrefix}/`)) continue;
       const merchant = String(entry.merchant || "").trim();
       if (!merchant || /^skipped\b/i.test(merchant)) continue;
       const merchantKey = core.normalizeMerchant(merchant);
@@ -10829,10 +10879,20 @@ class FinanceTrackerPlugin extends Plugin {
     if ("nextDue" in patch) next.nextDueOverride = patch.nextDue;
     if ("endDate" in patch) next.endDate = patch.endDate;
     if ("paymentsLeft" in patch) next.paymentsLeft = patch.paymentsLeft;
+    if ("name" in patch) next.name = patch.name;
+    if ("aliases" in patch) next.aliases = patch.aliases;
+    if ("dueRule" in patch) next.dueRule = patch.dueRule;
+    if ("reminderDays" in patch) next.reminderDays = patch.reminderDays;
     return next;
   }
 
   // One entry point for every per-bill change, whichever model is in play.
+  openEditBill(item, onSaved) {
+    const modal = new EditRecurringItemModal(this.app, this, item, onSaved);
+    modal.open();
+    return modal;
+  }
+
   async updateRecurringItem(item, patch = {}) {
     if (item?.billId) {
       await this.updateBill(item.billId, this.billPatchFromItemPatch(patch));
@@ -11098,7 +11158,8 @@ class FinanceTrackerPlugin extends Plugin {
   // day so the cadence anchor never drifts. Loops so an item several periods
   // behind catches all the way up.
   async logDueRecurringPayments(options = {}) {
-    const today = core.todayIsoLocal();
+    // A reference date is only ever passed by tests; the plugin logs up to today.
+    const today = core.parseIsoDate(options.referenceDate) || core.todayIsoLocal();
     let logged = 0;
     for (let pass = 0; pass < 24; pass += 1) {
       const recurring = await this.detectRecurring(today);
@@ -12682,6 +12743,150 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     return bill;
   },
 
+  describeDueRule(rule, cadence) {
+    const ordinal = (value) => {
+      const n = Number(value);
+      const suffix = n % 10 === 1 && n % 100 !== 11 ? "st" : n % 10 === 2 && n % 100 !== 12 ? "nd" : n % 10 === 3 && n % 100 !== 13 ? "rd" : "th";
+      return `${n}${suffix}`;
+    };
+    const weekdays = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    if (rule?.type === "day-of-month") return `on the ${ordinal(rule.day)} of the month`;
+    if (rule?.type === "nth-weekday") {
+      const which = { 1: "first", 2: "second", 3: "third", 4: "fourth", "-1": "last" }[String(rule.ordinal)] || "first";
+      return `on the ${which} ${weekdays[rule.weekday] || "Monday"}`;
+    }
+    return `${cadenceLabel(cadence).toLowerCase()}, counted from the last payment`;
+  },
+
+  // The block inside a bill note: what it costs, when it is next due, its price
+  // history and every payment linked to it. The note is the bill, so this is
+  // where a bill is looked at on its own.
+  async renderBillBlock(source, el, ctx) {
+    el.empty();
+    const referenceDate = core.todayIsoLocal();
+    const currency = core.normalizeCurrency(this.settings.defaultCurrency);
+    const wrapper = el.createDiv({ cls: "finance-tracker-dashboard finance-bill-note" });
+    const rerender = () => this.renderBillBlock(source, el, ctx);
+
+    const recurring = await this.detectRecurring(referenceDate);
+    const item = (recurring.items || []).find((entry) => entry.notePath === ctx.sourcePath);
+    if (!item) {
+      const merged = (await this.loadBills({ includeMerged: true })).find((bill) => bill.notePath === ctx.sourcePath);
+      wrapper.createDiv({
+        cls: "finance-tracker-empty",
+        text: merged?.mergedInto
+          ? `Merged into ${merged.mergedInto}. Payments under this name count toward that bill now.`
+          : "These properties do not describe a bill yet — it needs at least a bill_id and a cadence.",
+      });
+      return;
+    }
+
+    const status =
+      item.status === "finished"
+        ? item.finishedReason === "payments" ? "All payments made" : `Ended ${item.endDate}`
+        : !item.active
+          ? "Paused"
+          : item.status === "overdue"
+            ? `Overdue since ${item.nextDue}`
+            : item.status === "due"
+              ? "Due today"
+              : item.nextDue ? `Due ${item.nextDue}` : "No due date yet";
+
+    renderStatCards(wrapper, [
+      { label: "Next payment", value: core.formatCurrency(item.nextDueAmount ?? item.lastAmount, currency) },
+      { label: "When", value: status, cls: item.status === "overdue" ? "is-over" : "" },
+      { label: "Per month", value: core.formatCurrency(item.monthlyCost, currency) },
+      { label: "Payments logged", value: String(item.count) },
+    ]);
+
+    const about = [this.describeDueRule(item.dueRule, item.cadence)];
+    if (item.variable) about.push("amount varies");
+    if (item.bill?.aliases?.length) about.push(`also known as ${item.bill.aliases.join(", ")}`);
+    wrapper.createDiv({ cls: "finance-tracker-budget-meta", text: about.join(" · ") });
+
+    if (item.active) {
+      const actions = wrapper.createDiv({ cls: "finance-tracker-header-actions" });
+      addAction(
+        actions,
+        "Mark paid",
+        async () => {
+          if (item.variable) {
+            new LogVariableBillModal(this.app, this, item, rerender).open();
+            return;
+          }
+          const date = await this.logRecurringNow(item);
+          new Notice(`Logged ${item.label} for ${date}`);
+          await rerender();
+        },
+        { primary: item.status === "overdue" || item.status === "due", errorPrefix: `Logging ${item.label}`, opensModal: item.variable }
+      );
+      if (item.nextDue) {
+        addAction(
+          actions,
+          "Skip this cycle",
+          async () => {
+            await this.logRecurringSkip(item);
+            await rerender();
+          },
+          { errorPrefix: "Skipping" }
+        );
+      }
+      addAction(actions, "Edit", () => new EditRecurringItemModal(this.app, this, item, rerender).open(), { opensModal: true });
+    }
+
+    const history = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
+    const heading = history.createDiv({ cls: "finance-bill-row-top" });
+    heading.createEl("h4", { text: "Payments" });
+    this.renderBillSparkline(heading, item.payments.map((payment) => payment.amount).slice(-12));
+
+    if (!item.payments.length) {
+      history.createDiv({ cls: "finance-tracker-empty", text: "Nothing logged against this bill yet." });
+    } else {
+      const table = history.createEl("table", { cls: "finance-tracker-table" });
+      const head = table.createEl("thead").createEl("tr");
+      for (const label of ["Date", "Amount", "As written"]) head.createEl("th", { text: label });
+      const body = table.createEl("tbody");
+      for (const payment of item.payments.slice().reverse().slice(0, 24)) {
+        const row = body.createEl("tr");
+        row.createEl("td", { text: payment.date });
+        row.createEl("td", { text: core.formatCurrency(payment.amount, currency), cls: "is-numeric" });
+        row.createEl("td", { text: payment.merchant || "" });
+      }
+    }
+
+    if (item.skipped?.length) {
+      wrapper.createDiv({ cls: "finance-tracker-budget-meta", text: `Skipped: ${item.skipped.join(", ")}` });
+    }
+  },
+
+  // A card capture that is really a bill payment is filed under the bill. The
+  // bank sends "CLAUDE.AI SUBSCRIPTION" with no category; the bill knows its
+  // alias, its amount and when it is due.
+  async matchCaptureToBill(expense) {
+    const recurring = await this.detectRecurring(expense.date);
+    if (!recurring.billsMode) return null;
+    return core.findBillForPayment(
+      { date: expense.date, amount: expense.amount, merchant: expense.merchant },
+      recurring.items
+    );
+  },
+
+  async undoLastBillMatch() {
+    const last = this._lastBillMatch;
+    if (!last) return false;
+    this._lastBillMatch = null;
+    const entries = await this.collectTransactionsForRange({ start: last.date, end: last.date });
+    const entry = entries.find(
+      (candidate) =>
+        candidate.category === last.category &&
+        Math.abs(candidate.amount - last.amount) < 0.005 &&
+        (candidate.merchant || "") === (last.merchant || "")
+    );
+    if (!entry) return false;
+    await this.updateTransactionEntry(entry, { category: "uncategorized" });
+    return true;
+  },
+
   openMergeBill(item, live, onDone) {
     const modal = new MergeBillModal(this.app, this, item, live, onDone);
     modal.open();
@@ -13603,6 +13808,10 @@ class EditRecurringItemModal extends Modal {
     const item = this.item;
     contentEl.createEl("h3", { text: `Edit ${item.label}` });
 
+    // A bill note has an identity the old registry row never did: a name, the
+    // other names its payments arrive under, and a rule for when it falls due.
+    const billFields = item.billId ? this.renderBillIdentityFields(contentEl, item) : null;
+
     const amountRow = contentEl.createDiv({ cls: "finance-edit-row" });
     amountRow.createEl("label", { text: "Amount" });
     const amountInput = amountRow.createEl("input", { type: "number", attr: { step: "0.01" } });
@@ -13772,6 +13981,12 @@ class EditRecurringItemModal extends Modal {
           nextDue: core.parseIsoDate(nextDueInput.value) || null,
           variable: variableCheckbox.checked,
         };
+        if (billFields) {
+          Object.assign(patch, billFields.read());
+          // For a bill, next due is a correction, not a field to re-save: pinning
+          // the date it already had would turn a derived schedule into a fixed one.
+          if (patch.nextDue === (item.nextDue || null)) delete patch.nextDue;
+        }
         if (scheduleCheckbox.checked && nextAmountInput.value && changeDateInput.value) {
           patch.nextAmount = core.parseNumber(nextAmountInput.value);
           patch.changeDate = core.parseIsoDate(changeDateInput.value);
@@ -13796,6 +14011,83 @@ class EditRecurringItemModal extends Modal {
         saveButton.disabled = false;
       }
     });
+  }
+
+  renderBillIdentityFields(contentEl, item) {
+    const bill = item.bill || {};
+    const row = (label) => {
+      const element = contentEl.createDiv({ cls: "finance-edit-row" });
+      element.createEl("label", { text: label });
+      return element;
+    };
+
+    const nameInput = row("Name").createEl("input", { type: "text", attr: { "aria-label": "Bill name" } });
+    nameInput.value = bill.name || item.label || "";
+
+    const aliasInput = row("Also paid as").createEl("input", {
+      type: "text",
+      attr: { placeholder: "CLAUDE.AI SUBSCRIPTION, Anthropic", "aria-label": "Aliases" },
+    });
+    aliasInput.value = (bill.aliases || []).join(", ");
+    contentEl.createEl("p", {
+      cls: "finance-edit-hint",
+      text: "Other names this bill's payments arrive under, separated by commas — how a bank feed or a differently worded entry is recognised as this bill.",
+    });
+
+    const dueSelect = row("Due").createEl("select", { attr: { "aria-label": "Due rule" } });
+    for (const [value, label] of [["after-last", "Counted from the last payment"], ["day-of-month", "On a day of the month"], ["nth-weekday", "On a weekday of the month"]]) {
+      dueSelect.createEl("option", { text: label, value });
+    }
+    dueSelect.value = bill.dueRule?.type || "after-last";
+
+    const dayRow = row("Day");
+    const dayInput = dayRow.createEl("input", { type: "number", attr: { min: "1", max: "31", "aria-label": "Day of month" } });
+    dayInput.value = bill.dueRule?.type === "day-of-month" ? String(bill.dueRule.day) : "";
+
+    const weekdayRow = row("Which");
+    const ordinalSelect = weekdayRow.createEl("select", { attr: { "aria-label": "Which weekday" } });
+    for (const [value, label] of [["1", "First"], ["2", "Second"], ["3", "Third"], ["4", "Fourth"], ["-1", "Last"]]) {
+      ordinalSelect.createEl("option", { text: label, value });
+    }
+    const weekdaySelect = weekdayRow.createEl("select", { attr: { "aria-label": "Weekday" } });
+    ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"].forEach((label, index) => {
+      weekdaySelect.createEl("option", { text: label, value: String(index) });
+    });
+    if (bill.dueRule?.type === "nth-weekday") {
+      ordinalSelect.value = String(bill.dueRule.ordinal);
+      weekdaySelect.value = String(bill.dueRule.weekday);
+    }
+
+    const syncDueRows = () => {
+      dayRow.toggleClass("is-hidden", dueSelect.value !== "day-of-month");
+      weekdayRow.toggleClass("is-hidden", dueSelect.value !== "nth-weekday");
+    };
+    dueSelect.addEventListener("change", syncDueRows);
+    syncDueRows();
+
+    const reminderInput = row("Remind me").createEl("input", {
+      type: "number",
+      attr: { min: "0", max: "60", "aria-label": "Reminder days" },
+    });
+    reminderInput.value = String(bill.reminderDays ?? 3);
+    contentEl.createEl("p", { cls: "finance-edit-hint", text: "Days before the due date this bill moves into Due soon." });
+
+    return {
+      read: () => ({
+        name: nameInput.value.trim() || bill.name,
+        aliases: aliasInput.value
+          .split(",")
+          .map((alias) => alias.trim())
+          .filter(Boolean),
+        dueRule:
+          dueSelect.value === "day-of-month"
+            ? { type: "day-of-month", day: Math.min(31, Math.max(1, Number(dayInput.value) || 1)) }
+            : dueSelect.value === "nth-weekday"
+              ? { type: "nth-weekday", ordinal: Number(ordinalSelect.value), weekday: Number(weekdaySelect.value) }
+              : { type: "after-last" },
+        reminderDays: Math.max(0, Number(reminderInput.value) || 0),
+      }),
+    };
   }
 
   onClose() {
@@ -15822,6 +16114,14 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
         text: `No recurring payments detected yet. Log one with a cadence tag like #log/spending/${this.plugin.settings.recurringTagPrefix || "subscriptions"}/monthly/spotify.`,
       });
       return;
+    }
+    // Every bill in the author's registry said Auto-log "yes" while the master
+    // switch was off, so nothing was ever auto-logged and nothing said so.
+    if (!this.plugin.settings.autoLogRecurring) {
+      listEl.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: "Auto-log is switched off above, so the Auto-log ticks below have no effect until you turn it on.",
+      });
     }
     const scroll = listEl.createDiv({ cls: "finance-tracker-recurring-settings-scroll" });
     const header = scroll.createDiv({ cls: "finance-tracker-recurring-settings-header" });

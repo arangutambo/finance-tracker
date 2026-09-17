@@ -1386,3 +1386,78 @@ test("a bill can be added by hand with a calendar due rule", async () => {
   assert.equal(car.nextDue, "2027-08-29", "a bill never paid starts from its first due date");
   assert.equal(car.status, "upcoming");
 });
+
+test("a bill note's own block shows its schedule and payments", async () => {
+  const { plugin } = await vaultWithBills();
+
+  const el = new StubEl();
+  await plugin.renderBillBlock("", el, { sourcePath: "Utility/Budgets/Bills/claude.md" });
+  const text = el.allText();
+
+  assert.match(text, /Next payment \| \$34\.00/);
+  assert.match(text, /Payments logged \| 1/);
+  assert.match(text, /monthly, counted from the last payment · also known as Claude AI Payment/);
+  assert.match(text, /2026-08-26 \| \$34\.00 \| Claude AI Payment/);
+});
+
+test("a card capture that is a bill payment is filed under the bill, with undo", async () => {
+  const { plugin, files } = await vaultWithBills();
+
+  // The bank's own wording, no category — and close to Claude's 26 September due date.
+  await plugin.handleCapture({ amount: "34.00", merchant: "CLAUDE AI PAYMENT", date: "2026-09-25", source: "anz" });
+
+  const logged = financeLines(files, "2026-09-25");
+  assert.equal(logged.length, 1);
+  assert.match(logged[0], /#log\/spending\/subscriptions\/monthly\/claude/);
+  assert.match(notices.join(" "), /Filed under Claude/);
+
+  const recurring = await plugin.detectRecurring("2026-09-26");
+  assert.equal(recurring.items.find((item) => item.billId === "claude").nextDue, "2026-10-26", "the payment moved the schedule on");
+
+  assert.equal(await plugin.undoLastBillMatch(), true);
+  assert.match(financeLines(files, "2026-09-25")[0], /#log\/spending\/uncategorized/);
+
+  // A capture that only looks similar is left for review — neither the bill nor
+  // the merchant's history gets to claim a $340 charge as the $34 subscription.
+  await plugin.handleCapture({ amount: "340.00", merchant: "CLAUDE AI PAYMENT", date: "2026-09-25", source: "wise" });
+  assert.match(financeLines(files, "2026-09-25")[1], /#log\/spending\/uncategorized/);
+});
+
+test("editing a bill saves its name, aliases and due rule to the note", async () => {
+  const { plugin, files } = await vaultWithBills();
+  const recurring = await plugin.detectRecurring("2026-09-20");
+  const item = recurring.items.find((entry) => entry.billId === "claude");
+
+  const modal = plugin.openEditBill(item);
+  await modal.ready;
+  const field = (label) => modal.contentEl.find((node) => node.attrs["aria-label"] === label);
+  field("Aliases").value = "Claude AI Payment, ANTHROPIC";
+  field("Due rule").value = "day-of-month";
+  field("Day of month").value = "26";
+  field("Reminder days").value = "5";
+  await modal.contentEl.click("Save");
+
+  const note = files.get("Utility/Budgets/Bills/claude.md").content;
+  assert.match(note, /aliases: \[Claude AI Payment, ANTHROPIC\]/);
+  assert.match(note, /due_rule: day-of-month: 26/);
+  assert.match(note, /reminder_days: 5/);
+  assert.match(note, /next_due: \n/, "an unchanged due date is not pinned as an override");
+});
+
+test("auto-log catches a bill note up on missed cycles, and stops", async () => {
+  const { plugin, app, files } = makePlugin(billSettings());
+  delete plugin.invalidateIndexEntry;
+  await plugin.saveBill(billDefinition({ id: "climb", name: "Urban Climb", cadence: "weekly", amount: 30, autoLog: true }));
+  await app.vault.create("Daily/2026-08-31.md", "## Finance\n- [ ] #log/spending 30\n\t- $30.00 #log/spending/subscriptions/weekly/climb\n");
+
+  // Three weeks later, with nothing logged since.
+  const logged = await plugin.logDueRecurringPayments({ notify: false, autoOnly: true, referenceDate: "2026-09-21" });
+
+  assert.equal(logged, 3, "the 7th, 14th and 21st");
+  const dates = [...files.keys()].filter((path) => path.startsWith("Daily/2026-09")).sort();
+  assert.deepEqual(dates, ["Daily/2026-09-07.md", "Daily/2026-09-14.md", "Daily/2026-09-21.md"]);
+  for (const path of dates) assert.match(files.get(path).content, /\$30\.00 #log\/spending\/subscriptions\/weekly\/climb/);
+
+  // Nothing left due, so a second pass logs nothing.
+  assert.equal(await plugin.logDueRecurringPayments({ notify: false, autoOnly: true, referenceDate: "2026-09-21" }), 0);
+});

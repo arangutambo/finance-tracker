@@ -16,6 +16,10 @@ class EditRecurringItemModal extends Modal {
     const item = this.item;
     contentEl.createEl("h3", { text: `Edit ${item.label}` });
 
+    // A bill note has an identity the old registry row never did: a name, the
+    // other names its payments arrive under, and a rule for when it falls due.
+    const billFields = item.billId ? this.renderBillIdentityFields(contentEl, item) : null;
+
     const amountRow = contentEl.createDiv({ cls: "finance-edit-row" });
     amountRow.createEl("label", { text: "Amount" });
     const amountInput = amountRow.createEl("input", { type: "number", attr: { step: "0.01" } });
@@ -185,6 +189,12 @@ class EditRecurringItemModal extends Modal {
           nextDue: core.parseIsoDate(nextDueInput.value) || null,
           variable: variableCheckbox.checked,
         };
+        if (billFields) {
+          Object.assign(patch, billFields.read());
+          // For a bill, next due is a correction, not a field to re-save: pinning
+          // the date it already had would turn a derived schedule into a fixed one.
+          if (patch.nextDue === (item.nextDue || null)) delete patch.nextDue;
+        }
         if (scheduleCheckbox.checked && nextAmountInput.value && changeDateInput.value) {
           patch.nextAmount = core.parseNumber(nextAmountInput.value);
           patch.changeDate = core.parseIsoDate(changeDateInput.value);
@@ -209,6 +219,83 @@ class EditRecurringItemModal extends Modal {
         saveButton.disabled = false;
       }
     });
+  }
+
+  renderBillIdentityFields(contentEl, item) {
+    const bill = item.bill || {};
+    const row = (label) => {
+      const element = contentEl.createDiv({ cls: "finance-edit-row" });
+      element.createEl("label", { text: label });
+      return element;
+    };
+
+    const nameInput = row("Name").createEl("input", { type: "text", attr: { "aria-label": "Bill name" } });
+    nameInput.value = bill.name || item.label || "";
+
+    const aliasInput = row("Also paid as").createEl("input", {
+      type: "text",
+      attr: { placeholder: "CLAUDE.AI SUBSCRIPTION, Anthropic", "aria-label": "Aliases" },
+    });
+    aliasInput.value = (bill.aliases || []).join(", ");
+    contentEl.createEl("p", {
+      cls: "finance-edit-hint",
+      text: "Other names this bill's payments arrive under, separated by commas — how a bank feed or a differently worded entry is recognised as this bill.",
+    });
+
+    const dueSelect = row("Due").createEl("select", { attr: { "aria-label": "Due rule" } });
+    for (const [value, label] of [["after-last", "Counted from the last payment"], ["day-of-month", "On a day of the month"], ["nth-weekday", "On a weekday of the month"]]) {
+      dueSelect.createEl("option", { text: label, value });
+    }
+    dueSelect.value = bill.dueRule?.type || "after-last";
+
+    const dayRow = row("Day");
+    const dayInput = dayRow.createEl("input", { type: "number", attr: { min: "1", max: "31", "aria-label": "Day of month" } });
+    dayInput.value = bill.dueRule?.type === "day-of-month" ? String(bill.dueRule.day) : "";
+
+    const weekdayRow = row("Which");
+    const ordinalSelect = weekdayRow.createEl("select", { attr: { "aria-label": "Which weekday" } });
+    for (const [value, label] of [["1", "First"], ["2", "Second"], ["3", "Third"], ["4", "Fourth"], ["-1", "Last"]]) {
+      ordinalSelect.createEl("option", { text: label, value });
+    }
+    const weekdaySelect = weekdayRow.createEl("select", { attr: { "aria-label": "Weekday" } });
+    ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"].forEach((label, index) => {
+      weekdaySelect.createEl("option", { text: label, value: String(index) });
+    });
+    if (bill.dueRule?.type === "nth-weekday") {
+      ordinalSelect.value = String(bill.dueRule.ordinal);
+      weekdaySelect.value = String(bill.dueRule.weekday);
+    }
+
+    const syncDueRows = () => {
+      dayRow.toggleClass("is-hidden", dueSelect.value !== "day-of-month");
+      weekdayRow.toggleClass("is-hidden", dueSelect.value !== "nth-weekday");
+    };
+    dueSelect.addEventListener("change", syncDueRows);
+    syncDueRows();
+
+    const reminderInput = row("Remind me").createEl("input", {
+      type: "number",
+      attr: { min: "0", max: "60", "aria-label": "Reminder days" },
+    });
+    reminderInput.value = String(bill.reminderDays ?? 3);
+    contentEl.createEl("p", { cls: "finance-edit-hint", text: "Days before the due date this bill moves into Due soon." });
+
+    return {
+      read: () => ({
+        name: nameInput.value.trim() || bill.name,
+        aliases: aliasInput.value
+          .split(",")
+          .map((alias) => alias.trim())
+          .filter(Boolean),
+        dueRule:
+          dueSelect.value === "day-of-month"
+            ? { type: "day-of-month", day: Math.min(31, Math.max(1, Number(dayInput.value) || 1)) }
+            : dueSelect.value === "nth-weekday"
+              ? { type: "nth-weekday", ordinal: Number(ordinalSelect.value), weekday: Number(weekdaySelect.value) }
+              : { type: "after-last" },
+        reminderDays: Math.max(0, Number(reminderInput.value) || 0),
+      }),
+    };
   }
 
   onClose() {

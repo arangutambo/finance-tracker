@@ -710,6 +710,14 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
       });
       return;
     }
+    // Every bill in the author's registry said Auto-log "yes" while the master
+    // switch was off, so nothing was ever auto-logged and nothing said so.
+    if (!this.plugin.settings.autoLogRecurring) {
+      listEl.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: "Auto-log is switched off above, so the Auto-log ticks below have no effect until you turn it on.",
+      });
+    }
     const scroll = listEl.createDiv({ cls: "finance-tracker-recurring-settings-scroll" });
     const header = scroll.createDiv({ cls: "finance-tracker-recurring-settings-header" });
     header.createSpan({ text: "Bill" });

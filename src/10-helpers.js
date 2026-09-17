@@ -122,6 +122,7 @@ const NETWORTH_BLOCK = "networth-dashboard";
 const QUERY_BLOCK = "finance-query";
 const GOALS_BLOCK = "finance-goals";
 const RUNWAY_BLOCK = "finance-runway";
+const BILL_BLOCK = "finance-bill";
 const DAILY_BUDGET_VIEW = "finance-tracker-daily";
 const FINANCE_INBOX_VIEW = "finance-tracker-inbox";
 // Cadence display names live in core.RECURRING_CADENCES alongside the maths;

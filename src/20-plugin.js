@@ -90,6 +90,10 @@ class FinanceTrackerPlugin extends Plugin {
       await this.renderRunwayBlock(source, el, ctx);
     });
 
+    this.registerMarkdownCodeBlockProcessor(BILL_BLOCK, async (source, el, ctx) => {
+      await this.renderBillBlock(source, el, ctx);
+    });
+
     this.registerView(DAILY_BUDGET_VIEW, (leaf) => new DailyBudgetView(leaf, this));
     this.registerView(FINANCE_INBOX_VIEW, (leaf) => new FinanceInboxView(leaf, this));
 
@@ -692,6 +696,19 @@ class FinanceTrackerPlugin extends Plugin {
       return { skipped: true, reason: "cross-method-duplicate", duplicateOf, expense };
     }
 
+    // A bill first: a capture on the right day, for the right amount, from a
+    // merchant a bill knows, is that bill's payment — more specific than any
+    // merchant rule, and it moves the bill's schedule on.
+    let matchedBill = null;
+    if ((!expense.category || expense.category === "uncategorized") && expense.merchant && options.matchBills !== false) {
+      try {
+        matchedBill = await this.matchCaptureToBill(expense);
+      } catch (error) {
+        console.warn("[finance-tracker] bill matching failed", error);
+      }
+      if (matchedBill) expense.category = core.normalizeCategoryPath(matchedBill.category);
+    }
+
     if ((!expense.category || expense.category === "uncategorized") && expense.merchant) {
       const guessed = await this.guessCategoryForMerchant(expense.merchant);
       if (guessed) expense.category = guessed;
@@ -752,11 +769,37 @@ class FinanceTrackerPlugin extends Plugin {
       await this.app.workspace.getLeaf(true).openFile(file);
     }
 
+    if (matchedBill) {
+      this._lastBillMatch = {
+        amount: expense.amount,
+        category: core.normalizeCategoryPath(expense.category),
+        date: expense.date,
+        merchant: expense.merchant || "",
+      };
+      const message = `Filed under ${matchedBill.label}.`;
+      if (typeof createFragment === "function") {
+        new Notice(
+          createFragment((fragment) => {
+            fragment.appendText(`${message} `);
+            const undo = fragment.createEl("a", { text: "Undo", href: "#" });
+            undo.addEventListener("click", async (event) => {
+              event.preventDefault();
+              const undone = await this.undoLastBillMatch();
+              new Notice(undone ? "Moved back to uncategorised." : "That entry has changed since, so it was left alone.");
+            });
+          }),
+          10000
+        );
+      } else {
+        new Notice(message);
+      }
+    }
+
     if (options.notify) {
       new Notice(`Logged ${core.formatCurrency(expense.amount, expense.currency)} to ${expense.date}`);
     }
 
-    return { skipped: false, file, expense };
+    return { skipped: false, file, expense, bill: matchedBill };
   }
 
   // The rolling record of what each transport has captured. It is kept in
@@ -906,6 +949,7 @@ class FinanceTrackerPlugin extends Plugin {
   async loadMerchantHistory() {
     if (this._merchantHistory) return this._merchantHistory;
     const history = new Map();
+    const recurringPrefix = core.normalizeCategoryPath(this.settings.recurringTagPrefix || "subscriptions") || "subscriptions";
     for (const entry of await this.collectAllTransactions()) {
       if (entry.entryType === "balance" || entry.isIncome || entry.isGoalContribution) continue;
       // `entry.category` already has any trip prefix split off into holidayKey,
@@ -913,6 +957,11 @@ class FinanceTrackerPlugin extends Plugin {
       // and the capture path re-applies the trip prefix only if a trip is on.
       const category = core.normalizeCategoryPath(entry.category || "");
       if (!category || category === "uncategorized") continue;
+      // A bill category is not something to learn from a merchant name. Whether a
+      // charge from Claude is the monthly subscription depends on its amount and
+      // date, which bill matching checks; a merchant rule would file a one-off
+      // $340 purchase as the $34 bill and invent a payment.
+      if (category === recurringPrefix || category.startsWith(`${recurringPrefix}/`)) continue;
       const merchant = String(entry.merchant || "").trim();
       if (!merchant || /^skipped\b/i.test(merchant)) continue;
       const merchantKey = core.normalizeMerchant(merchant);
@@ -5513,10 +5562,20 @@ class FinanceTrackerPlugin extends Plugin {
     if ("nextDue" in patch) next.nextDueOverride = patch.nextDue;
     if ("endDate" in patch) next.endDate = patch.endDate;
     if ("paymentsLeft" in patch) next.paymentsLeft = patch.paymentsLeft;
+    if ("name" in patch) next.name = patch.name;
+    if ("aliases" in patch) next.aliases = patch.aliases;
+    if ("dueRule" in patch) next.dueRule = patch.dueRule;
+    if ("reminderDays" in patch) next.reminderDays = patch.reminderDays;
     return next;
   }
 
   // One entry point for every per-bill change, whichever model is in play.
+  openEditBill(item, onSaved) {
+    const modal = new EditRecurringItemModal(this.app, this, item, onSaved);
+    modal.open();
+    return modal;
+  }
+
   async updateRecurringItem(item, patch = {}) {
     if (item?.billId) {
       await this.updateBill(item.billId, this.billPatchFromItemPatch(patch));
@@ -5782,7 +5841,8 @@ class FinanceTrackerPlugin extends Plugin {
   // day so the cadence anchor never drifts. Loops so an item several periods
   // behind catches all the way up.
   async logDueRecurringPayments(options = {}) {
-    const today = core.todayIsoLocal();
+    // A reference date is only ever passed by tests; the plugin logs up to today.
+    const today = core.parseIsoDate(options.referenceDate) || core.todayIsoLocal();
     let logged = 0;
     for (let pass = 0; pass < 24; pass += 1) {
       const recurring = await this.detectRecurring(today);

@@ -345,6 +345,150 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     return bill;
   },
 
+  describeDueRule(rule, cadence) {
+    const ordinal = (value) => {
+      const n = Number(value);
+      const suffix = n % 10 === 1 && n % 100 !== 11 ? "st" : n % 10 === 2 && n % 100 !== 12 ? "nd" : n % 10 === 3 && n % 100 !== 13 ? "rd" : "th";
+      return `${n}${suffix}`;
+    };
+    const weekdays = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    if (rule?.type === "day-of-month") return `on the ${ordinal(rule.day)} of the month`;
+    if (rule?.type === "nth-weekday") {
+      const which = { 1: "first", 2: "second", 3: "third", 4: "fourth", "-1": "last" }[String(rule.ordinal)] || "first";
+      return `on the ${which} ${weekdays[rule.weekday] || "Monday"}`;
+    }
+    return `${cadenceLabel(cadence).toLowerCase()}, counted from the last payment`;
+  },
+
+  // The block inside a bill note: what it costs, when it is next due, its price
+  // history and every payment linked to it. The note is the bill, so this is
+  // where a bill is looked at on its own.
+  async renderBillBlock(source, el, ctx) {
+    el.empty();
+    const referenceDate = core.todayIsoLocal();
+    const currency = core.normalizeCurrency(this.settings.defaultCurrency);
+    const wrapper = el.createDiv({ cls: "finance-tracker-dashboard finance-bill-note" });
+    const rerender = () => this.renderBillBlock(source, el, ctx);
+
+    const recurring = await this.detectRecurring(referenceDate);
+    const item = (recurring.items || []).find((entry) => entry.notePath === ctx.sourcePath);
+    if (!item) {
+      const merged = (await this.loadBills({ includeMerged: true })).find((bill) => bill.notePath === ctx.sourcePath);
+      wrapper.createDiv({
+        cls: "finance-tracker-empty",
+        text: merged?.mergedInto
+          ? `Merged into ${merged.mergedInto}. Payments under this name count toward that bill now.`
+          : "These properties do not describe a bill yet — it needs at least a bill_id and a cadence.",
+      });
+      return;
+    }
+
+    const status =
+      item.status === "finished"
+        ? item.finishedReason === "payments" ? "All payments made" : `Ended ${item.endDate}`
+        : !item.active
+          ? "Paused"
+          : item.status === "overdue"
+            ? `Overdue since ${item.nextDue}`
+            : item.status === "due"
+              ? "Due today"
+              : item.nextDue ? `Due ${item.nextDue}` : "No due date yet";
+
+    renderStatCards(wrapper, [
+      { label: "Next payment", value: core.formatCurrency(item.nextDueAmount ?? item.lastAmount, currency) },
+      { label: "When", value: status, cls: item.status === "overdue" ? "is-over" : "" },
+      { label: "Per month", value: core.formatCurrency(item.monthlyCost, currency) },
+      { label: "Payments logged", value: String(item.count) },
+    ]);
+
+    const about = [this.describeDueRule(item.dueRule, item.cadence)];
+    if (item.variable) about.push("amount varies");
+    if (item.bill?.aliases?.length) about.push(`also known as ${item.bill.aliases.join(", ")}`);
+    wrapper.createDiv({ cls: "finance-tracker-budget-meta", text: about.join(" · ") });
+
+    if (item.active) {
+      const actions = wrapper.createDiv({ cls: "finance-tracker-header-actions" });
+      addAction(
+        actions,
+        "Mark paid",
+        async () => {
+          if (item.variable) {
+            new LogVariableBillModal(this.app, this, item, rerender).open();
+            return;
+          }
+          const date = await this.logRecurringNow(item);
+          new Notice(`Logged ${item.label} for ${date}`);
+          await rerender();
+        },
+        { primary: item.status === "overdue" || item.status === "due", errorPrefix: `Logging ${item.label}`, opensModal: item.variable }
+      );
+      if (item.nextDue) {
+        addAction(
+          actions,
+          "Skip this cycle",
+          async () => {
+            await this.logRecurringSkip(item);
+            await rerender();
+          },
+          { errorPrefix: "Skipping" }
+        );
+      }
+      addAction(actions, "Edit", () => new EditRecurringItemModal(this.app, this, item, rerender).open(), { opensModal: true });
+    }
+
+    const history = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
+    const heading = history.createDiv({ cls: "finance-bill-row-top" });
+    heading.createEl("h4", { text: "Payments" });
+    this.renderBillSparkline(heading, item.payments.map((payment) => payment.amount).slice(-12));
+
+    if (!item.payments.length) {
+      history.createDiv({ cls: "finance-tracker-empty", text: "Nothing logged against this bill yet." });
+    } else {
+      const table = history.createEl("table", { cls: "finance-tracker-table" });
+      const head = table.createEl("thead").createEl("tr");
+      for (const label of ["Date", "Amount", "As written"]) head.createEl("th", { text: label });
+      const body = table.createEl("tbody");
+      for (const payment of item.payments.slice().reverse().slice(0, 24)) {
+        const row = body.createEl("tr");
+        row.createEl("td", { text: payment.date });
+        row.createEl("td", { text: core.formatCurrency(payment.amount, currency), cls: "is-numeric" });
+        row.createEl("td", { text: payment.merchant || "" });
+      }
+    }
+
+    if (item.skipped?.length) {
+      wrapper.createDiv({ cls: "finance-tracker-budget-meta", text: `Skipped: ${item.skipped.join(", ")}` });
+    }
+  },
+
+  // A card capture that is really a bill payment is filed under the bill. The
+  // bank sends "CLAUDE.AI SUBSCRIPTION" with no category; the bill knows its
+  // alias, its amount and when it is due.
+  async matchCaptureToBill(expense) {
+    const recurring = await this.detectRecurring(expense.date);
+    if (!recurring.billsMode) return null;
+    return core.findBillForPayment(
+      { date: expense.date, amount: expense.amount, merchant: expense.merchant },
+      recurring.items
+    );
+  },
+
+  async undoLastBillMatch() {
+    const last = this._lastBillMatch;
+    if (!last) return false;
+    this._lastBillMatch = null;
+    const entries = await this.collectTransactionsForRange({ start: last.date, end: last.date });
+    const entry = entries.find(
+      (candidate) =>
+        candidate.category === last.category &&
+        Math.abs(candidate.amount - last.amount) < 0.005 &&
+        (candidate.merchant || "") === (last.merchant || "")
+    );
+    if (!entry) return false;
+    await this.updateTransactionEntry(entry, { category: "uncategorized" });
+    return true;
+  },
+
   openMergeBill(item, live, onDone) {
     const modal = new MergeBillModal(this.app, this, item, live, onDone);
     modal.open();
