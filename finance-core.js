@@ -2653,6 +2653,50 @@ function computeSinkingFund(input = {}) {
   return { currentSaved, daysLeft, expectedByNow, remaining, requiredPerWeek, status, targetAmount, weeksLeft };
 }
 
+// --- Goal keys and trip tags ------------------------------------------------------
+// Creating a goal used to ask for a "Goal key" and a trip for a "Trip tracking
+// tag" — the internal names tags are built from. They are derived from the name
+// now, kept unique, and only shown as the tag they produce.
+
+function slugifyName(value) {
+  const plain = String(value || "")
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/[\\/]+/g, " ");
+  return normalizeCategoryPath(plain).replace(/\//g, "-");
+}
+
+function uniqueKey(base, taken) {
+  if (!taken.has(base)) return base;
+  let counter = 2;
+  while (taken.has(`${base}-${counter}`)) counter += 1;
+  return `${base}-${counter}`;
+}
+
+// `existingKeys` should hold every goal key and every income category already in
+// use: a goal called "Salary" must not turn salary into goal contributions.
+function deriveGoalKey(name, existingKeys = []) {
+  const base = slugifyName(name) || "goal";
+  const taken = new Set((existingKeys || []).map((key) => slugifyName(key)).filter(Boolean));
+  return uniqueKey(base, taken);
+}
+
+// "Japan 2026" → 2026/japan. The year comes from the name when it has one, and
+// from the trip's start date otherwise, so a trip in January planned in
+// November gets the right year.
+function deriveTripTag(name, options = {}) {
+  const raw = String(name || "");
+  const yearMatch = raw.match(/\b(20\d{2})\b/);
+  const year = yearMatch ? yearMatch[1] : (parseIsoDate(options.startDate) || todayIsoLocal()).slice(0, 4);
+  const slug = slugifyName(raw.replace(/\b20\d{2}\b/g, " ")) || "trip";
+  const taken = new Set((options.existingTags || []).map((tag) => normalizeHolidayKey(tag)).filter(Boolean));
+  const base = `${year}/${slug}`;
+  if (!taken.has(base)) return base;
+  let counter = 2;
+  while (taken.has(`${base}-${counter}`)) counter += 1;
+  return `${base}-${counter}`;
+}
+
 // --- Goal and trip prompts ------------------------------------------------------
 // Moments a goal or trip needs a decision: a goal reaching its target or its due
 // date, a trip starting or ending. Each prompt has a key that includes the date
@@ -5701,6 +5745,9 @@ module.exports = {
   parseGoalDefinition,
   computeSinkingFund,
   buildGoalPrompts,
+  slugifyName,
+  deriveGoalKey,
+  deriveTripTag,
   parseOwedChildLine,
   buildOwedChildLine,
   buildOwedSharesFromTokens,

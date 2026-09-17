@@ -2046,3 +2046,40 @@ test("a withdrawal is logged against the goal with what it was spent on", async 
   await contribute.contentEl.click("Log contribution");
   assert.ok(notices.includes("Choose one of your goals first."));
 });
+
+
+test("a new goal gets its tag from the name, avoiding income already in use", async () => {
+  const { plugin, app, files } = await vaultWithGoal();
+  await app.vault.create("Daily/2026-09-01.md", "## Finance\n- [ ] #log/spending 0\n- $3,000.00 #log/income/salary\n");
+
+  const goalModal = plugin.openNewGoal();
+  await goalModal.ready;
+  const name = goalModal.contentEl.find((node) => node.attrs["aria-label"] === "Name");
+  name.value = "Salary";
+  await name.fire("input");
+  assert.match(goalModal.contentEl.allText(), /#log\/income\/salary-2/, "salary is already income");
+
+  name.value = "New Bike";
+  await name.fire("input");
+  const target = goalModal.contentEl.find((node) => node.attrs["aria-label"] === "Target");
+  target.value = "1200";
+  await target.fire("input");
+  assert.match(goalModal.contentEl.allText(), /#log\/income\/new-bike/);
+  await goalModal.contentEl.click("Create goal");
+
+  const note = files.get("Utility/Budgets/New Bike.md").content;
+  assert.match(note, /goal_key: new-bike/);
+  assert.match(note, /target_amount: 1200/);
+  assert.match(note, /due_date: \n/, "no due date means none, not today");
+  assert.match(note, /active: true/);
+});
+
+test("a new trip note carries its own currency, not yen", async () => {
+  const { plugin, files } = await vaultWithGoal();
+  const file = await plugin.createOrOpenHolidayBudget({ name: "Fiji", holidayKey: "2027/fiji", startDate: "2027-01-04", endDate: "2027-01-12", tripCurrency: "fjd" });
+  const note = files.get(file.path).content;
+  assert.match(note, /trip_currency: FJD/);
+  assert.match(note, /exchange_rates: \n/);
+  assert.doesNotMatch(note, /JPY/);
+  assert.deepEqual(await plugin.collectTakenTripTags(), ["2027/fiji"]);
+});

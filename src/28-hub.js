@@ -142,7 +142,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     const toolbar = host.createDiv({ cls: "finance-hub-toolbar" });
     addAction(toolbar, "Contribute", () => this.openContribute({ onDone: () => view.refresh() }), { primary: true, opensModal: true });
     addAction(toolbar, "Withdraw", () => this.openContribute({ mode: "withdraw", onDone: () => view.refresh() }), { opensModal: true });
-    addAction(toolbar, "New goal", () => new SavingsGoalModal(this.app, this, async () => view.refresh()).open(), {
+    addAction(toolbar, "New goal", () => this.openNewGoal(async () => view.refresh()), {
       opensModal: true,
     });
     addAction(toolbar, this.settings.tripModeActive ? "End trip mode" : "Start trip mode", async () => {

@@ -122,6 +122,12 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     return true;
   },
 
+  openNewGoal(onComplete) {
+    const modal = new SavingsGoalModal(this.app, this, onComplete);
+    modal.open();
+    return modal;
+  },
+
   openContribute(options = {}) {
     const modal = new ContributeGoalModal(this.app, this, options);
     modal.open();

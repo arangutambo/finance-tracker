@@ -3014,3 +3014,16 @@ test("trip prompts: start, end while trip mode is on, archive once it's off", ()
   assert.equal(core.buildGoalPrompts([{ ...trip, tripModeOn: true }], { referenceDate: "2026-10-15" })[0].kind, "trip-end");
   assert.equal(core.buildGoalPrompts([trip], { referenceDate: "2026-10-15" })[0].kind, "trip-archive");
 });
+
+test("goal keys and trip tags come from the name, unique and tag-safe", () => {
+  assert.equal(core.deriveGoalKey("House Deposit"), "house-deposit");
+  assert.equal(core.deriveGoalKey("Café & Bar"), "cafe-and-bar");
+  assert.equal(core.deriveGoalKey("Car/Bike fund"), "car-bike-fund", "a slash would split the tag");
+  assert.equal(core.deriveGoalKey("iPhone", ["iphone", "iphone-2"]), "iphone-3");
+  assert.equal(core.deriveGoalKey("Salary", ["salary"]), "salary-2", "an income category is taken too");
+  assert.equal(core.deriveGoalKey("!!!"), "goal");
+
+  assert.equal(core.deriveTripTag("Japan 2026"), "2026/japan");
+  assert.equal(core.deriveTripTag("New Zealand", { startDate: "2027-01-04" }), "2027/new-zealand");
+  assert.equal(core.deriveTripTag("Japan", { startDate: "2026-10-01", existingTags: ["2026/japan"] }), "2026/japan-2");
+});

@@ -2656,6 +2656,50 @@ const core = (() => {
     return { currentSaved, daysLeft, expectedByNow, remaining, requiredPerWeek, status, targetAmount, weeksLeft };
   }
 
+  // --- Goal keys and trip tags ------------------------------------------------------
+  // Creating a goal used to ask for a "Goal key" and a trip for a "Trip tracking
+  // tag" — the internal names tags are built from. They are derived from the name
+  // now, kept unique, and only shown as the tag they produce.
+
+  function slugifyName(value) {
+    const plain = String(value || "")
+      .normalize("NFD")
+      .replace(/[̀-ͯ]/g, "")
+      .replace(/[\\/]+/g, " ");
+    return normalizeCategoryPath(plain).replace(/\//g, "-");
+  }
+
+  function uniqueKey(base, taken) {
+    if (!taken.has(base)) return base;
+    let counter = 2;
+    while (taken.has(`${base}-${counter}`)) counter += 1;
+    return `${base}-${counter}`;
+  }
+
+  // `existingKeys` should hold every goal key and every income category already in
+  // use: a goal called "Salary" must not turn salary into goal contributions.
+  function deriveGoalKey(name, existingKeys = []) {
+    const base = slugifyName(name) || "goal";
+    const taken = new Set((existingKeys || []).map((key) => slugifyName(key)).filter(Boolean));
+    return uniqueKey(base, taken);
+  }
+
+  // "Japan 2026" → 2026/japan. The year comes from the name when it has one, and
+  // from the trip's start date otherwise, so a trip in January planned in
+  // November gets the right year.
+  function deriveTripTag(name, options = {}) {
+    const raw = String(name || "");
+    const yearMatch = raw.match(/\b(20\d{2})\b/);
+    const year = yearMatch ? yearMatch[1] : (parseIsoDate(options.startDate) || todayIsoLocal()).slice(0, 4);
+    const slug = slugifyName(raw.replace(/\b20\d{2}\b/g, " ")) || "trip";
+    const taken = new Set((options.existingTags || []).map((tag) => normalizeHolidayKey(tag)).filter(Boolean));
+    const base = `${year}/${slug}`;
+    if (!taken.has(base)) return base;
+    let counter = 2;
+    while (taken.has(`${base}-${counter}`)) counter += 1;
+    return `${base}-${counter}`;
+  }
+
   // --- Goal and trip prompts ------------------------------------------------------
   // Moments a goal or trip needs a decision: a goal reaching its target or its due
   // date, a trip starting or ending. Each prompt has a key that includes the date
@@ -5704,6 +5748,9 @@ const core = (() => {
     parseGoalDefinition,
     computeSinkingFund,
     buildGoalPrompts,
+    slugifyName,
+    deriveGoalKey,
+    deriveTripTag,
     parseOwedChildLine,
     buildOwedChildLine,
     buildOwedSharesFromTokens,
@@ -6613,7 +6660,7 @@ class FinanceTrackerPlugin extends Plugin {
       id: "finance-tracker-create-savings-goal",
       name: "Create savings goal",
       callback: async () => {
-        new SavingsGoalModal(this.app, this, async () => {}).open();
+        this.openNewGoal();
       },
     });
 
@@ -8910,6 +8957,7 @@ class FinanceTrackerPlugin extends Plugin {
     const parsedEndDate = core.parseIsoDate(options.endDate) || startDate;
     const endDate = parsedEndDate < startDate ? startDate : parsedEndDate;
     const currency = core.normalizeCurrency(options.currency || this.settings.defaultCurrency);
+    const tripCurrency = core.normalizeCurrency(options.tripCurrency || "", "");
     return [
       "---",
       `goal_name: ${holidayTitle}`,
@@ -8923,11 +8971,12 @@ class FinanceTrackerPlugin extends Plugin {
       "savings_progress_mode: account-plus-paid-planned",
       `currency: ${currency}`,
       `trip_tag: ${normalizedHolidayKey}`,
-      "trip_currency: ",
+      `trip_currency: ${tripCurrency}`,
       `start_date: ${startDate}`,
       `end_date: ${endDate}`,
       "total_budget: 0",
-      "exchange_rates: JPY=0.0095, JPY CASH=0.0098",
+      // Every new trip used to be born with yen rates, wherever it was going.
+      "exchange_rates: ",
       "exchange_rate_periods: ",
       "---",
       "",
@@ -8972,16 +9021,21 @@ class FinanceTrackerPlugin extends Plugin {
   buildSavingsGoalNoteContent(title, options = {}) {
     const goalName = String(title || "Savings goal").trim() || "Savings goal";
     const goalKey = core.normalizeCategoryPath(options.goalKey || buildGoalKeyFromName(goalName));
-    const dueDate = core.parseIsoDate(options.dueDate || "") || core.todayIsoLocal();
+    // A blank due date stays blank. It used to default to today, so a goal made
+    // without one was due the moment it existed.
+    const dueDate = core.parseIsoDate(options.dueDate || "") || "";
     const currency = core.normalizeCurrency(options.currency || this.settings.defaultCurrency);
+    const target = Number(options.targetAmount) > 0 ? core.roundCurrencyAmount(options.targetAmount) : 0;
     return [
       "---",
       `goal_name: ${goalName}`,
       `goal_key: ${goalKey}`,
-      "target_amount: 0",
+      `target_amount: ${target}`,
       "starting_balance: 0",
       `due_date: ${dueDate}`,
-      "active: false",
+      // Made on purpose, so it counts straight away: in the sidebar, the
+      // forecast and the prompts.
+      "active: true",
       "carry_missed_savings: false",
       `currency: ${currency}`,
       "---",
@@ -9014,7 +9068,29 @@ class FinanceTrackerPlugin extends Plugin {
       .filter((file) => file.path.startsWith(budgetsPrefix))
       .filter((file) => !file.path.startsWith(archivePrefix))
       .filter((file) => file.path !== defaultBudgetPath)
-      .filter((file) => file.path !== recurringNotePath);
+      .filter((file) => file.path !== recurringNotePath)
+      .filter((file) => !file.path.startsWith(`${this.getBillsFolderPath()}/`));
+  }
+
+  // Every goal key and income category already in use, so a new goal's key
+  // can't collide with either.
+  async collectTakenGoalKeys() {
+    const goals = await this.collectSavingsGoalDefinitions();
+    const entries = await this.collectAllTransactions();
+    const keys = new Set(goals.map((goal) => goal.goalKey).filter(Boolean));
+    for (const entry of entries) {
+      if (entry.entryType === "income" && entry.goalKey) keys.add(entry.goalKey);
+    }
+    return Array.from(keys);
+  }
+
+  async collectTakenTripTags() {
+    const entries = await this.collectAllTransactions();
+    const tags = new Set(entries.map((entry) => entry.holidayKey).filter(Boolean));
+    for (const goal of await this.collectSavingsGoalDefinitions()) {
+      if (goal.goalType === "holiday" && goal.tripTag) tags.add(goal.tripTag);
+    }
+    return Array.from(tags);
   }
 
   getSavingsGoalFiles() {
@@ -9048,6 +9124,7 @@ class FinanceTrackerPlugin extends Plugin {
         currency: definition?.currency || this.settings.defaultCurrency,
         endDate: definition?.endDate,
         startDate: definition?.startDate,
+        tripCurrency: definition?.tripCurrency,
       })
     );
     this.settings.activeHolidayBudgetPath = file.path;
@@ -9071,6 +9148,7 @@ class FinanceTrackerPlugin extends Plugin {
         currency: definition?.currency || this.settings.defaultCurrency,
         dueDate: definition?.dueDate,
         goalKey: definition?.goalKey || buildGoalKeyFromName(safeName),
+        targetAmount: definition?.targetAmount,
       })
     );
   }
@@ -9568,6 +9646,7 @@ class FinanceTrackerPlugin extends Plugin {
           goalKey: holiday.savingsGoalKey,
           goalName: holiday.holidayName,
           goalType: "holiday",
+          tripTag: holiday.holidayKey,
           paidPlannedExpenses: 0,
           plannedExpenses: holiday.plannedExpenses,
           savingsDisplayMode: holiday.savingsDisplayMode,
@@ -13996,6 +14075,12 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     return true;
   },
 
+  openNewGoal(onComplete) {
+    const modal = new SavingsGoalModal(this.app, this, onComplete);
+    modal.open();
+    return modal;
+  },
+
   openContribute(options = {}) {
     const modal = new ContributeGoalModal(this.app, this, options);
     modal.open();
@@ -15433,7 +15518,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     const toolbar = host.createDiv({ cls: "finance-hub-toolbar" });
     addAction(toolbar, "Contribute", () => this.openContribute({ onDone: () => view.refresh() }), { primary: true, opensModal: true });
     addAction(toolbar, "Withdraw", () => this.openContribute({ mode: "withdraw", onDone: () => view.refresh() }), { opensModal: true });
-    addAction(toolbar, "New goal", () => new SavingsGoalModal(this.app, this, async () => view.refresh()).open(), {
+    addAction(toolbar, "New goal", () => this.openNewGoal(async () => view.refresh()), {
       opensModal: true,
     });
     addAction(toolbar, this.settings.tripModeActive ? "End trip mode" : "Start trip mode", async () => {
@@ -17483,13 +17568,22 @@ class HolidayBudgetModal extends Modal {
       endDate: core.addDays(core.todayIsoLocal(), 7) || core.todayIsoLocal(),
       holidayKey: "",
       name: "",
+      nameEdited: false,
       startDate: core.todayIsoLocal(),
+      tagOverride: "",
+      tripCurrency: "",
     };
+    this.takenTripTags = [];
   }
 
   getMatchingFiles() {
     const query = this.query.trim().toLowerCase();
-    const files = this.plugin.getHolidayBudgetFiles();
+    // Only trips: a plain savings goal lives in the same folder but has no
+    // trip tag, and choosing one here only led to "That note has no trip tag".
+    const files = this.plugin.getHolidayBudgetFiles().filter((file) => {
+      const frontmatter = this.app.metadataCache?.getFileCache?.(file)?.frontmatter;
+      return !frontmatter || Boolean(frontmatter.trip_tag || frontmatter.holiday_tag || frontmatter.holiday);
+    });
     if (!query) return files;
     return files.filter((file) => file.basename.toLowerCase().includes(query));
   }
@@ -17507,8 +17601,14 @@ class HolidayBudgetModal extends Modal {
 
   updateCreateDefaults() {
     const name = this.query.trim();
-    this.createForm.name = name;
-    this.createForm.holidayKey = core.normalizeHolidayKey(this.createForm.holidayKey || "") || guessHolidayTagFromName(name || "Trip");
+    if (!this.createForm.nameEdited) this.createForm.name = name;
+    const override = core.normalizeHolidayKey(this.createForm.tagOverride || "");
+    this.createForm.holidayKey =
+      override ||
+      core.deriveTripTag(this.createForm.name || name || "Trip", {
+        startDate: this.createForm.startDate,
+        existingTags: this.takenTripTags || [],
+      });
   }
 
   async createFromForm() {
@@ -17521,6 +17621,7 @@ class HolidayBudgetModal extends Modal {
       holidayKey: this.createForm.holidayKey,
       name: holidayName,
       startDate: this.createForm.startDate,
+      tripCurrency: this.createForm.tripCurrency,
     });
     if (file) {
       await this.app.workspace.getLeaf(true).openFile(file);
@@ -17551,7 +17652,7 @@ class HolidayBudgetModal extends Modal {
     if (!trimmed) {
       this.resultsEl.createDiv({
         cls: "finance-tracker-empty",
-        text: "Search for an existing trip budget, or type a new trip name to create one.",
+        text: "Type to search your trips, or a new trip's name to create one.",
       });
       if (this.createPanelEl) {
         this.createPanelEl.empty();
@@ -17581,57 +17682,67 @@ class HolidayBudgetModal extends Modal {
     if (!this.query.trim()) return;
 
     this.updateCreateDefaults();
-    this.createPanelEl.createEl("h3", { text: "New trip details" });
-    this.createPanelEl.createEl("p", {
-      cls: "finance-tracker-settings-section-copy",
-      text: "Set the tracking tag and trip dates now so the trip budget note is ready to use immediately.",
+    this.createPanelEl.createEl("h3", { text: "New trip" });
+
+    const field = (label, type, key, attrs = {}) => {
+      const row = this.createPanelEl.createDiv({ cls: "finance-edit-row" });
+      row.createEl("label", { cls: "finance-edit-label", text: label });
+      const input = row.createEl("input", { type, attr: { ...attrs, "aria-label": label } });
+      input.value = this.createForm[key] || "";
+      input.addEventListener("input", () => {
+        this.createForm[key] = input.value;
+        if (key === "name") this.createForm.nameEdited = true;
+        this.updateCreateDefaults();
+        updateHint();
+      });
+      return input;
+    };
+    field("Name", "text", "name", { placeholder: "Japan 2026" });
+    field("Start", "date", "startDate");
+    field("End", "date", "endDate");
+    const currencyInput = field("Currency", "text", "tripCurrency", { placeholder: "JPY", maxlength: "3", autocapitalize: "characters" });
+    currencyInput.addEventListener("change", () => {
+      this.createForm.tripCurrency = core.normalizeCurrency(currencyInput.value, "");
+      currencyInput.value = this.createForm.tripCurrency;
+      updateHint();
     });
 
-    const nameSetting = new Setting(this.createPanelEl).setName("Trip name").setDesc("This is the budget note title and file name.");
-    nameSetting.addText((text) => {
-      text.setPlaceholder("Japan 2026").setValue(this.createForm.name).onChange((value) => {
-        this.createForm.name = value;
-      });
-    });
+    const hint = this.createPanelEl.createDiv({ cls: "finance-tracker-budget-meta finance-goal-tag-hint" });
+    const updateHint = () => {
+      const currency = core.normalizeCurrency(this.createForm.tripCurrency || "", "");
+      hint.setText(
+        `Spending on the trip is tagged #log/spending/${this.createForm.holidayKey}/food and so on.` +
+          (currency ? ` Amounts in ${currency} need a rate; add one with Add trip exchange rate.` : " Leave the currency blank if you're spending your own.")
+      );
+    };
+    updateHint();
 
-    const tagSetting = new Setting(this.createPanelEl)
-      .setName("Trip tracking tag")
-      .setDesc("Used by the holiday dashboard to match tags like #log/spending/2026/japan/flights.");
-    tagSetting.addText((text) => {
-      text.setPlaceholder("2026/japan").setValue(this.createForm.holidayKey).onChange((value) => {
-        this.createForm.holidayKey = core.normalizeHolidayKey(value) || guessHolidayTagFromName(this.createForm.name || this.query);
-      });
-    });
-
-    const startSetting = new Setting(this.createPanelEl).setName("Start date").setDesc("Saved as a date property in the trip budget note.");
-    startSetting.addText((text) => {
-      text.inputEl.type = "date";
-      text.setValue(this.createForm.startDate).onChange((value) => {
-        this.createForm.startDate = core.parseIsoDate(value) || core.todayIsoLocal();
-      });
-    });
-
-    const endSetting = new Setting(this.createPanelEl).setName("End date").setDesc("Saved as a date property in the trip budget note.");
-    endSetting.addText((text) => {
-      text.inputEl.type = "date";
-      text.setValue(this.createForm.endDate).onChange((value) => {
-        this.createForm.endDate = core.parseIsoDate(value) || this.createForm.startDate;
-      });
+    const advanced = this.createPanelEl.createEl("details", { cls: "finance-goal-advanced" });
+    advanced.createEl("summary", { text: "Advanced" });
+    const overrideRow = advanced.createDiv({ cls: "finance-edit-row" });
+    overrideRow.createEl("label", { cls: "finance-edit-label", text: "Trip tag" });
+    const overrideInput = overrideRow.createEl("input", { type: "text", attr: { placeholder: this.createForm.holidayKey, "aria-label": "Trip tag" } });
+    overrideInput.value = this.createForm.tagOverride || "";
+    overrideInput.addEventListener("input", () => {
+      this.createForm.tagOverride = overrideInput.value;
+      this.updateCreateDefaults();
+      updateHint();
     });
 
     const actions = this.createPanelEl.createDiv({ cls: "finance-tracker-settings-actions" });
-    const createButton = actions.createEl("button", { text: "Create trip budget" });
+    const createButton = actions.createEl("button", { text: "Create trip", cls: "mod-cta" });
     createButton.addEventListener("click", async () => {
       await this.createFromForm();
     });
   }
 
-  onOpen() {
+  async onOpen() {
     const { contentEl } = this;
     contentEl.empty();
+    this.takenTripTags = await this.plugin.collectTakenTripTags();
     contentEl.createEl("h2", { text: "Select or create a trip" });
     const intro = contentEl.createEl("p", {
-      text: "Search an existing trip budget. If nothing matches, choose the create option to start a new one inside your budgets folder.",
+      text: "Search your trips. If nothing matches, type the new trip's name to create it.",
     });
     intro.addClass("finance-tracker-settings-section-copy");
 
@@ -17787,74 +17898,108 @@ class ExchangeRateModal extends Modal {
   }
 }
 
+// A goal is a name, a target and (optionally) a date. The key its tags are built
+// from is worked out from the name and only shown as the tag it produces; the
+// Advanced section is there for someone who wants a different one.
 class SavingsGoalModal extends Modal {
   constructor(app, plugin, onComplete) {
     super(app);
     this.plugin = plugin;
     this.onComplete = onComplete;
-    this.form = {
-      dueDate: "",
-      goalKey: "",
-      name: "",
-    };
+    this.form = { dueDate: "", name: "", target: "", keyOverride: "" };
+    this.takenKeys = [];
+  }
+
+  currentKey() {
+    const override = core.slugifyName(this.form.keyOverride);
+    return override || core.deriveGoalKey(this.form.name, this.takenKeys);
   }
 
   async submit() {
     const name = String(this.form.name || "").trim();
-    if (!name) return;
+    if (!name) {
+      new Notice("Give the goal a name first.");
+      return;
+    }
+    const goalKey = this.currentKey();
+    if (this.form.keyOverride && this.takenKeys.includes(goalKey)) {
+      new Notice(`#log/income/${goalKey} is already in use. Choose another tag name, or leave it blank.`);
+      return;
+    }
+    const target = core.parseNumber(this.form.target);
     const file = await this.plugin.createOrOpenSavingsGoal({
       dueDate: this.form.dueDate,
-      goalKey: this.form.goalKey || buildGoalKeyFromName(name),
+      goalKey,
       name,
+      targetAmount: Number.isFinite(target) && target > 0 ? target : 0,
     });
     if (file) {
       await this.app.workspace.getLeaf(true).openFile(file);
-      if (typeof this.onComplete === "function") {
-        await this.onComplete(file);
-      }
+      if (typeof this.onComplete === "function") await this.onComplete(file);
     }
     this.close();
   }
 
-  onOpen() {
+  async onOpen() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl("h2", { text: "Create savings goal" });
+    contentEl.createEl("h2", { text: "New savings goal" });
+    this.takenKeys = await this.plugin.collectTakenGoalKeys();
 
-    new Setting(contentEl)
-      .setName("Goal name")
-      .setDesc("For example House Deposit or Rainy Day Fund.")
-      .addText((text) =>
-        text.setPlaceholder("House Deposit").onChange((value) => {
-          this.form.name = value;
-          this.form.goalKey = buildGoalKeyFromName(value);
-        })
-      );
-
-    new Setting(contentEl)
-      .setName("Goal key")
-      .setDesc("Used by tags like #log/income/house-deposit.")
-      .addText((text) =>
-        text.setPlaceholder("house-deposit").setValue(this.form.goalKey).onChange((value) => {
-          this.form.goalKey = core.normalizeCategoryPath(value) || buildGoalKeyFromName(this.form.name);
-        })
-      );
-
-    new Setting(contentEl)
-      .setName("Due date")
-      .setDesc("Optional target date for calculating required savings per period.")
-      .addText((text) => {
-        text.inputEl.type = "date";
-        text.setValue(this.form.dueDate).onChange((value) => {
-          this.form.dueDate = core.parseIsoDate(value) || "";
-        });
+    const field = (label, attrs, key) => {
+      const row = contentEl.createDiv({ cls: "finance-edit-row" });
+      row.createEl("label", { cls: "finance-edit-label", text: label });
+      const input = row.createEl("input", { type: attrs.type || "text", attr: { ...attrs.attr, "aria-label": label } });
+      input.value = this.form[key];
+      input.addEventListener("input", () => {
+        this.form[key] = input.value;
+        updateHint();
       });
+      return input;
+    };
+
+    const nameInput = field("Name", { attr: { placeholder: "House deposit" } }, "name");
+    field("Target", { type: "number", attr: { step: "0.01", min: "0", inputmode: "decimal", placeholder: "2000" } }, "target");
+    field("Due date", { type: "date", attr: {} }, "dueDate");
+    const hint = contentEl.createDiv({ cls: "finance-tracker-budget-meta finance-goal-tag-hint" });
+
+    const advanced = contentEl.createEl("details", { cls: "finance-goal-advanced" });
+    advanced.createEl("summary", { text: "Advanced" });
+    const overrideRow = advanced.createDiv({ cls: "finance-edit-row" });
+    overrideRow.createEl("label", { cls: "finance-edit-label", text: "Tag name" });
+    const overrideInput = overrideRow.createEl("input", { type: "text", attr: { placeholder: "worked out from the name", "aria-label": "Tag name" } });
+    overrideInput.addEventListener("input", () => {
+      this.form.keyOverride = overrideInput.value;
+      updateHint();
+    });
+
+    const updateHint = () => {
+      const name = String(this.form.name || "").trim();
+      hint.setText(
+        name
+          ? `Contributions are logged as #log/income/${this.currentKey()}. The due date is optional.`
+          : "The due date is optional; with one, the goal shows what to set aside each week."
+      );
+    };
+    updateHint();
 
     const actions = contentEl.createDiv({ cls: "finance-tracker-settings-actions" });
-    const createButton = actions.createEl("button", { text: "Create goal note" });
+    const createButton = actions.createEl("button", { text: "Create goal", cls: "mod-cta" });
     createButton.addEventListener("click", async () => {
-      await this.submit();
+      createButton.disabled = true;
+      try {
+        await this.submit();
+      } catch (error) {
+        new Notice(`Creating the goal failed: ${error.message}`);
+      } finally {
+        createButton.disabled = false;
+      }
     });
+    window.setTimeout(() => nameInput.focus(), 0);
+  }
+
+  onClose() {
+    this.contentEl.empty();
   }
 }
 
@@ -19009,7 +19154,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
     addSection("Savings goals", "Create standalone savings goal notes for things like a house deposit or rainy day fund. Any goal with a target amount and a due date shows sinking-fund math automatically.");
     const savingsActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
     addAction(savingsActions, "Create savings goal", () => {
-      new SavingsGoalModal(this.app, this.plugin, async () => this.display()).open();
+      this.plugin.openNewGoal(async () => this.display());
     }, { primary: true, opensModal: true });
 
     const savingsGoalListEl = containerEl.createDiv({ cls: "finance-tracker-goal-list" });

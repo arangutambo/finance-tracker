@@ -38,7 +38,7 @@ class FinanceTrackerPlugin extends Plugin {
       id: "finance-tracker-create-savings-goal",
       name: "Create savings goal",
       callback: async () => {
-        new SavingsGoalModal(this.app, this, async () => {}).open();
+        this.openNewGoal();
       },
     });
 
@@ -2335,6 +2335,7 @@ class FinanceTrackerPlugin extends Plugin {
     const parsedEndDate = core.parseIsoDate(options.endDate) || startDate;
     const endDate = parsedEndDate < startDate ? startDate : parsedEndDate;
     const currency = core.normalizeCurrency(options.currency || this.settings.defaultCurrency);
+    const tripCurrency = core.normalizeCurrency(options.tripCurrency || "", "");
     return [
       "---",
       `goal_name: ${holidayTitle}`,
@@ -2348,11 +2349,12 @@ class FinanceTrackerPlugin extends Plugin {
       "savings_progress_mode: account-plus-paid-planned",
       `currency: ${currency}`,
       `trip_tag: ${normalizedHolidayKey}`,
-      "trip_currency: ",
+      `trip_currency: ${tripCurrency}`,
       `start_date: ${startDate}`,
       `end_date: ${endDate}`,
       "total_budget: 0",
-      "exchange_rates: JPY=0.0095, JPY CASH=0.0098",
+      // Every new trip used to be born with yen rates, wherever it was going.
+      "exchange_rates: ",
       "exchange_rate_periods: ",
       "---",
       "",
@@ -2397,16 +2399,21 @@ class FinanceTrackerPlugin extends Plugin {
   buildSavingsGoalNoteContent(title, options = {}) {
     const goalName = String(title || "Savings goal").trim() || "Savings goal";
     const goalKey = core.normalizeCategoryPath(options.goalKey || buildGoalKeyFromName(goalName));
-    const dueDate = core.parseIsoDate(options.dueDate || "") || core.todayIsoLocal();
+    // A blank due date stays blank. It used to default to today, so a goal made
+    // without one was due the moment it existed.
+    const dueDate = core.parseIsoDate(options.dueDate || "") || "";
     const currency = core.normalizeCurrency(options.currency || this.settings.defaultCurrency);
+    const target = Number(options.targetAmount) > 0 ? core.roundCurrencyAmount(options.targetAmount) : 0;
     return [
       "---",
       `goal_name: ${goalName}`,
       `goal_key: ${goalKey}`,
-      "target_amount: 0",
+      `target_amount: ${target}`,
       "starting_balance: 0",
       `due_date: ${dueDate}`,
-      "active: false",
+      // Made on purpose, so it counts straight away: in the sidebar, the
+      // forecast and the prompts.
+      "active: true",
       "carry_missed_savings: false",
       `currency: ${currency}`,
       "---",
@@ -2439,7 +2446,29 @@ class FinanceTrackerPlugin extends Plugin {
       .filter((file) => file.path.startsWith(budgetsPrefix))
       .filter((file) => !file.path.startsWith(archivePrefix))
       .filter((file) => file.path !== defaultBudgetPath)
-      .filter((file) => file.path !== recurringNotePath);
+      .filter((file) => file.path !== recurringNotePath)
+      .filter((file) => !file.path.startsWith(`${this.getBillsFolderPath()}/`));
+  }
+
+  // Every goal key and income category already in use, so a new goal's key
+  // can't collide with either.
+  async collectTakenGoalKeys() {
+    const goals = await this.collectSavingsGoalDefinitions();
+    const entries = await this.collectAllTransactions();
+    const keys = new Set(goals.map((goal) => goal.goalKey).filter(Boolean));
+    for (const entry of entries) {
+      if (entry.entryType === "income" && entry.goalKey) keys.add(entry.goalKey);
+    }
+    return Array.from(keys);
+  }
+
+  async collectTakenTripTags() {
+    const entries = await this.collectAllTransactions();
+    const tags = new Set(entries.map((entry) => entry.holidayKey).filter(Boolean));
+    for (const goal of await this.collectSavingsGoalDefinitions()) {
+      if (goal.goalType === "holiday" && goal.tripTag) tags.add(goal.tripTag);
+    }
+    return Array.from(tags);
   }
 
   getSavingsGoalFiles() {
@@ -2473,6 +2502,7 @@ class FinanceTrackerPlugin extends Plugin {
         currency: definition?.currency || this.settings.defaultCurrency,
         endDate: definition?.endDate,
         startDate: definition?.startDate,
+        tripCurrency: definition?.tripCurrency,
       })
     );
     this.settings.activeHolidayBudgetPath = file.path;
@@ -2496,6 +2526,7 @@ class FinanceTrackerPlugin extends Plugin {
         currency: definition?.currency || this.settings.defaultCurrency,
         dueDate: definition?.dueDate,
         goalKey: definition?.goalKey || buildGoalKeyFromName(safeName),
+        targetAmount: definition?.targetAmount,
       })
     );
   }
@@ -2993,6 +3024,7 @@ class FinanceTrackerPlugin extends Plugin {
           goalKey: holiday.savingsGoalKey,
           goalName: holiday.holidayName,
           goalType: "holiday",
+          tripTag: holiday.holidayKey,
           paidPlannedExpenses: 0,
           plannedExpenses: holiday.plannedExpenses,
           savingsDisplayMode: holiday.savingsDisplayMode,

@@ -9,13 +9,22 @@ class HolidayBudgetModal extends Modal {
       endDate: core.addDays(core.todayIsoLocal(), 7) || core.todayIsoLocal(),
       holidayKey: "",
       name: "",
+      nameEdited: false,
       startDate: core.todayIsoLocal(),
+      tagOverride: "",
+      tripCurrency: "",
     };
+    this.takenTripTags = [];
   }
 
   getMatchingFiles() {
     const query = this.query.trim().toLowerCase();
-    const files = this.plugin.getHolidayBudgetFiles();
+    // Only trips: a plain savings goal lives in the same folder but has no
+    // trip tag, and choosing one here only led to "That note has no trip tag".
+    const files = this.plugin.getHolidayBudgetFiles().filter((file) => {
+      const frontmatter = this.app.metadataCache?.getFileCache?.(file)?.frontmatter;
+      return !frontmatter || Boolean(frontmatter.trip_tag || frontmatter.holiday_tag || frontmatter.holiday);
+    });
     if (!query) return files;
     return files.filter((file) => file.basename.toLowerCase().includes(query));
   }
@@ -33,8 +42,14 @@ class HolidayBudgetModal extends Modal {
 
   updateCreateDefaults() {
     const name = this.query.trim();
-    this.createForm.name = name;
-    this.createForm.holidayKey = core.normalizeHolidayKey(this.createForm.holidayKey || "") || guessHolidayTagFromName(name || "Trip");
+    if (!this.createForm.nameEdited) this.createForm.name = name;
+    const override = core.normalizeHolidayKey(this.createForm.tagOverride || "");
+    this.createForm.holidayKey =
+      override ||
+      core.deriveTripTag(this.createForm.name || name || "Trip", {
+        startDate: this.createForm.startDate,
+        existingTags: this.takenTripTags || [],
+      });
   }
 
   async createFromForm() {
@@ -47,6 +62,7 @@ class HolidayBudgetModal extends Modal {
       holidayKey: this.createForm.holidayKey,
       name: holidayName,
       startDate: this.createForm.startDate,
+      tripCurrency: this.createForm.tripCurrency,
     });
     if (file) {
       await this.app.workspace.getLeaf(true).openFile(file);
@@ -77,7 +93,7 @@ class HolidayBudgetModal extends Modal {
     if (!trimmed) {
       this.resultsEl.createDiv({
         cls: "finance-tracker-empty",
-        text: "Search for an existing trip budget, or type a new trip name to create one.",
+        text: "Type to search your trips, or a new trip's name to create one.",
       });
       if (this.createPanelEl) {
         this.createPanelEl.empty();
@@ -107,57 +123,67 @@ class HolidayBudgetModal extends Modal {
     if (!this.query.trim()) return;
 
     this.updateCreateDefaults();
-    this.createPanelEl.createEl("h3", { text: "New trip details" });
-    this.createPanelEl.createEl("p", {
-      cls: "finance-tracker-settings-section-copy",
-      text: "Set the tracking tag and trip dates now so the trip budget note is ready to use immediately.",
+    this.createPanelEl.createEl("h3", { text: "New trip" });
+
+    const field = (label, type, key, attrs = {}) => {
+      const row = this.createPanelEl.createDiv({ cls: "finance-edit-row" });
+      row.createEl("label", { cls: "finance-edit-label", text: label });
+      const input = row.createEl("input", { type, attr: { ...attrs, "aria-label": label } });
+      input.value = this.createForm[key] || "";
+      input.addEventListener("input", () => {
+        this.createForm[key] = input.value;
+        if (key === "name") this.createForm.nameEdited = true;
+        this.updateCreateDefaults();
+        updateHint();
+      });
+      return input;
+    };
+    field("Name", "text", "name", { placeholder: "Japan 2026" });
+    field("Start", "date", "startDate");
+    field("End", "date", "endDate");
+    const currencyInput = field("Currency", "text", "tripCurrency", { placeholder: "JPY", maxlength: "3", autocapitalize: "characters" });
+    currencyInput.addEventListener("change", () => {
+      this.createForm.tripCurrency = core.normalizeCurrency(currencyInput.value, "");
+      currencyInput.value = this.createForm.tripCurrency;
+      updateHint();
     });
 
-    const nameSetting = new Setting(this.createPanelEl).setName("Trip name").setDesc("This is the budget note title and file name.");
-    nameSetting.addText((text) => {
-      text.setPlaceholder("Japan 2026").setValue(this.createForm.name).onChange((value) => {
-        this.createForm.name = value;
-      });
-    });
+    const hint = this.createPanelEl.createDiv({ cls: "finance-tracker-budget-meta finance-goal-tag-hint" });
+    const updateHint = () => {
+      const currency = core.normalizeCurrency(this.createForm.tripCurrency || "", "");
+      hint.setText(
+        `Spending on the trip is tagged #log/spending/${this.createForm.holidayKey}/food and so on.` +
+          (currency ? ` Amounts in ${currency} need a rate; add one with Add trip exchange rate.` : " Leave the currency blank if you're spending your own.")
+      );
+    };
+    updateHint();
 
-    const tagSetting = new Setting(this.createPanelEl)
-      .setName("Trip tracking tag")
-      .setDesc("Used by the holiday dashboard to match tags like #log/spending/2026/japan/flights.");
-    tagSetting.addText((text) => {
-      text.setPlaceholder("2026/japan").setValue(this.createForm.holidayKey).onChange((value) => {
-        this.createForm.holidayKey = core.normalizeHolidayKey(value) || guessHolidayTagFromName(this.createForm.name || this.query);
-      });
-    });
-
-    const startSetting = new Setting(this.createPanelEl).setName("Start date").setDesc("Saved as a date property in the trip budget note.");
-    startSetting.addText((text) => {
-      text.inputEl.type = "date";
-      text.setValue(this.createForm.startDate).onChange((value) => {
-        this.createForm.startDate = core.parseIsoDate(value) || core.todayIsoLocal();
-      });
-    });
-
-    const endSetting = new Setting(this.createPanelEl).setName("End date").setDesc("Saved as a date property in the trip budget note.");
-    endSetting.addText((text) => {
-      text.inputEl.type = "date";
-      text.setValue(this.createForm.endDate).onChange((value) => {
-        this.createForm.endDate = core.parseIsoDate(value) || this.createForm.startDate;
-      });
+    const advanced = this.createPanelEl.createEl("details", { cls: "finance-goal-advanced" });
+    advanced.createEl("summary", { text: "Advanced" });
+    const overrideRow = advanced.createDiv({ cls: "finance-edit-row" });
+    overrideRow.createEl("label", { cls: "finance-edit-label", text: "Trip tag" });
+    const overrideInput = overrideRow.createEl("input", { type: "text", attr: { placeholder: this.createForm.holidayKey, "aria-label": "Trip tag" } });
+    overrideInput.value = this.createForm.tagOverride || "";
+    overrideInput.addEventListener("input", () => {
+      this.createForm.tagOverride = overrideInput.value;
+      this.updateCreateDefaults();
+      updateHint();
     });
 
     const actions = this.createPanelEl.createDiv({ cls: "finance-tracker-settings-actions" });
-    const createButton = actions.createEl("button", { text: "Create trip budget" });
+    const createButton = actions.createEl("button", { text: "Create trip", cls: "mod-cta" });
     createButton.addEventListener("click", async () => {
       await this.createFromForm();
     });
   }
 
-  onOpen() {
+  async onOpen() {
     const { contentEl } = this;
     contentEl.empty();
+    this.takenTripTags = await this.plugin.collectTakenTripTags();
     contentEl.createEl("h2", { text: "Select or create a trip" });
     const intro = contentEl.createEl("p", {
-      text: "Search an existing trip budget. If nothing matches, choose the create option to start a new one inside your budgets folder.",
+      text: "Search your trips. If nothing matches, type the new trip's name to create it.",
     });
     intro.addClass("finance-tracker-settings-section-copy");
 
@@ -313,74 +339,108 @@ class ExchangeRateModal extends Modal {
   }
 }
 
+// A goal is a name, a target and (optionally) a date. The key its tags are built
+// from is worked out from the name and only shown as the tag it produces; the
+// Advanced section is there for someone who wants a different one.
 class SavingsGoalModal extends Modal {
   constructor(app, plugin, onComplete) {
     super(app);
     this.plugin = plugin;
     this.onComplete = onComplete;
-    this.form = {
-      dueDate: "",
-      goalKey: "",
-      name: "",
-    };
+    this.form = { dueDate: "", name: "", target: "", keyOverride: "" };
+    this.takenKeys = [];
+  }
+
+  currentKey() {
+    const override = core.slugifyName(this.form.keyOverride);
+    return override || core.deriveGoalKey(this.form.name, this.takenKeys);
   }
 
   async submit() {
     const name = String(this.form.name || "").trim();
-    if (!name) return;
+    if (!name) {
+      new Notice("Give the goal a name first.");
+      return;
+    }
+    const goalKey = this.currentKey();
+    if (this.form.keyOverride && this.takenKeys.includes(goalKey)) {
+      new Notice(`#log/income/${goalKey} is already in use. Choose another tag name, or leave it blank.`);
+      return;
+    }
+    const target = core.parseNumber(this.form.target);
     const file = await this.plugin.createOrOpenSavingsGoal({
       dueDate: this.form.dueDate,
-      goalKey: this.form.goalKey || buildGoalKeyFromName(name),
+      goalKey,
       name,
+      targetAmount: Number.isFinite(target) && target > 0 ? target : 0,
     });
     if (file) {
       await this.app.workspace.getLeaf(true).openFile(file);
-      if (typeof this.onComplete === "function") {
-        await this.onComplete(file);
-      }
+      if (typeof this.onComplete === "function") await this.onComplete(file);
     }
     this.close();
   }
 
-  onOpen() {
+  async onOpen() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl("h2", { text: "Create savings goal" });
+    contentEl.createEl("h2", { text: "New savings goal" });
+    this.takenKeys = await this.plugin.collectTakenGoalKeys();
 
-    new Setting(contentEl)
-      .setName("Goal name")
-      .setDesc("For example House Deposit or Rainy Day Fund.")
-      .addText((text) =>
-        text.setPlaceholder("House Deposit").onChange((value) => {
-          this.form.name = value;
-          this.form.goalKey = buildGoalKeyFromName(value);
-        })
-      );
-
-    new Setting(contentEl)
-      .setName("Goal key")
-      .setDesc("Used by tags like #log/income/house-deposit.")
-      .addText((text) =>
-        text.setPlaceholder("house-deposit").setValue(this.form.goalKey).onChange((value) => {
-          this.form.goalKey = core.normalizeCategoryPath(value) || buildGoalKeyFromName(this.form.name);
-        })
-      );
-
-    new Setting(contentEl)
-      .setName("Due date")
-      .setDesc("Optional target date for calculating required savings per period.")
-      .addText((text) => {
-        text.inputEl.type = "date";
-        text.setValue(this.form.dueDate).onChange((value) => {
-          this.form.dueDate = core.parseIsoDate(value) || "";
-        });
+    const field = (label, attrs, key) => {
+      const row = contentEl.createDiv({ cls: "finance-edit-row" });
+      row.createEl("label", { cls: "finance-edit-label", text: label });
+      const input = row.createEl("input", { type: attrs.type || "text", attr: { ...attrs.attr, "aria-label": label } });
+      input.value = this.form[key];
+      input.addEventListener("input", () => {
+        this.form[key] = input.value;
+        updateHint();
       });
+      return input;
+    };
+
+    const nameInput = field("Name", { attr: { placeholder: "House deposit" } }, "name");
+    field("Target", { type: "number", attr: { step: "0.01", min: "0", inputmode: "decimal", placeholder: "2000" } }, "target");
+    field("Due date", { type: "date", attr: {} }, "dueDate");
+    const hint = contentEl.createDiv({ cls: "finance-tracker-budget-meta finance-goal-tag-hint" });
+
+    const advanced = contentEl.createEl("details", { cls: "finance-goal-advanced" });
+    advanced.createEl("summary", { text: "Advanced" });
+    const overrideRow = advanced.createDiv({ cls: "finance-edit-row" });
+    overrideRow.createEl("label", { cls: "finance-edit-label", text: "Tag name" });
+    const overrideInput = overrideRow.createEl("input", { type: "text", attr: { placeholder: "worked out from the name", "aria-label": "Tag name" } });
+    overrideInput.addEventListener("input", () => {
+      this.form.keyOverride = overrideInput.value;
+      updateHint();
+    });
+
+    const updateHint = () => {
+      const name = String(this.form.name || "").trim();
+      hint.setText(
+        name
+          ? `Contributions are logged as #log/income/${this.currentKey()}. The due date is optional.`
+          : "The due date is optional; with one, the goal shows what to set aside each week."
+      );
+    };
+    updateHint();
 
     const actions = contentEl.createDiv({ cls: "finance-tracker-settings-actions" });
-    const createButton = actions.createEl("button", { text: "Create goal note" });
+    const createButton = actions.createEl("button", { text: "Create goal", cls: "mod-cta" });
     createButton.addEventListener("click", async () => {
-      await this.submit();
+      createButton.disabled = true;
+      try {
+        await this.submit();
+      } catch (error) {
+        new Notice(`Creating the goal failed: ${error.message}`);
+      } finally {
+        createButton.disabled = false;
+      }
     });
+    window.setTimeout(() => nameInput.focus(), 0);
+  }
+
+  onClose() {
+    this.contentEl.empty();
   }
 }
 

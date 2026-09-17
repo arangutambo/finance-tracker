@@ -428,7 +428,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
     addSection("Savings goals", "Create standalone savings goal notes for things like a house deposit or rainy day fund. Any goal with a target amount and a due date shows sinking-fund math automatically.");
     const savingsActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
     addAction(savingsActions, "Create savings goal", () => {
-      new SavingsGoalModal(this.app, this.plugin, async () => this.display()).open();
+      this.plugin.openNewGoal(async () => this.display());
     }, { primary: true, opensModal: true });
 
     const savingsGoalListEl = containerEl.createDiv({ cls: "finance-tracker-goal-list" });

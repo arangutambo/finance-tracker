@@ -1815,3 +1815,7 @@
 .finance-goal-mode { margin-bottom: 10px; }
 .finance-edit-label.is-hidden,
 .finance-contribute-category.is-hidden { display: none; }
+
+.finance-goal-tag-hint { margin: 4px 0 8px; font-family: var(--font-interface); }
+.finance-goal-advanced { margin: 8px 0; }
+.finance-goal-advanced > summary { cursor: pointer; color: var(--text-muted); font-size: var(--font-ui-small); }
