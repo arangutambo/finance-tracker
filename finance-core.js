@@ -5036,11 +5036,36 @@ function parseSheetPrices(csvText) {
 }
 
 // The formula a sheet row needs, so setting one up is copy and paste.
-function sheetFormulaForTicker(ticker) {
+function sheetFormulaForTicker(ticker, attribute = "") {
   const symbol = normalizeTicker(ticker);
+  const extra = attribute ? `, "${attribute}"` : "";
   if (/^[A-Z]{3}AUD$/.test(symbol)) return `=GOOGLEFINANCE("CURRENCY:${symbol}")`;
-  if (symbol.endsWith(".AX")) return `=GOOGLEFINANCE("ASX:${symbol.slice(0, -3)}")`;
-  return `=GOOGLEFINANCE("${symbol}")`;
+  if (symbol.endsWith(".AX")) return `=GOOGLEFINANCE("ASX:${symbol.slice(0, -3)}"${extra})`;
+  return `=GOOGLEFINANCE("${symbol}"${extra})`;
+}
+
+// The whole sheet, as tab-separated text that pastes straight into Google Sheets:
+// one row per ticker held, plus a row for each foreign currency.
+function buildPriceSheetTemplate(tickers, currencies = []) {
+  const rows = [["Ticker", "Price", "Currency", "Name", "Previous close"].join("\t")];
+  for (const ticker of tickers || []) {
+    const symbol = normalizeTicker(ticker);
+    rows.push(
+      [
+        symbol,
+        sheetFormulaForTicker(symbol),
+        sheetFormulaForTicker(symbol, "currency"),
+        sheetFormulaForTicker(symbol, "name"),
+        sheetFormulaForTicker(symbol, "closeyest"),
+      ].join("\t")
+    );
+  }
+  for (const currency of currencies || []) {
+    const code = normalizeCurrency(currency);
+    if (code === "AUD") continue;
+    rows.push([`${code}AUD`, sheetFormulaForTicker(`${code}AUD`), "AUD", "", ""].join("\t"));
+  }
+  return rows.join("\n");
 }
 
 // Which cached quotes are too old to trust as current. Shown with a stale badge
@@ -5061,6 +5086,24 @@ function nextBackoff(previousFailures, now = Date.now()) {
   const failures = Math.max(1, Number(previousFailures) + 1 || 1);
   const minutes = Math.min(360, Math.pow(2, failures));
   return { failures, until: new Date(now + minutes * 60 * 1000).toISOString(), minutes };
+}
+
+// Net worth over time: account balances carried forward from each snapshot, plus
+// the portfolio's value carried forward from each point in its series. Before
+// either has a first point it counts as nothing, rather than stopping the line.
+function mergeNetWorthSeries(balanceSeries, portfolioSeries) {
+  const balances = (balanceSeries || []).slice().sort((left, right) => left.date.localeCompare(right.date));
+  const shares = (portfolioSeries || []).slice().sort((left, right) => left.date.localeCompare(right.date));
+  const dates = Array.from(new Set([...balances.map((point) => point.date), ...shares.map((point) => point.date)])).sort();
+  let cash = 0;
+  let held = 0;
+  let b = 0;
+  let s = 0;
+  return dates.map((date) => {
+    while (b < balances.length && balances[b].date <= date) cash = balances[b++].total;
+    while (s < shares.length && shares[s].date <= date) held = shares[s++].valueAud;
+    return { date, value: roundCurrencyAmount(cash + held) };
+  });
 }
 
 module.exports = {
@@ -5086,6 +5129,7 @@ module.exports = {
   parseYahooSearch,
   parseSheetPrices,
   sheetFormulaForTicker,
+  buildPriceSheetTemplate,
   markStaleQuotes,
   nextBackoff,
   planBillsFromLegacy,
@@ -5128,6 +5172,7 @@ module.exports = {
   isSpendingEntry,
   buildBalanceSnapshotLine,
   summarizeBalanceSnapshots,
+  mergeNetWorthSeries,
   computeForecastInputs,
   buildForecastProjection,
   runFinanceQuery,

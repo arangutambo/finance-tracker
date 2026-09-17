@@ -704,17 +704,32 @@ class SettleUpModal extends Modal {
 }
 
 class BalanceSnapshotModal extends Modal {
-  constructor(app, plugin) {
+  constructor(app, plugin, options = {}) {
     super(app);
     this.plugin = plugin;
     this.rows = [];
+    this.accountOptions = [];
+    this.onSaved = options.onSaved;
   }
 
   addRow(container, account = "", amount = "") {
     const row = container.createDiv({ cls: "finance-edit-row" });
-    const accountInput = row.createEl("input", { type: "text", attr: { placeholder: "anz-plus" } });
+    const accountInput = row.createEl("input", { type: "text", attr: { placeholder: "anz-plus", "aria-label": "Account" } });
     accountInput.value = account;
-    const amountInput = row.createEl("input", { type: "number", attr: { step: "0.01", placeholder: "5230" } });
+    // Accounts already snapshotted, and the ones captures say money came from, so
+    // "anz-plus" is picked rather than retyped as "anz plus" and split in two.
+    const suggest = new FinanceSuggest(accountInput, {
+      scope: this.scope,
+      getItems: (query) => {
+        const needle = core.normalizeCategoryPath(query);
+        return this.accountOptions
+          .filter((option) => !needle || option.includes(needle))
+          .filter((option) => !this.rows.some((other) => other.accountInput !== accountInput && core.normalizeCategoryPath(other.accountInput.value) === option))
+          .map((option) => ({ value: option, label: option, kind: "account" }));
+      },
+    });
+    this.suggests = [...(this.suggests || []), suggest];
+    const amountInput = row.createEl("input", { type: "number", attr: { step: "0.01", placeholder: "5230", inputmode: "decimal", "aria-label": "Balance" } });
     amountInput.value = amount === "" ? "" : String(amount);
     this.rows.push({ accountInput, amountInput });
   }
@@ -731,6 +746,10 @@ class BalanceSnapshotModal extends Modal {
     const rowsHost = contentEl.createDiv();
     const entries = await this.plugin.collectAllTransactions();
     const summary = core.summarizeBalanceSnapshots(entries);
+    const ledgerSources = (this.plugin.settings.captureLedger || [])
+      .map((record) => core.normalizeCategoryPath(record?.source || ""))
+      .filter((sourceName) => sourceName && !["manual", "quick-add", "csv-reconcile", "apple-pay"].includes(sourceName));
+    this.accountOptions = Array.from(new Set([...summary.accounts.map((account) => account.key), ...ledgerSources])).sort();
     for (const account of summary.accounts) {
       this.addRow(rowsHost, account.key, account.latest?.amount ?? "");
     }
@@ -759,6 +778,7 @@ class BalanceSnapshotModal extends Modal {
         await this.plugin.appendFinanceLines(core.todayIsoLocal(), lines);
         new Notice(`Logged ${lines.length} balance snapshot${lines.length === 1 ? "" : "s"}`);
         this.close();
+        if (typeof this.onSaved === "function") await this.onSaved();
       } catch (error) {
         new Notice(`Snapshot failed: ${error.message}`);
         saveButton.disabled = false;
@@ -767,6 +787,7 @@ class BalanceSnapshotModal extends Modal {
   }
 
   onClose() {
+    for (const suggest of this.suggests || []) suggest.destroy();
     this.contentEl.empty();
   }
 }

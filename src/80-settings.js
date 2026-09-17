@@ -528,6 +528,81 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
     const runwayStatus = containerEl.createDiv({ cls: "finance-tracker-vault-status" });
     this.renderRunwayStatus(runwayStatus).catch(() => {});
 
+    addSection(
+      "Portfolio",
+      "Shares and ETFs, from the Trades table in your portfolio note. Figures are arithmetic on your own records, not financial or tax advice."
+    );
+
+    new Setting(containerEl)
+      .setName("Price source")
+      .setDesc(
+        "Where share prices come from. Typed prices make no network requests. A Google Sheet and Yahoo both fetch over the internet, only when the portfolio is opened or refreshed, and only the tickers you hold are sent."
+      )
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("manual", "Typed in the portfolio note")
+          .addOption("sheet", "A published Google Sheet")
+          .addOption("yahoo", "Yahoo Finance (unofficial)")
+          .setValue(this.plugin.settings.priceSource || "manual")
+          .onChange(async (value) => {
+            this.plugin.settings.priceSource = value;
+            await this.plugin.saveSettings();
+            this.display();
+          })
+      );
+
+    const source = this.plugin.settings.priceSource || "manual";
+    if (source === "sheet") {
+      new Setting(containerEl)
+        .setName("Sheet link")
+        .setDesc("In Google Sheets: File → Share → Publish to web → the sheet → Comma-separated values → Publish, then paste the link here.")
+        .addText((text) =>
+          text
+            .setPlaceholder("https://docs.google.com/spreadsheets/d/e/…/pub?output=csv")
+            .setValue(this.plugin.settings.priceSheetUrl || "")
+            .onChange(async (value) => {
+              this.plugin.settings.priceSheetUrl = value.trim();
+              await this.plugin.saveSettings();
+            })
+        );
+      const help = containerEl.createEl("details", { cls: "finance-tracker-advanced" });
+      help.createEl("summary", { text: "Set up the sheet" });
+      help.createEl("p", {
+        cls: "finance-tracker-settings-section-copy",
+        text: "Copy this into cell A1 of a new Google Sheet. It has a row for each ticker you hold and each foreign currency, with the formulas already written.",
+      });
+      const template = help.createEl("textarea", { cls: "finance-price-sheet-template", attr: { rows: "6", readonly: "readonly" } });
+      this.plugin
+        .loadPortfolio()
+        .then((portfolio) => {
+          const tickers = Array.from(new Set(portfolio.trades.map((trade) => trade.ticker)));
+          const currencies = Array.from(new Set(portfolio.trades.map((trade) => trade.currency)));
+          template.value = core.buildPriceSheetTemplate(tickers.length ? tickers : ["VAS.AX", "AAPL"], currencies.length ? currencies : ["USD"]);
+        })
+        .catch(() => {});
+    }
+    if (source === "yahoo") {
+      containerEl.createEl("p", {
+        cls: "finance-tracker-settings-section-copy",
+        text: "Yahoo's price feed is free but unofficial: it can refuse requests or change without notice. When it refuses, the plugin backs off and keeps showing the last prices it fetched, marked as old.",
+      });
+    }
+    if (source !== "manual") {
+      new Setting(containerEl)
+        .setName("Refresh at most every (minutes)")
+        .setDesc("Opening the portfolio refreshes prices when they are older than this.")
+        .addText((text) =>
+          text.setValue(String(this.plugin.settings.priceRefreshMinutes || 60)).onChange(async (value) => {
+            const minutes = Number(value);
+            this.plugin.settings.priceRefreshMinutes = Number.isFinite(minutes) && minutes >= 5 ? Math.floor(minutes) : 60;
+            await this.plugin.saveSettings();
+          })
+        );
+    }
+
+    const portfolioActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
+    addAction(portfolioActions, "Open portfolio", () => this.plugin.openPortfolioNote(), { primary: true, errorPrefix: "Opening the portfolio" });
+
     addSection("Setup", "Re-run the guided setup to create any missing starter notes. Existing notes are never overwritten.");
     const setupActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
     addAction(setupActions, "Set up finance notes", () => new SetupWizardModal(this.app, this.plugin).open(), {

@@ -1684,3 +1684,9 @@
 .finance-portfolio-cost-line { stroke: var(--text-faint); stroke-dasharray: 4 3; }
 .finance-portfolio-source { margin-bottom: 8px; }
 .finance-portfolio-disclaimer { margin-top: 12px; font-style: italic; }
+
+.finance-price-sheet-template {
+  width: 100%;
+  font-family: var(--font-monospace);
+  font-size: 0.8em;
+}

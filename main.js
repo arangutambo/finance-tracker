@@ -5039,11 +5039,36 @@ const core = (() => {
   }
 
   // The formula a sheet row needs, so setting one up is copy and paste.
-  function sheetFormulaForTicker(ticker) {
+  function sheetFormulaForTicker(ticker, attribute = "") {
     const symbol = normalizeTicker(ticker);
+    const extra = attribute ? `, "${attribute}"` : "";
     if (/^[A-Z]{3}AUD$/.test(symbol)) return `=GOOGLEFINANCE("CURRENCY:${symbol}")`;
-    if (symbol.endsWith(".AX")) return `=GOOGLEFINANCE("ASX:${symbol.slice(0, -3)}")`;
-    return `=GOOGLEFINANCE("${symbol}")`;
+    if (symbol.endsWith(".AX")) return `=GOOGLEFINANCE("ASX:${symbol.slice(0, -3)}"${extra})`;
+    return `=GOOGLEFINANCE("${symbol}"${extra})`;
+  }
+
+  // The whole sheet, as tab-separated text that pastes straight into Google Sheets:
+  // one row per ticker held, plus a row for each foreign currency.
+  function buildPriceSheetTemplate(tickers, currencies = []) {
+    const rows = [["Ticker", "Price", "Currency", "Name", "Previous close"].join("\t")];
+    for (const ticker of tickers || []) {
+      const symbol = normalizeTicker(ticker);
+      rows.push(
+        [
+          symbol,
+          sheetFormulaForTicker(symbol),
+          sheetFormulaForTicker(symbol, "currency"),
+          sheetFormulaForTicker(symbol, "name"),
+          sheetFormulaForTicker(symbol, "closeyest"),
+        ].join("\t")
+      );
+    }
+    for (const currency of currencies || []) {
+      const code = normalizeCurrency(currency);
+      if (code === "AUD") continue;
+      rows.push([`${code}AUD`, sheetFormulaForTicker(`${code}AUD`), "AUD", "", ""].join("\t"));
+    }
+    return rows.join("\n");
   }
 
   // Which cached quotes are too old to trust as current. Shown with a stale badge
@@ -5064,6 +5089,24 @@ const core = (() => {
     const failures = Math.max(1, Number(previousFailures) + 1 || 1);
     const minutes = Math.min(360, Math.pow(2, failures));
     return { failures, until: new Date(now + minutes * 60 * 1000).toISOString(), minutes };
+  }
+
+  // Net worth over time: account balances carried forward from each snapshot, plus
+  // the portfolio's value carried forward from each point in its series. Before
+  // either has a first point it counts as nothing, rather than stopping the line.
+  function mergeNetWorthSeries(balanceSeries, portfolioSeries) {
+    const balances = (balanceSeries || []).slice().sort((left, right) => left.date.localeCompare(right.date));
+    const shares = (portfolioSeries || []).slice().sort((left, right) => left.date.localeCompare(right.date));
+    const dates = Array.from(new Set([...balances.map((point) => point.date), ...shares.map((point) => point.date)])).sort();
+    let cash = 0;
+    let held = 0;
+    let b = 0;
+    let s = 0;
+    return dates.map((date) => {
+      while (b < balances.length && balances[b].date <= date) cash = balances[b++].total;
+      while (s < shares.length && shares[s].date <= date) held = shares[s++].valueAud;
+      return { date, value: roundCurrencyAmount(cash + held) };
+    });
   }
 
   return {
@@ -5089,6 +5132,7 @@ const core = (() => {
     parseYahooSearch,
     parseSheetPrices,
     sheetFormulaForTicker,
+    buildPriceSheetTemplate,
     markStaleQuotes,
     nextBackoff,
     planBillsFromLegacy,
@@ -5131,6 +5175,7 @@ const core = (() => {
     isSpendingEntry,
     buildBalanceSnapshotLine,
     summarizeBalanceSnapshots,
+    mergeNetWorthSeries,
     computeForecastInputs,
     buildForecastProjection,
     runFinanceQuery,
@@ -6241,7 +6286,7 @@ class FinanceTrackerPlugin extends Plugin {
     this.addCommand({
       id: "finance-tracker-snapshot-balances",
       name: "Snapshot balances",
-      callback: () => new BalanceSnapshotModal(this.app, this).open(),
+      callback: () => this.openSnapshotBalances(),
     });
 
     // One palette entry instead of eight. Eight near-identical "Insert … block"
@@ -7128,6 +7173,12 @@ class FinanceTrackerPlugin extends Plugin {
 
   // One place that opens the edit modal, so every caller gets the same options
   // and a test can hold on to the instance.
+  openSnapshotBalances(options = {}) {
+    const modal = new BalanceSnapshotModal(this.app, this, options);
+    modal.open();
+    return modal;
+  }
+
   openQuickAdd(options = {}) {
     const modal = new QuickAddTransactionModal(this.app, this, options);
     modal.open();
@@ -12529,53 +12580,98 @@ class FinanceTrackerPlugin extends Plugin {
 
   // --- Net worth ------------------------------------------------------------------
 
+  // Net worth as what it is: money in accounts plus the portfolio. Cash comes from
+  // balance snapshots, shares from the portfolio at the prices already held. This
+  // block never fetches a price, so a dashboard note never reaches the network —
+  // only the portfolio block itself does, and only when a source is chosen.
   async renderNetWorthBlock(source, el, ctx) {
     el.empty();
     const config = parseConfigBlock(source);
     const currency = core.normalizeCurrency(config.currency || this.settings.defaultCurrency);
+    const referenceDate = core.todayIsoLocal();
     const entries = await this.collectAllTransactions();
     const summary = core.summarizeBalanceSnapshots(entries);
+    const portfolio = await this.buildPortfolioModel(referenceDate);
+    const hasPortfolio = portfolio.portfolio.trades.length > 0;
+    const shares = hasPortfolio ? portfolio.value.totals.valueAud : 0;
+    const rerender = () => this.renderNetWorthBlock(source, el, ctx);
 
     const wrapper = el.createDiv({ cls: "finance-tracker-dashboard" });
     const header = wrapper.createDiv({ cls: "finance-tracker-header" });
-    header.createEl("h3", { text: config.title || "Net worth" });
+    header.createEl("h3", { text: config.title || "Accounts & portfolio" });
     const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
-    addAction(headerActions, "Snapshot balances", () => new BalanceSnapshotModal(this.app, this).open(), {
+    addAction(headerActions, "Snapshot balances", () => new BalanceSnapshotModal(this.app, this, { onSaved: rerender }).open(), {
       primary: true,
       opensModal: true,
     });
+    addAction(headerActions, hasPortfolio ? "Portfolio" : "Log a trade", () => (hasPortfolio ? this.openPortfolioNote() : this.openLogTrade({ onSaved: rerender })), {
+      opensModal: !hasPortfolio,
+      errorPrefix: "Opening the portfolio",
+    });
 
-    if (!summary.accounts.length) {
+    if (!summary.accounts.length && !hasPortfolio) {
       wrapper.createDiv({
         cls: "finance-tracker-empty",
-        text: "No balance snapshots yet. Run the Snapshot balances command to log bullets like `- $5,230.00 #log/balance/anz-plus` into today's note.",
+        text: "Nothing to add up yet. Snapshot your account balances — a bullet like `- $5,230.00 #log/balance/anz-plus` in today's note — or log a trade.",
       });
       return;
     }
 
-    const cardData = [{ label: "Net worth", value: core.formatCurrency(summary.latestTotal, currency) }];
+    const cash = summary.latestTotal || 0;
+    const cards = [{ label: "Net worth", value: core.formatCurrency(cash + shares, currency) }];
+    cards.push({
+      label: "Accounts",
+      value: summary.accounts.length ? core.formatCurrency(cash, currency) : "No snapshots",
+      hint: summary.accounts.length ? `${summary.accounts.length} account${summary.accounts.length === 1 ? "" : "s"}` : "",
+    });
+    if (hasPortfolio) {
+      cards.push({
+        label: "Portfolio",
+        value: core.formatCurrency(shares, currency),
+        hint: portfolio.value.missing.length ? `${portfolio.value.missing.length} unpriced` : "",
+      });
+    }
     if (Number.isFinite(summary.previousTotal)) {
       const delta = core.roundCurrencyAmount(summary.latestTotal - summary.previousTotal);
-      cardData.push({
-        label: "Since last snapshot",
+      cards.push({
+        label: "Accounts since last snapshot",
         value: `${delta > 0 ? "▲" : delta < 0 ? "▼" : "—"} ${core.formatCurrency(Math.abs(delta), currency)}`,
         cls: delta > 0 ? "is-down" : delta < 0 ? "is-up" : "",
       });
     }
-    cardData.push({ label: "Accounts", value: String(summary.accounts.length) });
-    renderStatCards(wrapper, cardData);
+    renderStatCards(wrapper, cards);
 
-    this.renderLineChartCard(wrapper, "Balance trend", summary.series.map((point) => ({ date: point.date, value: point.total })), {
-      emptyText: "Take a second snapshot to draw the trend line.",
+    this.renderLineChartCard(wrapper, "Net worth over time", core.mergeNetWorthSeries(summary.series, portfolio.series), {
+      emptyText: hasPortfolio && !summary.accounts.length
+        ? "The line starts once there is a balance snapshot, or price history for the portfolio."
+        : "Take a second snapshot to draw the trend line.",
     });
 
     const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
-    section.createEl("h4", { text: "Accounts" });
+    section.createEl("h4", { text: "Where it is" });
     const list = section.createDiv({ cls: "finance-tracker-budget-list" });
     for (const account of summary.accounts) {
       const row = list.createDiv({ cls: "finance-tracker-budget-card" });
       renderRowTitle(row, account.label, core.formatCurrency(account.latest?.amount || 0, currency));
-      row.createDiv({ cls: "finance-tracker-budget-meta", text: `As of ${account.latest?.date || "?"} · ${account.history.length} snapshot${account.history.length === 1 ? "" : "s"}` });
+      row.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: `As of ${account.latest?.date || "?"} · ${account.history.length} snapshot${account.history.length === 1 ? "" : "s"}`,
+      });
+    }
+    if (!summary.accounts.length) {
+      list.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: "No account balances yet, so net worth is the portfolio alone. Snapshot balances to add your cash.",
+      });
+    }
+    if (hasPortfolio) {
+      const row = list.createDiv({ cls: "finance-tracker-budget-card is-clickable" });
+      renderRowTitle(row, "Portfolio", core.formatCurrency(shares, currency));
+      row.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: `${portfolio.value.rows.length} holding${portfolio.value.rows.length === 1 ? "" : "s"} · ${this.describePriceSource(portfolio)}`,
+      });
+      row.addEventListener("click", () => this.openPortfolioNote());
     }
   }
 
@@ -16590,17 +16686,32 @@ class SettleUpModal extends Modal {
 }
 
 class BalanceSnapshotModal extends Modal {
-  constructor(app, plugin) {
+  constructor(app, plugin, options = {}) {
     super(app);
     this.plugin = plugin;
     this.rows = [];
+    this.accountOptions = [];
+    this.onSaved = options.onSaved;
   }
 
   addRow(container, account = "", amount = "") {
     const row = container.createDiv({ cls: "finance-edit-row" });
-    const accountInput = row.createEl("input", { type: "text", attr: { placeholder: "anz-plus" } });
+    const accountInput = row.createEl("input", { type: "text", attr: { placeholder: "anz-plus", "aria-label": "Account" } });
     accountInput.value = account;
-    const amountInput = row.createEl("input", { type: "number", attr: { step: "0.01", placeholder: "5230" } });
+    // Accounts already snapshotted, and the ones captures say money came from, so
+    // "anz-plus" is picked rather than retyped as "anz plus" and split in two.
+    const suggest = new FinanceSuggest(accountInput, {
+      scope: this.scope,
+      getItems: (query) => {
+        const needle = core.normalizeCategoryPath(query);
+        return this.accountOptions
+          .filter((option) => !needle || option.includes(needle))
+          .filter((option) => !this.rows.some((other) => other.accountInput !== accountInput && core.normalizeCategoryPath(other.accountInput.value) === option))
+          .map((option) => ({ value: option, label: option, kind: "account" }));
+      },
+    });
+    this.suggests = [...(this.suggests || []), suggest];
+    const amountInput = row.createEl("input", { type: "number", attr: { step: "0.01", placeholder: "5230", inputmode: "decimal", "aria-label": "Balance" } });
     amountInput.value = amount === "" ? "" : String(amount);
     this.rows.push({ accountInput, amountInput });
   }
@@ -16617,6 +16728,10 @@ class BalanceSnapshotModal extends Modal {
     const rowsHost = contentEl.createDiv();
     const entries = await this.plugin.collectAllTransactions();
     const summary = core.summarizeBalanceSnapshots(entries);
+    const ledgerSources = (this.plugin.settings.captureLedger || [])
+      .map((record) => core.normalizeCategoryPath(record?.source || ""))
+      .filter((sourceName) => sourceName && !["manual", "quick-add", "csv-reconcile", "apple-pay"].includes(sourceName));
+    this.accountOptions = Array.from(new Set([...summary.accounts.map((account) => account.key), ...ledgerSources])).sort();
     for (const account of summary.accounts) {
       this.addRow(rowsHost, account.key, account.latest?.amount ?? "");
     }
@@ -16645,6 +16760,7 @@ class BalanceSnapshotModal extends Modal {
         await this.plugin.appendFinanceLines(core.todayIsoLocal(), lines);
         new Notice(`Logged ${lines.length} balance snapshot${lines.length === 1 ? "" : "s"}`);
         this.close();
+        if (typeof this.onSaved === "function") await this.onSaved();
       } catch (error) {
         new Notice(`Snapshot failed: ${error.message}`);
         saveButton.disabled = false;
@@ -16653,6 +16769,7 @@ class BalanceSnapshotModal extends Modal {
   }
 
   onClose() {
+    for (const suggest of this.suggests || []) suggest.destroy();
     this.contentEl.empty();
   }
 }
@@ -17347,6 +17464,81 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
 
     const runwayStatus = containerEl.createDiv({ cls: "finance-tracker-vault-status" });
     this.renderRunwayStatus(runwayStatus).catch(() => {});
+
+    addSection(
+      "Portfolio",
+      "Shares and ETFs, from the Trades table in your portfolio note. Figures are arithmetic on your own records, not financial or tax advice."
+    );
+
+    new Setting(containerEl)
+      .setName("Price source")
+      .setDesc(
+        "Where share prices come from. Typed prices make no network requests. A Google Sheet and Yahoo both fetch over the internet, only when the portfolio is opened or refreshed, and only the tickers you hold are sent."
+      )
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("manual", "Typed in the portfolio note")
+          .addOption("sheet", "A published Google Sheet")
+          .addOption("yahoo", "Yahoo Finance (unofficial)")
+          .setValue(this.plugin.settings.priceSource || "manual")
+          .onChange(async (value) => {
+            this.plugin.settings.priceSource = value;
+            await this.plugin.saveSettings();
+            this.display();
+          })
+      );
+
+    const source = this.plugin.settings.priceSource || "manual";
+    if (source === "sheet") {
+      new Setting(containerEl)
+        .setName("Sheet link")
+        .setDesc("In Google Sheets: File → Share → Publish to web → the sheet → Comma-separated values → Publish, then paste the link here.")
+        .addText((text) =>
+          text
+            .setPlaceholder("https://docs.google.com/spreadsheets/d/e/…/pub?output=csv")
+            .setValue(this.plugin.settings.priceSheetUrl || "")
+            .onChange(async (value) => {
+              this.plugin.settings.priceSheetUrl = value.trim();
+              await this.plugin.saveSettings();
+            })
+        );
+      const help = containerEl.createEl("details", { cls: "finance-tracker-advanced" });
+      help.createEl("summary", { text: "Set up the sheet" });
+      help.createEl("p", {
+        cls: "finance-tracker-settings-section-copy",
+        text: "Copy this into cell A1 of a new Google Sheet. It has a row for each ticker you hold and each foreign currency, with the formulas already written.",
+      });
+      const template = help.createEl("textarea", { cls: "finance-price-sheet-template", attr: { rows: "6", readonly: "readonly" } });
+      this.plugin
+        .loadPortfolio()
+        .then((portfolio) => {
+          const tickers = Array.from(new Set(portfolio.trades.map((trade) => trade.ticker)));
+          const currencies = Array.from(new Set(portfolio.trades.map((trade) => trade.currency)));
+          template.value = core.buildPriceSheetTemplate(tickers.length ? tickers : ["VAS.AX", "AAPL"], currencies.length ? currencies : ["USD"]);
+        })
+        .catch(() => {});
+    }
+    if (source === "yahoo") {
+      containerEl.createEl("p", {
+        cls: "finance-tracker-settings-section-copy",
+        text: "Yahoo's price feed is free but unofficial: it can refuse requests or change without notice. When it refuses, the plugin backs off and keeps showing the last prices it fetched, marked as old.",
+      });
+    }
+    if (source !== "manual") {
+      new Setting(containerEl)
+        .setName("Refresh at most every (minutes)")
+        .setDesc("Opening the portfolio refreshes prices when they are older than this.")
+        .addText((text) =>
+          text.setValue(String(this.plugin.settings.priceRefreshMinutes || 60)).onChange(async (value) => {
+            const minutes = Number(value);
+            this.plugin.settings.priceRefreshMinutes = Number.isFinite(minutes) && minutes >= 5 ? Math.floor(minutes) : 60;
+            await this.plugin.saveSettings();
+          })
+        );
+    }
+
+    const portfolioActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
+    addAction(portfolioActions, "Open portfolio", () => this.plugin.openPortfolioNote(), { primary: true, errorPrefix: "Opening the portfolio" });
 
     addSection("Setup", "Re-run the guided setup to create any missing starter notes. Existing notes are never overwritten.");
     const setupActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });

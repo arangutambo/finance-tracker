@@ -1675,3 +1675,55 @@ test("logging a trade creates the portfolio note when there is none", async () =
   assert.match(note, /\| 2026-09-15 \| buy \| NDQ\.AX \| 20 \| 48 \| 3 \| AUD \|/);
   assert.equal((await plugin.loadPortfolio()).trades.length, 1);
 });
+
+test("net worth adds the portfolio to account balances", async () => {
+  const note = PORTFOLIO_NOTE.replace("price_overrides: ", "price_overrides: VAS.AX=100, AAPL=200").replace("fx_rates: ", "fx_rates: USD=1.5");
+  const { plugin, app } = await vaultWithPortfolio({ priceSource: "manual" }, note);
+  await app.vault.create("Daily/2026-09-01.md", "## Finance\n- [ ] #log/spending 0\n- $5,230.00 #log/balance/anz-plus\n- $812.40 #log/balance/wise\n");
+  let requests = 0;
+  requestUrlHandler = async () => {
+    requests += 1;
+    return { status: 200 };
+  };
+
+  const el = new StubEl();
+  await plugin.renderNetWorthBlock("", el, { sourcePath: "Utility/Finance/📊 Finance Dashboard.md" });
+  const text = el.allText();
+
+  assert.equal(requests, 0, "a dashboard never fetches prices");
+  assert.match(text, /Accounts & portfolio/);
+  assert.match(text, /Net worth \| \$8,542\.40/, "$6,042.40 in accounts + $2,500 in shares");
+  assert.match(text, /Accounts \| \$6,042\.40 \| 2 accounts/);
+  assert.match(text, /Portfolio \| \$2,500\.00/);
+  assert.match(text, /Anz Plus \| \$5,230\.00/);
+});
+
+test("with no balances yet, net worth is the portfolio and says so", async () => {
+  const note = PORTFOLIO_NOTE.replace("price_overrides: ", "price_overrides: VAS.AX=100, AAPL=200").replace("fx_rates: ", "fx_rates: USD=1.5");
+  const { plugin } = await vaultWithPortfolio({ priceSource: "manual" }, note);
+
+  const el = new StubEl();
+  await plugin.renderNetWorthBlock("", el, { sourcePath: "Dashboard.md" });
+
+  assert.match(el.allText(), /Accounts \| No snapshots/);
+  assert.match(el.allText(), /net worth is the portfolio alone/);
+});
+
+test("the snapshot dialog suggests accounts from past snapshots and capture sources", async () => {
+  const { plugin, app } = makePlugin({
+    captureLedger: [
+      { date: "2026-09-10", amount: 10, merchant: "Coles", method: "gist", source: "anz" },
+      { date: "2026-09-11", amount: 5, merchant: "Wise card", method: "gist", source: "wise" },
+      { date: "2026-09-12", amount: 3, merchant: "x", method: "quick-add", source: "quick-add" },
+    ],
+  });
+  delete plugin.invalidateIndexEntry;
+  await app.vault.create("Daily/2026-08-01.md", "## Finance\n- [ ] #log/spending 0\n- $5,000.00 #log/balance/anz-plus\n");
+
+  const modal = plugin.openSnapshotBalances();
+  await modal.ready;
+
+  assert.deepEqual(modal.accountOptions, ["anz", "anz-plus", "wise"]);
+  const accountInput = modal.contentEl.find((node) => node.attrs["aria-label"] === "Account");
+  assert.equal(accountInput.value, "anz-plus", "a known account is pre-filled with its last balance");
+});

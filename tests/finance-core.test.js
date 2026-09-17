@@ -2743,3 +2743,38 @@ test("backoff doubles after each refusal, up to six hours", () => {
   assert.equal(core.nextBackoff(20, now).minutes, 360);
   assert.equal(core.nextBackoff(0, now).until, "2026-09-17T10:02:00.000Z");
 });
+
+test("buildPriceSheetTemplate writes a ready-to-paste sheet", () => {
+  const template = core.buildPriceSheetTemplate(["VAS.AX", "AAPL"], ["AUD", "USD"]);
+  const rows = template.split("\n").map((row) => row.split("\t"));
+  assert.deepEqual(rows[0], ["Ticker", "Price", "Currency", "Name", "Previous close"]);
+  assert.deepEqual(rows[1], [
+    "VAS.AX",
+    '=GOOGLEFINANCE("ASX:VAS")',
+    '=GOOGLEFINANCE("ASX:VAS", "currency")',
+    '=GOOGLEFINANCE("ASX:VAS", "name")',
+    '=GOOGLEFINANCE("ASX:VAS", "closeyest")',
+  ]);
+  assert.equal(rows[3][0], "USDAUD");
+  assert.equal(rows.length, 4, "AUD needs no exchange-rate row");
+
+  // And what it produces reads back through the sheet parser, once the formulas
+  // have become values.
+  const published = "Ticker,Price,Currency,Name,Previous close\nVAS.AX,103.4,AUD,Vanguard,102.9\nUSDAUD,1.51,AUD,,";
+  const { quotes, fx } = core.parseSheetPrices(published);
+  assert.equal(quotes["VAS.AX"].price, 103.4);
+  assert.equal(fx.USD, 1.51);
+});
+
+test("net worth over time carries balances and portfolio value forward", () => {
+  const merged = core.mergeNetWorthSeries(
+    [{ date: "2026-08-01", total: 5000 }, { date: "2026-09-01", total: 5400 }],
+    [{ date: "2026-07-20", valueAud: 1000 }, { date: "2026-08-15", valueAud: 1100 }]
+  );
+  assert.deepEqual(merged, [
+    { date: "2026-07-20", value: 1000 },
+    { date: "2026-08-01", value: 6000 },
+    { date: "2026-08-15", value: 6100 },
+    { date: "2026-09-01", value: 6500 },
+  ]);
+});

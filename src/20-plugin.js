@@ -280,7 +280,7 @@ class FinanceTrackerPlugin extends Plugin {
     this.addCommand({
       id: "finance-tracker-snapshot-balances",
       name: "Snapshot balances",
-      callback: () => new BalanceSnapshotModal(this.app, this).open(),
+      callback: () => this.openSnapshotBalances(),
     });
 
     // One palette entry instead of eight. Eight near-identical "Insert … block"
@@ -1167,6 +1167,12 @@ class FinanceTrackerPlugin extends Plugin {
 
   // One place that opens the edit modal, so every caller gets the same options
   // and a test can hold on to the instance.
+  openSnapshotBalances(options = {}) {
+    const modal = new BalanceSnapshotModal(this.app, this, options);
+    modal.open();
+    return modal;
+  }
+
   openQuickAdd(options = {}) {
     const modal = new QuickAddTransactionModal(this.app, this, options);
     modal.open();
@@ -6568,53 +6574,98 @@ class FinanceTrackerPlugin extends Plugin {
 
   // --- Net worth ------------------------------------------------------------------
 
+  // Net worth as what it is: money in accounts plus the portfolio. Cash comes from
+  // balance snapshots, shares from the portfolio at the prices already held. This
+  // block never fetches a price, so a dashboard note never reaches the network —
+  // only the portfolio block itself does, and only when a source is chosen.
   async renderNetWorthBlock(source, el, ctx) {
     el.empty();
     const config = parseConfigBlock(source);
     const currency = core.normalizeCurrency(config.currency || this.settings.defaultCurrency);
+    const referenceDate = core.todayIsoLocal();
     const entries = await this.collectAllTransactions();
     const summary = core.summarizeBalanceSnapshots(entries);
+    const portfolio = await this.buildPortfolioModel(referenceDate);
+    const hasPortfolio = portfolio.portfolio.trades.length > 0;
+    const shares = hasPortfolio ? portfolio.value.totals.valueAud : 0;
+    const rerender = () => this.renderNetWorthBlock(source, el, ctx);
 
     const wrapper = el.createDiv({ cls: "finance-tracker-dashboard" });
     const header = wrapper.createDiv({ cls: "finance-tracker-header" });
-    header.createEl("h3", { text: config.title || "Net worth" });
+    header.createEl("h3", { text: config.title || "Accounts & portfolio" });
     const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
-    addAction(headerActions, "Snapshot balances", () => new BalanceSnapshotModal(this.app, this).open(), {
+    addAction(headerActions, "Snapshot balances", () => new BalanceSnapshotModal(this.app, this, { onSaved: rerender }).open(), {
       primary: true,
       opensModal: true,
     });
+    addAction(headerActions, hasPortfolio ? "Portfolio" : "Log a trade", () => (hasPortfolio ? this.openPortfolioNote() : this.openLogTrade({ onSaved: rerender })), {
+      opensModal: !hasPortfolio,
+      errorPrefix: "Opening the portfolio",
+    });
 
-    if (!summary.accounts.length) {
+    if (!summary.accounts.length && !hasPortfolio) {
       wrapper.createDiv({
         cls: "finance-tracker-empty",
-        text: "No balance snapshots yet. Run the Snapshot balances command to log bullets like `- $5,230.00 #log/balance/anz-plus` into today's note.",
+        text: "Nothing to add up yet. Snapshot your account balances — a bullet like `- $5,230.00 #log/balance/anz-plus` in today's note — or log a trade.",
       });
       return;
     }
 
-    const cardData = [{ label: "Net worth", value: core.formatCurrency(summary.latestTotal, currency) }];
+    const cash = summary.latestTotal || 0;
+    const cards = [{ label: "Net worth", value: core.formatCurrency(cash + shares, currency) }];
+    cards.push({
+      label: "Accounts",
+      value: summary.accounts.length ? core.formatCurrency(cash, currency) : "No snapshots",
+      hint: summary.accounts.length ? `${summary.accounts.length} account${summary.accounts.length === 1 ? "" : "s"}` : "",
+    });
+    if (hasPortfolio) {
+      cards.push({
+        label: "Portfolio",
+        value: core.formatCurrency(shares, currency),
+        hint: portfolio.value.missing.length ? `${portfolio.value.missing.length} unpriced` : "",
+      });
+    }
     if (Number.isFinite(summary.previousTotal)) {
       const delta = core.roundCurrencyAmount(summary.latestTotal - summary.previousTotal);
-      cardData.push({
-        label: "Since last snapshot",
+      cards.push({
+        label: "Accounts since last snapshot",
         value: `${delta > 0 ? "▲" : delta < 0 ? "▼" : "—"} ${core.formatCurrency(Math.abs(delta), currency)}`,
         cls: delta > 0 ? "is-down" : delta < 0 ? "is-up" : "",
       });
     }
-    cardData.push({ label: "Accounts", value: String(summary.accounts.length) });
-    renderStatCards(wrapper, cardData);
+    renderStatCards(wrapper, cards);
 
-    this.renderLineChartCard(wrapper, "Balance trend", summary.series.map((point) => ({ date: point.date, value: point.total })), {
-      emptyText: "Take a second snapshot to draw the trend line.",
+    this.renderLineChartCard(wrapper, "Net worth over time", core.mergeNetWorthSeries(summary.series, portfolio.series), {
+      emptyText: hasPortfolio && !summary.accounts.length
+        ? "The line starts once there is a balance snapshot, or price history for the portfolio."
+        : "Take a second snapshot to draw the trend line.",
     });
 
     const section = wrapper.createDiv({ cls: "finance-tracker-chart-card" });
-    section.createEl("h4", { text: "Accounts" });
+    section.createEl("h4", { text: "Where it is" });
     const list = section.createDiv({ cls: "finance-tracker-budget-list" });
     for (const account of summary.accounts) {
       const row = list.createDiv({ cls: "finance-tracker-budget-card" });
       renderRowTitle(row, account.label, core.formatCurrency(account.latest?.amount || 0, currency));
-      row.createDiv({ cls: "finance-tracker-budget-meta", text: `As of ${account.latest?.date || "?"} · ${account.history.length} snapshot${account.history.length === 1 ? "" : "s"}` });
+      row.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: `As of ${account.latest?.date || "?"} · ${account.history.length} snapshot${account.history.length === 1 ? "" : "s"}`,
+      });
+    }
+    if (!summary.accounts.length) {
+      list.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: "No account balances yet, so net worth is the portfolio alone. Snapshot balances to add your cash.",
+      });
+    }
+    if (hasPortfolio) {
+      const row = list.createDiv({ cls: "finance-tracker-budget-card is-clickable" });
+      renderRowTitle(row, "Portfolio", core.formatCurrency(shares, currency));
+      row.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: `${portfolio.value.rows.length} holding${portfolio.value.rows.length === 1 ? "" : "s"} · ${this.describePriceSource(portfolio)}`,
+      });
+      row.addEventListener("click", () => this.openPortfolioNote());
     }
   }
 
