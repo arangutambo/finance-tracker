@@ -3957,6 +3957,20 @@ function serializeBillDueRule(rule) {
   return "after-last";
 }
 
+// Aliases differing only in case or punctuation match the same payments, so one
+// spelling of each is kept — the converted Urban Climb note listed seven.
+function dedupeBillAliases(aliases, id) {
+  const seen = new Set([normalizeBillId(id)]);
+  const kept = [];
+  for (const alias of aliases || []) {
+    const key = normalizeBillId(alias);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    kept.push(alias);
+  }
+  return kept;
+}
+
 function parseListValue(value) {
   if (Array.isArray(value)) return value.map((item) => normalizeWhitespace(item)).filter(Boolean);
   const raw = String(value || "").trim().replace(/^\[|\]$/g, "");
@@ -3984,7 +3998,7 @@ function parseBillDefinition(frontmatter, options = {}) {
     // Keep the name as written where there is one to keep: title-casing the id
     // turns "Aussie Broadband NBN" into "Aussie Broadband Nbn".
     name: normalizeWhitespace(fm.bill_name || fm.name || "") || billNameFromId(fm.bill_id || fm.id || "", id),
-    aliases: parseListValue(fm.aliases),
+    aliases: dedupeBillAliases(parseListValue(fm.aliases), fm.bill_id || fm.id || fm.bill_name || fm.name || ""),
     cadence,
     dueRule: parseBillDueRule(fm.due_rule),
     amount: Number.isFinite(amount) && amount > 0 ? roundCurrencyAmount(amount) : null,

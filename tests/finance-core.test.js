@@ -2482,3 +2482,12 @@ test("a bill paid a day before its override date is settled for that cycle", () 
   assert.equal(early.nextDue, "2026-09-17");
   assert.equal(early.usedOverride, true);
 });
+
+test("a bill's aliases keep one spelling of each", () => {
+  const bill = core.parseBillDefinition({
+    bill_id: "urban-climb-subscription",
+    cadence: "weekly",
+    aliases: "[urban-climb-membership, Urban Climb Membership, urban-climb-sub, Urban Climb Sub, Urban climb sub, urban-climb, Urban Climb, Urban Climb Subscription]",
+  });
+  assert.deepEqual(bill.aliases, ["urban-climb-membership", "urban-climb-sub", "urban-climb"]);
+});
