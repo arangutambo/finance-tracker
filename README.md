@@ -20,9 +20,15 @@ in plain text, in notes you can grep, link and edit by hand.
 That is the whole data format. Everything below is built from it.
 
 - Runs on **desktop and mobile** (Obsidian 1.0+).
-- **Network use is opt-in and named**: only the GitHub gist capture method talks
-  to the internet, and only when you switch it on and supply your own gist and
-  token. No telemetry, no bank connections, nothing phoning home.
+- **Network use is opt-in and named.** Two features can reach the internet, and
+  both are off until you turn them on:
+  - **GitHub gist capture** talks to GitHub, using your own gist and token.
+  - **Share prices**, if you choose a price source other than typing them in:
+    a Google Sheet you publish, or Yahoo Finance's unofficial price feed. Only
+    the tickers you hold are sent, and only when the portfolio is opened or
+    refreshed.
+
+  No telemetry, no bank connections, nothing phoning home.
 - MIT licensed — see [LICENSE](LICENSE).
 - Recent changes: [CHANGELOG.md](CHANGELOG.md).
 
@@ -38,7 +44,7 @@ Support the project: [Buy Me a Coffee](https://buymeacoffee.com/tonyhad)
 - [Goals (savings + trips)](#goals-savings--trips) — sinking funds and trip mode
 - [Recurring payments](#recurring-payments) — bills, cadences, and the lifecycle
 - [Runway](#runway) — how much of your outgoings you have covered
-- [Split expenses](#split-expenses) · [Forecast](#forecast) · [Net worth](#net-worth)
+- [Split expenses](#split-expenses) · [Forecast](#forecast) · [Accounts & portfolio](#accounts--portfolio)
 - [Query block](#query-block) · [Year & quarter reviews](#year--quarter-reviews)
 - [Daily budget sidebar](#daily-budget-sidebar--status-bar) · [Merchant map](#merchant-map)
 - [Commands](#commands) · [Settings](#key-settings) · [Limitations](#limitations)
@@ -826,12 +832,18 @@ average discretionary spend, forward N months — including committed goal
 set-asides — as a line chart with a `~$X by <date>` headline. Override any
 input with `income:`, `bills:`, `discretionary:`, `setaside:`, or `start:`.
 
-## Net worth
+## Accounts & portfolio
 
-Command: **Snapshot balances** · **Insert a finance block** → Net worth
+Commands: **Snapshot balances** · **Open portfolio** · **Log a trade** · **Refresh share prices**
 
-Snapshot balances logs one bullet per account into today's daily note (accounts
-you've snapshotted before are pre-filled):
+> Everything here is arithmetic on your own records. It is **not financial or tax
+> advice**, and the capital-gains flag is a reminder to check, not a ruling.
+
+### Account balances
+
+Snapshot balances logs one bullet per account into today's daily note. Accounts
+you've snapshotted before are pre-filled, and the account box suggests the ones
+you've used — including the `source=` names your captures carry, like `anz`:
 
 ![Snapshot balances modal, pre-filled with the last known balance](docs/images/snapshot-balances-modal.jpg)
 
@@ -840,12 +852,70 @@ you've snapshotted before are pre-filled):
 - $812.40 #log/balance/wise
 ```
 
-The dashboard renders the balance trend from those bullets — no extra files:
+### The portfolio
+
+Shares and ETFs live in a note, `Utility/Finance/📈 Portfolio.md`, as a table of
+trades — hand-editable, and the only record the plugin needs. **Log a trade**
+writes a row for you.
+
+```md
+| Date | Type | Ticker | Units | Price | Fees | Currency | AUD cost | Account | Note |
+| --- | --- | --- | ---: | ---: | ---: | --- | ---: | --- | --- |
+| 2026-03-02 | buy | VAS.AX | 50 | 98.20 | 9.50 | AUD | | Pearler | |
+| 2026-06-10 | buy | AAPL | 5 | 190.00 | 2.00 | USD | 1455.20 | Stake | |
+| 2026-08-01 | split | AAPL | 2 | | | | | | 2-for-1 |
+```
+
+- **Type** is `buy`, `sell`, `drp` (dividend reinvestment) or `split`. For a
+  split, Units is the ratio: `2` for a 2-for-1, `0.5` for a 1-for-2
+  consolidation.
+- **Tickers**: ASX codes end in `.AX`; US tickers are written plain.
+- **AUD cost** matters for anything bought in another currency: it is what
+  actually left your account, brokerage included. Leave it out and the cost is
+  estimated at the current exchange rate, and flagged.
+- **Dividends** go in your daily notes as income, so they count everywhere income
+  counts: `- $12.40 #log/income/dividend/vas-ax`.
+- **Buying shares is a transfer, not spending.** Trades never enter a daily
+  note, so they never touch a budget.
+
+The `finance-portfolio` block (already in the note) shows:
+
+- value, cost base, gain, today's move, realised gains, twelve months of
+  dividends and an annualised return;
+- holdings, first in first out, with brokerage in the cost base — tap one for
+  its parcels, and which have been held twelve months;
+- allocation by market and holding, value against cost over time, dividends
+  with yield on cost, and every trade.
+
+### Where prices come from
+
+Settings → **Portfolio** → **Price source**:
+
+| Source | Network | Notes |
+| --- | --- | --- |
+| **Typed in** (default) | none | Put prices in the note's properties: `price_overrides: VAS.AX=103.42, AAPL=229.10` and `fx_rates: USD=1.51`. Always works. |
+| **A published Google Sheet** | Google | Free, reliable, and yours. Settings gives you a template to paste into a new sheet — a row per ticker, `GOOGLEFINANCE` formulas already written — then publish it as CSV and paste the link. |
+| **Yahoo Finance** | Yahoo | Free and covers the ASX, but **unofficial**: it can refuse requests or change without notice. |
+
+However prices arrive, they are cached, so the portfolio still shows offline or
+while a source is refusing — with old prices marked as old. A source that
+refuses is backed off (2 minutes, doubling, up to six hours), and prices you type
+in always win. Prices are only fetched when the portfolio block is opened or you
+run **Refresh share prices**; there is no background polling.
+
+There is no way to use the Stocks app on a Mac or iPhone: it has no API, and its
+prices are not available to other apps.
+
+### Net worth
 
 ````md
 ```networth-dashboard
 ```
 ````
+
+Net worth is your account balances plus the portfolio, at the prices already
+held — this block never fetches prices itself. The line over time carries each
+forward from its own last point.
 
 ![Net worth block: total, accounts, and the balance-trend card](docs/images/networth-dashboard.jpg)
 
@@ -979,6 +1049,11 @@ with **Finance Tracker:**.
 | **Sync capture gist now** | Polls the capture gist immediately instead of waiting for the next scheduled check. |
 | **Check capture methods for overlap** | Reports which pairs of capture methods have been logging the same transactions, so you can switch off one you don't need. |
 | **Reconcile a bank CSV** | Paste a bank or Wise CSV export; matches rows by date+amount and can send unmatched charges to the capture inbox. |
+| **Open portfolio** | Opens (creating if needed) the portfolio note, with its Trades table and dashboard. |
+| **Log a trade** | Adds a buy, sell, dividend reinvestment or split to the Trades table, with ticker search. |
+| **Refresh share prices** | Fetches prices now from the chosen source, unless it is backing off after refusing. |
+| **Convert recurring payments to bill notes** | Turns detected bills and the registry into one note per bill, merging duplicate wordings and keeping cancelled bills as ended. Preview first. |
+| **Tidy up recurring payments** | Removes same-day duplicate bill charges, old $0 skip markers and leftover registry rows. Preview first. |
 | **Open categorisation inbox** | Every uncategorised entry, whatever its date, grouped by merchant with a suggested category and one-tap filing. Also lists captures that failed, with retry. |
 | **Rename or split a category** | Rename a category everywhere — daily notes, the budgets table, merchant rules — or split it by merchant (bare `transport` into public transport, rideshare and scooter). Preview first. |
 | **Convert legacy trip tags** | Converts trips filed under the older `#log/archive/<year>/<trip>/spending/…` tags to the current trip format, rewriting two-currency amounts so the original currency is read back. Shows a full preview first. |
