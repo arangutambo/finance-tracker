@@ -37,7 +37,21 @@ global.window = global.window || {
 let requestUrlHandler = async () => ({ status: 404, json: null, text: "" });
 
 const obsidianStub = {
-  ItemView: class {},
+  // Views render into contentEl; the hub is tested by opening one for real.
+  ItemView: class {
+    constructor(leaf) {
+      this.leaf = leaf;
+      this.app = leaf?.app;
+      this.contentEl = new StubEl();
+    }
+  },
+  // A rendered block's lifecycle handle. Obsidian calls onload when the block's
+  // section is shown and onunload when the note closes.
+  MarkdownRenderChild: class {
+    constructor(containerEl) {
+      this.containerEl = containerEl;
+    }
+  },
   Modal: class {
     constructor(app) {
       this.app = app;
@@ -1726,4 +1740,193 @@ test("the snapshot dialog suggests accounts from past snapshots and capture sour
   assert.deepEqual(modal.accountOptions, ["anz", "anz-plus", "wise"]);
   const accountInput = modal.contentEl.find((node) => node.attrs["aria-label"] === "Account");
   assert.equal(accountInput.value, "anz-plus", "a known account is pre-filled with its last balance");
+});
+
+
+// --- Reviews, live blocks and the hub ---------------------------------------------------
+
+async function vaultForReviews() {
+  const made = makePlugin(billSettings());
+  delete made.plugin.invalidateIndexEntry;
+  const { plugin, app } = made;
+  await plugin.saveBill(billDefinition({ id: "nbn", name: "Aussie Broadband NBN", cadence: "monthly", amount: 66.5 }));
+  const note = (lines) => ["## Finance", "- [ ] #log/spending 0", ...lines, ""].join("\n");
+  // previous week
+  await app.vault.create("Daily/2026-09-02.md", note(["- $100.00 #log/spending/food/groceries", "\t- Woolworths/cnr Brisbane H"]));
+  // this week (Mon 7 – Sun 13 Sep)
+  await app.vault.create(
+    "Daily/2026-09-09.md",
+    note([
+      "- $90.00 #log/spending/food/groceries",
+      "\t- Woolworths/8 Sherwood Roa",
+      "- $480.00 #log/spending/medical",
+      "\t- The Good Group Cli",
+      "- $33.23 #log/spending",
+      "\t- Hillgate Hill Dbs",
+      "- $2,000.00 #log/income/salary",
+    ])
+  );
+  await app.vault.create(
+    "Daily/2026-09-12.md",
+    note(["- $66.50 #log/spending/subscriptions/monthly/nbn", "\t- Aussie Broadband", "- $210.00 #log/spending/26/japan/food", "\t- Lawson"])
+  );
+  return made;
+}
+
+test("a weekly dashboard gains income, merchants, largest, changes, bills and trips", async () => {
+  const { plugin } = await vaultForReviews();
+
+  const el = new StubEl();
+  await plugin.renderDashboard("period: week\ngroupBy: full", el, { sourcePath: "", referenceDate: "2026-09-10" });
+  const text = el.allText();
+
+  assert.match(text, /Income and savings/);
+  assert.match(text, /Savings rate \| 67%/, "(2000 − 669.73) ÷ 2000");
+  assert.match(text, /1 entry this week \(\$33\.23\) has no category yet/);
+  assert.ok(el.button("Open inbox"), "the callout links to the inbox");
+  assert.match(text, /Change vs previous week/);
+  assert.match(text, /Top merchants \| .*The Good Group Cli \| \$480\.00/);
+  assert.match(text, /Largest transactions/);
+  assert.match(text, /Paid this week: \$66\.50 \| .*Aussie Broadband NBN \| \$66\.50/);
+  assert.match(text, /Trip spending: \$210\.00/);
+  assert.doesNotMatch(text, /Unknown section/);
+});
+
+test("an existing dashboard for a year keeps its old shape, and hide: removes sections", async () => {
+  const { plugin } = await vaultForReviews();
+
+  const year = new StubEl();
+  await plugin.renderDashboard("period: year", year, { sourcePath: "", referenceDate: "2026-09-10" });
+  assert.doesNotMatch(year.allText(), /Top merchants|Income and savings|Largest transactions/);
+
+  const hidden = new StubEl();
+  await plugin.renderDashboard("period: week\nhide: merchants, largest, sparkle", hidden, { sourcePath: "", referenceDate: "2026-09-10" });
+  const text = hidden.allText();
+  assert.doesNotMatch(text, /Top merchants|Largest transactions/);
+  assert.match(text, /Income and savings/);
+  assert.match(text, /Unknown section name: sparkle/);
+});
+
+test("Insert weekly review uses the note's own week", async () => {
+  const { plugin, app } = await vaultForReviews();
+  app.metadataCache.getFileCache = (file) => (file.path === "Weekly/W37-2026.md" ? { frontmatter: { "journal-date": "2026-09-07" } } : null);
+  await app.vault.create("Weekly/W37-2026.md", "# W37\n");
+  let inserted = "";
+  const editor = { replaceSelection: (value) => (inserted += value) };
+
+  await plugin.insertPeriodReview(editor, { file: app.vault.getAbstractFileByPath("Weekly/W37-2026.md") }, "week");
+
+  assert.match(inserted, /^## Finance review: week of 7 Sep 2026/);
+  assert.match(inserted, /Saved: \$1,330\.27 \(67% savings rate\)/);
+  assert.match(inserted, /Bills paid: 1 \(\$66\.50\)/);
+  assert.match(inserted, /Trip spending, not counted above: Japan \$210\.00/);
+});
+
+test("the insert list offers weekly and monthly reviews for the note's period", async () => {
+  const { plugin } = await vaultForReviews();
+  let inserted = "";
+  const modal = plugin.openInsertBlock({ replaceSelection: (value) => (inserted += value) }, "Daily/2026-09-09.md");
+  await modal.ready;
+
+  assert.ok(modal.contentEl.find((node) => node.text === "Monthly review"));
+  const option = modal.contentEl.find((node) => node.text === "Weekly review");
+  assert.ok(option, "listed");
+  await option.parentElement.fire("click");
+  assert.match(inserted, /^## Finance review: week of 7 Sep 2026/);
+  assert.equal(modal.closed, true);
+});
+
+test("open blocks re-render when finance notes change, and stop once their note closes", async () => {
+  const { plugin } = makePlugin();
+  let renders = 0;
+  let child = null;
+  const ctx = { addChild: (value) => { child = value; } };
+  const el = new StubEl();
+
+  const entry = plugin.trackLiveBlock(el, ctx, async () => { renders += 1; });
+  child.onload();
+  await plugin.refreshFinanceSurfaces();
+  assert.equal(renders, 1);
+
+  child.onunload();
+  await plugin.refreshFinanceSurfaces();
+  assert.equal(renders, 1, "a closed note's block is no longer refreshed");
+  assert.ok(entry);
+
+  assert.equal(plugin.isFinanceSourcePath("Daily/2026-09-10.md"), true);
+  assert.equal(plugin.isFinanceSourcePath("Utility/Budgets/Bills/nbn.md"), false, "bills folder needs budgetsFolderPath set");
+  plugin.settings.budgetsFolderPath = "Utility/Budgets";
+  assert.equal(plugin.isFinanceSourcePath("Utility/Budgets/Bills/nbn.md"), true);
+  assert.equal(plugin.isFinanceSourcePath("Utility/Finance/📈 Portfolio.md"), true);
+  assert.equal(plugin.isFinanceSourcePath("Notes/Recipes.md"), false);
+  assert.equal(plugin.isFinanceSourcePath("Daily/attachment.png"), false);
+});
+
+test("note changes are debounced into one refresh", async () => {
+  const { plugin } = makePlugin();
+  let refreshes = 0;
+  plugin.refreshFinanceSurfaces = async () => { refreshes += 1; };
+  delete plugin.refreshDailyBudgetView;
+  plugin.refreshDailyBudgetView();
+  plugin.notifyFinanceDataChanged();
+  plugin.notifyFinanceDataChanged();
+  await new Promise((resolve) => setTimeout(resolve, 650));
+  assert.equal(refreshes, 1);
+});
+
+test("the hub opens on Today and every tab renders", async () => {
+  const { plugin, app } = await vaultForReviews();
+  const view = plugin.createHubView({ app });
+  await view.onOpen();
+
+  const tabs = view.contentEl.findAll((node) => node.classList.has("finance-hub-tab")).map((node) => node.text);
+  assert.deepEqual(tabs, ["Today", "Inbox", "Budgets", "Bills", "Goals & trips", "Portfolio", "Reviews"]);
+  assert.match(view.contentEl.allText(), /Daily budget/);
+
+  for (const label of ["Inbox", "Budgets", "Bills", "Goals & trips", "Portfolio", "Reviews"]) {
+    await view.contentEl.click(label);
+    const text = view.contentEl.allText();
+    assert.doesNotMatch(text, /failed to render/, `${label}: ${text.slice(0, 300)}`);
+    assert.equal(view.getState().tab, FINANCE_TAB_IDS[label]);
+  }
+});
+
+const FINANCE_TAB_IDS = { Inbox: "inbox", Budgets: "budgets", Bills: "bills", "Goals & trips": "goals", Portfolio: "portfolio", Reviews: "reviews" };
+
+test("the hub inbox badge counts what is waiting, and the inbox tab shows it", async () => {
+  const { plugin, app } = await vaultForReviews();
+  const view = plugin.createHubView({ app });
+  await view.setState({ tab: "inbox" });
+  await view.onOpen();
+
+  const badge = view.contentEl.find((node) => node.classList.has("finance-hub-badge"));
+  assert.ok(badge, "a badge is shown");
+  assert.ok(Number(badge.text) >= 1);
+  assert.match(view.contentEl.allText(), /Needs a category/);
+  assert.match(view.contentEl.allText(), /Hillgate Hill Dbs/);
+});
+
+test("the hub Reviews tab steps back a week and copies a frozen review", async () => {
+  const { plugin, app } = await vaultForReviews();
+  const view = plugin.createHubView({ app });
+  view.reviewAnchor = "2026-09-17";
+  await view.setState({ tab: "reviews" });
+  await view.onOpen();
+  assert.match(view.contentEl.allText(), /Week of 14 Sep 2026/);
+
+  await view.contentEl.click("‹");
+  assert.match(view.contentEl.allText(), /Week of 7 Sep 2026/);
+  assert.match(view.contentEl.allText(), /Top merchants/);
+
+  let copied = "";
+  const hadNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  Object.defineProperty(globalThis, "navigator", { value: { clipboard: { writeText: async (value) => { copied = value; } } }, configurable: true });
+  try {
+    await view.contentEl.click("Copy as text");
+  } finally {
+    if (hadNavigator) Object.defineProperty(globalThis, "navigator", hadNavigator);
+    else delete globalThis.navigator;
+  }
+  assert.match(copied, /^## Finance review: week of 7 Sep 2026/);
+  assert.ok(notices.some((message) => /Review copied/.test(message)));
 });

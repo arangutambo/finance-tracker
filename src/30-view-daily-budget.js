@@ -2,30 +2,19 @@ class DailyBudgetView extends ItemView {
   constructor(leaf, plugin) {
     super(leaf);
     this.plugin = plugin;
-    this._refreshTimer = null;
   }
 
   getViewType() { return DAILY_BUDGET_VIEW; }
   getDisplayText() { return "Daily budget"; }
   getIcon() { return "coins"; }
 
+  // Note changes reach this view through the plugin's single, debounced
+  // refresh (notifyFinanceDataChanged), shared with the hub and open blocks.
   async onOpen() {
-    this.registerEvent(
-      this.app.vault.on("modify", (file) => {
-        if (_ftSelfWrites.has(file.path)) return;
-        const prefix = normalizePath(this.plugin.settings.dailyNotesFolder + "/");
-        if (file.path.startsWith(prefix)) {
-          clearTimeout(this._refreshTimer);
-          this._refreshTimer = setTimeout(() => this.refresh(), 400);
-        }
-      })
-    );
     await this.refresh();
   }
 
-  async onClose() {
-    clearTimeout(this._refreshTimer);
-  }
+  async onClose() {}
 
   async refresh() {
     try {

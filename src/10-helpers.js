@@ -132,6 +132,19 @@ const RUNWAY_BLOCK = "finance-runway";
 const BILL_BLOCK = "finance-bill";
 const DAILY_BUDGET_VIEW = "finance-tracker-daily";
 const FINANCE_INBOX_VIEW = "finance-tracker-inbox";
+const FINANCE_HUB_VIEW = "finance-tracker-hub";
+
+// The hub's tabs, in order. Ids are what commands and saved layouts refer to,
+// so they stay stable even if a label changes.
+const FINANCE_HUB_TABS = [
+  { id: "today", label: "Today" },
+  { id: "inbox", label: "Inbox" },
+  { id: "budgets", label: "Budgets" },
+  { id: "bills", label: "Bills" },
+  { id: "goals", label: "Goals & trips" },
+  { id: "portfolio", label: "Portfolio" },
+  { id: "reviews", label: "Reviews" },
+];
 // Cadence display names live in core.RECURRING_CADENCES alongside the maths;
 // this reads them from there rather than keeping a second copy in sync.
 function cadenceLabel(cadence) {

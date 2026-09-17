@@ -1,11 +1,11 @@
 // The inbox is a view rather than a modal: it is somewhere you work through a
-// backlog, and a modal cannot stay open beside the notes it is about. The finance
-// hub will embed the same render method as one of its tabs.
+// backlog, and a modal cannot stay open beside the notes it is about. It is now
+// the hub's Inbox tab; this standalone view is kept registered only so a
+// workspace saved with it open still loads.
 class FinanceInboxView extends ItemView {
   constructor(leaf, plugin) {
     super(leaf);
     this.plugin = plugin;
-    this._refreshTimer = null;
   }
 
   getViewType() { return FINANCE_INBOX_VIEW; }
@@ -13,20 +13,10 @@ class FinanceInboxView extends ItemView {
   getIcon() { return "inbox"; }
 
   async onOpen() {
-    this.registerEvent(
-      this.app.vault.on("modify", (file) => {
-        if (_ftSelfWrites.has(file.path)) return;
-        if (!file?.path?.startsWith(normalizePath(`${this.plugin.settings.dailyNotesFolder}/`))) return;
-        clearTimeout(this._refreshTimer);
-        this._refreshTimer = setTimeout(() => this.refresh(), 500);
-      })
-    );
     await this.refresh();
   }
 
-  async onClose() {
-    clearTimeout(this._refreshTimer);
-  }
+  async onClose() {}
 
   async refresh() {
     try {

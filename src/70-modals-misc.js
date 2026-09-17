@@ -7,7 +7,7 @@ const INSERTABLE_BLOCKS = [
     name: "Dashboard",
     block: DASHBOARD_BLOCK,
     body: "period: week",
-    description: "Spend for a period: totals, category donut, daily trend, budget progress.",
+    description: "Spend for a period: totals, income and savings rate, categories, top merchants, bills and budgets.",
   },
   {
     name: "Recurring payments",
@@ -46,10 +46,16 @@ const INSERTABLE_BLOCKS = [
     description: "Projects income minus bills and spending forward month by month.",
   },
   {
-    name: "Net worth",
+    name: "Accounts & portfolio",
     block: NETWORTH_BLOCK,
     body: "",
-    description: "Balance snapshots per account and the net-worth line over time.",
+    description: "Account balances plus the share portfolio, and net worth over time.",
+  },
+  {
+    name: "Portfolio",
+    block: PORTFOLIO_BLOCK,
+    body: "",
+    description: "Holdings, value, gains, dividends and trades from the portfolio note.",
   },
   {
     name: "Query",
@@ -60,10 +66,11 @@ const INSERTABLE_BLOCKS = [
 ];
 
 class InsertBlockModal extends Modal {
-  constructor(app, plugin, editor) {
+  constructor(app, plugin, editor, sourcePath = "") {
     super(app);
     this.plugin = plugin;
     this.editor = editor;
+    this.sourcePath = sourcePath;
   }
 
   onOpen() {
@@ -88,15 +95,19 @@ class InsertBlockModal extends Modal {
 
     // Reviews compute once and paste finished numbers — a frozen snapshot, not
     // a live block — but this is where someone looks for "put finance in a note".
+    // The period is the note's own: a weekly note gets its week.
+    const referenceDate = this.plugin.getReferenceDateForSource(this.sourcePath);
     for (const [period, name, description] of [
-      ["year", "Year in review", "Totals, best/worst month, top categories and transfers for this year — inserted as plain text."],
-      ["quarter", "Quarter in review", "The same summary, scoped to this quarter."],
+      ["week", "Weekly review", "Spent, income and savings rate, where it went, top merchants and largest transactions for this note's week, as plain text."],
+      ["month", "Monthly review", "The same review for this note's month."],
+      ["quarter", "Quarter in review", "Totals, best and worst month, top categories and transfers for the quarter."],
+      ["year", "Year in review", "The same summary for the whole year."],
     ]) {
       const option = list.createDiv({ cls: "finance-tracker-holiday-result" });
       option.createDiv({ cls: "finance-tracker-holiday-result-title", text: name });
       option.createDiv({ cls: "finance-tracker-holiday-result-path", text: description });
       option.addEventListener("click", async () => {
-        const lines = await this.plugin.buildPeriodReview(period);
+        const lines = await this.plugin.buildPeriodReview(period, referenceDate);
         insert(`${lines.join("\n")}\n`);
       });
     }

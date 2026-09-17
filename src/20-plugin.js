@@ -50,57 +50,26 @@ class FinanceTrackerPlugin extends Plugin {
       console.warn("[finance-tracker] Obsidian protocol handlers are not available in this app version.");
     }
 
-    this.registerMarkdownCodeBlockProcessor(DASHBOARD_BLOCK, async (source, el, ctx) => {
-      await this.renderDashboard(source, el, ctx);
-    });
-
-    this.registerMarkdownCodeBlockProcessor(HOLIDAY_DASHBOARD_BLOCK, async (source, el, ctx) => {
-      await this.renderHolidayDashboard(source, el, ctx);
-    });
-
-    this.registerMarkdownCodeBlockProcessor(SAVINGS_DASHBOARD_BLOCK, async (source, el, ctx) => {
-      await this.renderSavingsDashboard(source, el, ctx);
-    });
-
-    this.registerMarkdownCodeBlockProcessor(RECURRING_BLOCK, async (source, el, ctx) => {
-      await this.renderRecurringBlock(source, el, ctx);
-    });
-
-    this.registerMarkdownCodeBlockProcessor(SPLITS_BLOCK, async (source, el, ctx) => {
-      await this.renderSplitsBlock(source, el, ctx);
-    });
-
-    this.registerMarkdownCodeBlockProcessor(FORECAST_BLOCK, async (source, el, ctx) => {
-      await this.renderForecastBlock(source, el, ctx);
-    });
-
-    this.registerMarkdownCodeBlockProcessor(NETWORTH_BLOCK, async (source, el, ctx) => {
-      await this.renderNetWorthBlock(source, el, ctx);
-    });
-
-    this.registerMarkdownCodeBlockProcessor(QUERY_BLOCK, async (source, el, ctx) => {
-      await this.renderQueryBlock(source, el, ctx);
-    });
-
-    this.registerMarkdownCodeBlockProcessor(GOALS_BLOCK, async (source, el, ctx) => {
-      await this.renderGoalsBlock(source, el, ctx);
-    });
-
-    this.registerMarkdownCodeBlockProcessor(RUNWAY_BLOCK, async (source, el, ctx) => {
-      await this.renderRunwayBlock(source, el, ctx);
-    });
-
-    this.registerMarkdownCodeBlockProcessor(BILL_BLOCK, async (source, el, ctx) => {
-      await this.renderBillBlock(source, el, ctx);
-    });
-
-    this.registerMarkdownCodeBlockProcessor(PORTFOLIO_BLOCK, async (source, el, ctx) => {
-      await this.renderPortfolioBlock(source, el, ctx);
-    });
+    // Every block re-renders when the notes behind it change, so a weekly review
+    // left open beside today's note keeps up with what gets logged.
+    this.registerFinanceBlock(DASHBOARD_BLOCK, this.renderDashboard);
+    this.registerFinanceBlock(HOLIDAY_DASHBOARD_BLOCK, this.renderHolidayDashboard);
+    this.registerFinanceBlock(SAVINGS_DASHBOARD_BLOCK, this.renderSavingsDashboard);
+    this.registerFinanceBlock(RECURRING_BLOCK, this.renderRecurringBlock);
+    this.registerFinanceBlock(SPLITS_BLOCK, this.renderSplitsBlock);
+    this.registerFinanceBlock(FORECAST_BLOCK, this.renderForecastBlock);
+    this.registerFinanceBlock(NETWORTH_BLOCK, this.renderNetWorthBlock);
+    this.registerFinanceBlock(QUERY_BLOCK, this.renderQueryBlock);
+    this.registerFinanceBlock(GOALS_BLOCK, this.renderGoalsBlock);
+    this.registerFinanceBlock(RUNWAY_BLOCK, this.renderRunwayBlock);
+    this.registerFinanceBlock(BILL_BLOCK, this.renderBillBlock);
+    this.registerFinanceBlock(PORTFOLIO_BLOCK, this.renderPortfolioBlock);
 
     this.registerView(DAILY_BUDGET_VIEW, (leaf) => new DailyBudgetView(leaf, this));
     this.registerView(FINANCE_INBOX_VIEW, (leaf) => new FinanceInboxView(leaf, this));
+    this.registerView(FINANCE_HUB_VIEW, (leaf) => this.createHubView(leaf));
 
+    this.addRibbonIcon("wallet", "Open finance hub", () => this.activateHubView());
     this.addRibbonIcon("coins", "Daily budget", () => this.activateDailyBudgetView());
     this.addRibbonIcon("circle-plus", "Quick add transaction", () => this.openQuickAdd());
 
@@ -116,9 +85,31 @@ class FinanceTrackerPlugin extends Plugin {
     });
 
     this.addCommand({
-      id: "finance-tracker-open-inbox",
-      name: "Open categorisation inbox",
-      callback: () => this.activateInboxView(),
+      id: "finance-tracker-open-hub",
+      name: "Open finance hub",
+      callback: () => this.activateHubView(),
+    });
+
+    // One command per tab, so any of them can have a hotkey. The inbox keeps the
+    // id it shipped with.
+    for (const tab of FINANCE_HUB_TABS) {
+      this.addCommand({
+        id: tab.id === "inbox" ? "finance-tracker-open-inbox" : `finance-tracker-open-hub-${tab.id}`,
+        name: `Open finance hub: ${tab.label.toLowerCase()}`,
+        callback: () => this.activateHubView(tab.id),
+      });
+    }
+
+    this.addCommand({
+      id: "finance-tracker-insert-weekly-review",
+      name: "Insert weekly review",
+      editorCallback: (editor, view) => this.insertPeriodReview(editor, view, "week"),
+    });
+
+    this.addCommand({
+      id: "finance-tracker-insert-monthly-review",
+      name: "Insert monthly review",
+      editorCallback: (editor, view) => this.insertPeriodReview(editor, view, "month"),
     });
 
     this.addCommand({
@@ -290,7 +281,7 @@ class FinanceTrackerPlugin extends Plugin {
     this.addCommand({
       id: "finance-tracker-insert-block",
       name: "Insert a finance block",
-      editorCallback: (editor) => new InsertBlockModal(this.app, this, editor).open(),
+      editorCallback: (editor, view) => this.openInsertBlock(editor, view?.file?.path || ""),
     });
 
     this.app.workspace.onLayoutReady(() => {
@@ -343,15 +334,10 @@ class FinanceTrackerPlugin extends Plugin {
     }
   }
 
+  // The inbox lives in the hub now. The standalone view stays registered so a
+  // workspace saved with it open still loads.
   async activateInboxView() {
-    const existing = this.app.workspace.getLeavesOfType(FINANCE_INBOX_VIEW);
-    if (existing.length) {
-      this.app.workspace.revealLeaf(existing[0]);
-      return;
-    }
-    const leaf = this.app.workspace.getLeaf(true);
-    await leaf.setViewState({ type: FINANCE_INBOX_VIEW, active: true });
-    this.app.workspace.revealLeaf(leaf);
+    return this.activateHubView("inbox");
   }
 
   async activateDailyBudgetView() {
@@ -371,6 +357,8 @@ class FinanceTrackerPlugin extends Plugin {
   onunload() {
     clearTimeout(this._inboxDrainTimer);
     clearTimeout(this._statusBarTimer);
+    clearTimeout(this._dataChangedTimer);
+    this._liveBlocks?.clear();
   }
 
   async loadSettings() {
@@ -1526,13 +1514,84 @@ class FinanceTrackerPlugin extends Plugin {
     this.registerInterval(this._gistPollTimer);
   }
 
+  // Called after every write the plugin makes. It no longer refreshes only the
+  // sidebar: the hub, the inbox and every open finance block depend on the same
+  // notes, and all of them are brought up to date together.
   refreshDailyBudgetView() {
-    const leaves = this.app.workspace.getLeavesOfType(DAILY_BUDGET_VIEW);
-    for (const leaf of leaves) {
-      if (leaf.view && typeof leaf.view.refresh === "function") {
-        leaf.view.refresh();
+    this.notifyFinanceDataChanged();
+  }
+
+  // Debounced, so a burst — a batch capture, a migration, Sync bringing in a
+  // week of notes — costs one refresh. Rendering never writes a note, so a
+  // refresh cannot trigger another one.
+  notifyFinanceDataChanged() {
+    clearTimeout(this._dataChangedTimer);
+    this._dataChangedTimer = setTimeout(() => {
+      this._dataChangedTimer = null;
+      this.refreshFinanceSurfaces().catch((error) => console.warn("[finance-tracker] refresh failed", error));
+    }, 500);
+  }
+
+  async refreshFinanceSurfaces() {
+    for (const type of [DAILY_BUDGET_VIEW, FINANCE_INBOX_VIEW, FINANCE_HUB_VIEW]) {
+      for (const leaf of this.app.workspace.getLeavesOfType(type)) {
+        if (typeof leaf.view?.refresh === "function") leaf.view.refresh();
       }
     }
+    for (const block of Array.from(this._liveBlocks || [])) {
+      await block.refresh().catch((error) => console.warn("[finance-tracker] block refresh failed", error));
+    }
+    this._scheduleStatusBarUpdate();
+  }
+
+  // Notes whose changes can move a number somewhere: daily notes, the budgets
+  // folder (budgets, goals, trips, bills) and the portfolio note.
+  isFinanceSourcePath(path) {
+    const value = String(path || "");
+    if (!value.endsWith(".md")) return false;
+    const folders = [this.settings.dailyNotesFolder, this.settings.budgetsFolderPath, this.settings.budgetArchiveFolderPath]
+      .map((folder) => String(folder || "").trim())
+      .filter(Boolean)
+      .map((folder) => normalizePath(`${folder}/`));
+    if (folders.some((folder) => value.startsWith(folder))) return true;
+    return typeof this.getPortfolioNotePath === "function" && value === this.getPortfolioNotePath();
+  }
+
+  registerFinanceBlock(type, render) {
+    this.registerMarkdownCodeBlockProcessor(type, async (source, el, ctx) => {
+      this.trackLiveBlock(el, ctx, () => render.call(this, source, el, ctx));
+      await render.call(this, source, el, ctx);
+    });
+  }
+
+  // Ties a rendered block to the note's lifecycle: registered while the note is
+  // open, dropped when it closes. A block holding focus — someone typing into
+  // it — is left alone and caught up once focus moves on.
+  trackLiveBlock(el, ctx, rerender) {
+    if (typeof ctx?.addChild !== "function" || typeof MarkdownRenderChild !== "function") return null;
+    const blocks = this._liveBlocks || (this._liveBlocks = new Set());
+    const child = new MarkdownRenderChild(el);
+    const entry = {
+      el,
+      refresh: async () => {
+        const active = typeof document !== "undefined" ? document.activeElement : null;
+        if (active && typeof el.contains === "function" && el.contains(active)) {
+          if (!entry.waiting) {
+            entry.waiting = true;
+            el.addEventListener("focusout", () => {
+              entry.waiting = false;
+              window.setTimeout(() => entry.refresh(), 0);
+            }, { once: true });
+          }
+          return;
+        }
+        await rerender();
+      },
+    };
+    child.onload = () => blocks.add(entry);
+    child.onunload = () => blocks.delete(entry);
+    ctx.addChild(child);
+    return entry;
   }
 
   _scheduleStatusBarUpdate() {
@@ -1664,19 +1723,32 @@ class FinanceTrackerPlugin extends Plugin {
           this.invalidateIndexEntry(file.path);
           this._scheduleStatusBarUpdate();
         }
+        if (this.isFinanceSourcePath(file.path)) this.notifyFinanceDataChanged();
       })
     );
     this.registerEvent(
       this.app.vault.on("create", (file) => {
         // A note arriving from Sync, or from another device, changes the numbers
         // exactly as much as one edited here does.
-        if (!file?.path?.startsWith(normalizePath(`${this.settings.dailyNotesFolder}/`))) return;
+        if (_ftSelfWrites.has(file?.path) || !this.isFinanceSourcePath(file?.path)) return;
+        this.notifyFinanceDataChanged();
+        if (!file.path.startsWith(normalizePath(`${this.settings.dailyNotesFolder}/`))) return;
         this.invalidateIndexEntry(file.path);
         this._scheduleStatusBarUpdate();
       })
     );
-    this.registerEvent(this.app.vault.on("delete", (file) => this.invalidateIndexEntry(file.path)));
-    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.invalidateIndexEntry(oldPath)));
+    this.registerEvent(
+      this.app.vault.on("delete", (file) => {
+        this.invalidateIndexEntry(file.path);
+        if (this.isFinanceSourcePath(file.path)) this.notifyFinanceDataChanged();
+      })
+    );
+    this.registerEvent(
+      this.app.vault.on("rename", (file, oldPath) => {
+        this.invalidateIndexEntry(oldPath);
+        if (this.isFinanceSourcePath(file.path) || this.isFinanceSourcePath(oldPath)) this.notifyFinanceDataChanged();
+      })
+    );
     this.registerEvent(
       this.app.workspace.on("file-open", (file) => {
         if (!file || !file.path) return;
@@ -2915,6 +2987,7 @@ class FinanceTrackerPlugin extends Plugin {
           carryMissedSavings: holiday.carryMissedSavings,
           currency: holiday.currency,
           dueDate: holiday.savingsDueDate,
+          endDate: holiday.endDate || "",
           file,
           goalKey: holiday.savingsGoalKey,
           goalName: holiday.holidayName,
@@ -4617,6 +4690,7 @@ class FinanceTrackerPlugin extends Plugin {
       tooltip: "Quick add a transaction",
     });
     addAction(headerActions, "Budgets", () => this.openDefaultBudgetNote(), { errorPrefix: "Opening budgets note" });
+    addAction(headerActions, "Hub", () => this.activateHubView(), { opensModal: true, tooltip: "Open the finance hub" });
 
     // Summary cards: Today + this period (+ trip cards when one is running).
     // Collected first, rendered once, so the conditional cards join the same
@@ -6759,18 +6833,28 @@ class FinanceTrackerPlugin extends Plugin {
     }
   }
 
-  // --- Year/quarter review command --------------------------------------------------
+  // --- Frozen period reviews ---------------------------------------------------------
 
-  // Computes the finished markdown for "Insert yearly review" / "Insert
-  // quarterly review" — a frozen snapshot as of today, not a live block.
-  async buildPeriodReview(period) {
+  // The finished markdown for the review commands and the Insert a finance block
+  // list — a snapshot as of now, for the period containing `referenceDate`, not
+  // a live block.
+  async buildPeriodReview(period, referenceDate = core.todayIsoLocal()) {
     const entries = await this.collectAllTransactions();
     const goalKeys = (await this.collectSavingsGoalDefinitions()).map((goal) => goal.goalKey).filter(Boolean);
+    const recurringPrefix = core.normalizeCategoryPath(this.settings.recurringTagPrefix || "subscriptions") || "subscriptions";
+    let billLabels = new Map();
+    if (period === "week" || period === "month") {
+      const recurring = await this.detectRecurring(core.todayIsoLocal(), recurringPrefix);
+      billLabels = new Map(recurring.items.map((item) => [core.normalizeCategoryPath(item.category || ""), item.label]));
+    }
     return core.buildPeriodReviewLines(entries, {
       period,
-      referenceDate: core.todayIsoLocal(),
+      referenceDate: core.parseIsoDate(referenceDate) || core.todayIsoLocal(),
       currency: this.settings.defaultCurrency,
       goalKeys,
+      weekStartsOn: this.settings.weekStartsOn,
+      recurringPrefix,
+      billLabels,
     });
   }
 
@@ -7103,16 +7187,21 @@ class FinanceTrackerPlugin extends Plugin {
     el.empty();
 
     const config = parseConfigBlock(source);
-    const referenceDate = this.getReferenceDateForSource(ctx.sourcePath);
+    // The hub's Reviews tab steps through periods with no note behind them, so
+    // it hands the date over directly.
+    const referenceDate = core.parseIsoDate(ctx?.referenceDate) || this.getReferenceDateForSource(ctx?.sourcePath);
+    const weekStartsOn = this.settings.weekStartsOn;
     const range = core.toPeriodRange({
       period: config.period || "week",
       referenceDate,
       start: config.start,
       end: config.end,
-      weekStartsOn: this.settings.weekStartsOn,
+      weekStartsOn,
     });
     const currency = core.normalizeCurrency(config.currency || this.settings.defaultCurrency);
     const groupBy = String(config.groupby || this.settings.dashboardDefaultGroupBy || "primary").toLowerCase();
+    const { sections, unknown } = core.resolveDashboardSections(config, range.period);
+    const on = new Set(sections);
 
     const wrapper = el.createDiv({ cls: "finance-tracker-dashboard" });
     const header = wrapper.createDiv({ cls: "finance-tracker-header" });
@@ -7132,34 +7221,61 @@ class FinanceTrackerPlugin extends Plugin {
     const filterReal = (list) => list.filter((entry) => core.isSpendingEntry(entry));
     const entries = filterReal(allEntries);
 
-    // Previous comparable period (same length, immediately before) for the delta card.
+    // The previous period: last month for a month, last week for a week, the
+    // same number of days before for a custom range.
     const spanDays = core.daysBetweenInclusive(range.start, range.end);
-    const prevEnd = core.addDays(range.start, -1);
-    const prevStart = core.addDays(prevEnd, -(spanDays - 1));
-    const prevEntries = filterReal(await this.collectTransactionsForRange({ period: range.period, start: prevStart, end: prevEnd }));
+    const previousRange = core.previousPeriodRange(range, { weekStartsOn });
+    const prevEntries = filterReal(await this.collectTransactionsForRange(previousRange));
     const previousTotal = core.roundCurrencyAmount(prevEntries.reduce((sum, entry) => sum + core.entrySpendAmount(entry), 0));
 
-    this.renderSummary(wrapper, entries, currency, range, { previousTotal });
+    if (on.has("summary")) this.renderSummary(wrapper, entries, currency, range, { previousTotal });
 
-    // Honour the Default grouping setting. This was hardcoded to "full", so a
-    // vault set to "Primary category" still got subcategory rings it had asked
-    // not to see.
-    const hierarchy = core.buildHierarchicalCategoryGroups(entries, groupBy);
-    this.renderPieChart(wrapper, hierarchy, currency, Number(this.settings.dashboardSliceLabelThreshold || 0.08));
-
-    const budgets = await this.loadBudgets("default");
-    const budgetProgress = this.buildBudgetProgress(entries, budgets, range, groupBy, referenceDate);
-
-    const allBudget = budgets.find((budget) => budget.category === "all");
-    let perDayBudget = 0;
-    if (allBudget) {
-      const scaled = core.scaleBudgetLimit(Number(allBudget.limit || 0), allBudget.period, range, referenceDate || range.start, this.settings.weekStartsOn);
-      perDayBudget = spanDays > 0 ? core.roundCurrencyAmount(scaled / spanDays) : 0;
+    if (on.has("income")) {
+      const goalKeys = (await this.collectSavingsGoalDefinitions()).map((goal) => goal.goalKey).filter(Boolean);
+      this.renderIncomeSection(wrapper, allEntries, currency, range, goalKeys);
     }
-    this.renderSpendTrend(wrapper, entries, range, currency, { perDayBudget });
 
-    this.renderBudgets(wrapper, budgetProgress, currency);
-    await this.renderSavingsActivity(wrapper, allEntries, currency, range, referenceDate);
+    if (on.has("uncategorised")) this.renderUncategorisedCallout(wrapper, entries, currency, range);
+
+    if (on.has("categories")) {
+      // Honour the Default grouping setting. This was hardcoded to "full", so a
+      // vault set to "Primary category" still got subcategory rings it had asked
+      // not to see.
+      const hierarchy = core.buildHierarchicalCategoryGroups(entries, groupBy);
+      this.renderPieChart(wrapper, hierarchy, currency, Number(this.settings.dashboardSliceLabelThreshold || 0.08));
+    }
+
+    const budgets = on.has("trend") || on.has("budgets") ? await this.loadBudgets("default") : [];
+    if (on.has("trend")) {
+      const allBudget = budgets.find((budget) => budget.category === "all");
+      let perDayBudget = 0;
+      if (allBudget) {
+        const scaled = core.scaleBudgetLimit(Number(allBudget.limit || 0), allBudget.period, range, referenceDate || range.start, weekStartsOn);
+        perDayBudget = spanDays > 0 ? core.roundCurrencyAmount(scaled / spanDays) : 0;
+      }
+      this.renderSpendTrend(wrapper, entries, range, currency, { perDayBudget });
+    }
+
+    if (on.has("changes")) this.renderCategoryChanges(wrapper, entries, prevEntries, currency, range);
+    if (on.has("merchants")) this.renderTopMerchants(wrapper, entries, currency);
+    if (on.has("largest")) this.renderLargestTransactions(wrapper, entries, currency);
+
+    if (on.has("budgets")) {
+      const budgetProgress = this.buildBudgetProgress(entries, budgets, range, groupBy, referenceDate);
+      this.renderBudgets(wrapper, budgetProgress, currency);
+    }
+
+    if (on.has("bills")) await this.renderBillsForPeriod(wrapper, allEntries, currency, range);
+    if (on.has("trips")) this.renderTripSpendSection(wrapper, allEntries, currency);
+    if (on.has("savings")) await this.renderSavingsActivity(wrapper, allEntries, currency, range, referenceDate);
+    if (on.has("portfolio")) await this.renderPortfolioChange(wrapper, allEntries, currency, range);
+
+    if (unknown.length) {
+      wrapper.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: `Unknown section name${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}. Sections: ${core.DASHBOARD_SECTIONS.join(", ")}.`,
+      });
+    }
   }
 }
 

@@ -2977,6 +2977,7 @@ function buildMonthlyIncomeExpense(entries, options = {}) {
 // `#log/income/<key>` tag is only a real contribution when <key> matches one;
 // otherwise it's just regular income under that name (e.g. salary).
 function buildPeriodReviewLines(entries, options = {}) {
+  if (options.period === "week" || options.period === "month") return buildShortPeriodReviewLines(entries, options);
   const period = options.period === "quarter" ? "quarter" : "year";
   const currency = options.currency || "AUD";
   const range = toPeriodRange({ period, referenceDate: options.referenceDate });
@@ -2986,18 +2987,9 @@ function buildPeriodReviewLines(entries, options = {}) {
   const spendEntries = inRange.filter((entry) => isSpendingEntry(entry));
   const totalSpend = roundCurrencyAmount(spendEntries.reduce((sum, entry) => sum + entrySpendAmount(entry), 0));
 
-  const incomeEntries = inRange.filter((entry) => entry.entryType === "income");
-  const contributions = incomeEntries.filter((entry) => goalKeys.has(entry.goalKey));
-  const settleUps = incomeEntries.filter(
-    (entry) => !goalKeys.has(entry.goalKey) && normalizeCategoryPath(entry.category || "").startsWith("settleup/")
-  );
-  const runwayContributions = incomeEntries.filter(
-    (entry) => !goalKeys.has(entry.goalKey) && RUNWAY_LEGACY_KEYS.has(normalizeCategoryPath(entry.category || ""))
-  );
-  const regularIncome = incomeEntries.filter(
-    (entry) => !goalKeys.has(entry.goalKey) && !settleUps.includes(entry) && !runwayContributions.includes(entry)
-  );
-  const withdrawals = inRange.filter((entry) => entry.entryType === "goal-withdrawal");
+  const { contributions, settleUps, runwayContributions, regularIncome, withdrawals } = classifyIncomeEntries(inRange, {
+    goalKeys: Array.from(goalKeys),
+  });
 
   const totalIncome = roundCurrencyAmount(regularIncome.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
   const contributedTotal = roundCurrencyAmount(contributions.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
@@ -3051,6 +3043,444 @@ function buildPeriodReviewLines(entries, options = {}) {
   lines.push(`- Savings withdrawals: ${formatCurrency(withdrawnTotal, currency)} (${withdrawals.length})`);
   lines.push(`- Settled repayments received: ${formatCurrency(settledTotal, currency)} (${settleUps.length})`);
   lines.push(`- Runway contributions: ${formatCurrency(runwayTotal, currency)} (${runwayContributions.length})`);
+
+  return lines;
+}
+
+// Income, split by what it really is. Only the first group is money earned:
+// the rest are transfers. `goalKeys` must be the vault's actual goal keys — an
+// `#log/income/<key>` tag is a contribution only when <key> names a goal;
+// otherwise it is ordinary income under that name (salary, dividend/vas-ax).
+function classifyIncomeEntries(entries, options = {}) {
+  const goalKeys = new Set((options.goalKeys || []).map((key) => normalizeCategoryPath(key)).filter(Boolean));
+  const incomeEntries = (entries || []).filter((entry) => entry?.entryType === "income");
+  const contributions = incomeEntries.filter((entry) => goalKeys.has(entry.goalKey));
+  const settleUps = incomeEntries.filter(
+    (entry) => !goalKeys.has(entry.goalKey) && normalizeCategoryPath(entry.category || "").startsWith("settleup/")
+  );
+  const runwayContributions = incomeEntries.filter(
+    (entry) => !goalKeys.has(entry.goalKey) && RUNWAY_LEGACY_KEYS.has(normalizeCategoryPath(entry.category || ""))
+  );
+  const regularIncome = incomeEntries.filter(
+    (entry) => !goalKeys.has(entry.goalKey) && !settleUps.includes(entry) && !runwayContributions.includes(entry)
+  );
+  const withdrawals = (entries || []).filter((entry) => entry?.entryType === "goal-withdrawal");
+  return { contributions, settleUps, runwayContributions, regularIncome, withdrawals };
+}
+
+const sumBy = (list, amountOf) => roundCurrencyAmount((list || []).reduce((sum, item) => sum + Number(amountOf(item) || 0), 0));
+
+// Savings rate = (income − home spending) ÷ income. Goal contributions, settle-
+// ups and runway top-ups are transfers, so they are neither income nor spend;
+// trip spending is paid from a trip's savings and is reported on its own. With
+// no income the rate is null — "no income logged", not −∞%.
+function summarizeIncomeAndSavings(entries, options = {}) {
+  const { regularIncome } = classifyIncomeEntries(entries, options);
+  const income = sumBy(regularIncome, (entry) => entry.amount);
+  const spending = sumBy((entries || []).filter((entry) => isSpendingEntry(entry)), entrySpendAmount);
+  const saved = roundCurrencyAmount(income - spending);
+  const sources = new Map();
+  for (const entry of regularIncome) {
+    const key = primaryCategory(entry.category || "income") || "income";
+    const row = sources.get(key) || { key, label: titleCaseSegment(key), total: 0, count: 0 };
+    row.total = roundCurrencyAmount(row.total + Number(entry.amount || 0));
+    row.count += 1;
+    sources.set(key, row);
+  }
+  return {
+    income,
+    incomeCount: regularIncome.length,
+    saved,
+    savingsRate: income > 0 ? saved / income : null,
+    sources: Array.from(sources.values()).sort((left, right) => right.total - left.total),
+    spending,
+  };
+}
+
+function isUncategorisedEntry(entry) {
+  return isSpendingEntry(entry) && (!entry.category || entry.category === "uncategorized");
+}
+
+function summarizeUncategorised(entries) {
+  const list = (entries || []).filter((entry) => isUncategorisedEntry(entry));
+  return { count: list.length, total: sumBy(list, entrySpendAmount) };
+}
+
+// Merchants by what was spent there, grouped the way the inbox groups them so
+// "Woolworths/cnr Brisbane H" and "Woolworths/8 Sherwood Roa" are one shop.
+// Entries with no merchant are counted separately rather than lumped together
+// as a fake shop called "(no merchant)".
+function summarizeTopMerchants(entries, options = {}) {
+  const limit = Number(options.limit) > 0 ? Number(options.limit) : 5;
+  const groups = new Map();
+  let unnamedCount = 0;
+  let unnamedTotal = 0;
+  for (const entry of entries || []) {
+    if (!isSpendingEntry(entry)) continue;
+    const merchant = normalizeWhitespace(entry.merchant || "");
+    const root = merchantRootKey(merchant);
+    const spend = entrySpendAmount(entry);
+    if (!root) {
+      unnamedCount += 1;
+      unnamedTotal = roundCurrencyAmount(unnamedTotal + spend);
+      continue;
+    }
+    const group = groups.get(root) || { key: root, label: "", total: 0, count: 0, lastDate: "" };
+    group.total = roundCurrencyAmount(group.total + spend);
+    group.count += 1;
+    const date = parseIsoDate(entry.date) || "";
+    if (!group.label || date >= group.lastDate) {
+      group.label = cleanMerchantDisplay(merchant);
+      group.lastDate = date;
+    }
+    groups.set(root, group);
+  }
+  const rows = Array.from(groups.values())
+    .filter((group) => group.total > 0)
+    .sort((left, right) => right.total - left.total || right.count - left.count || left.label.localeCompare(right.label));
+  return { rows: rows.slice(0, limit), merchantCount: rows.length, unnamedCount, unnamedTotal };
+}
+
+function largestTransactions(entries, options = {}) {
+  const limit = Number(options.limit) > 0 ? Number(options.limit) : 5;
+  return (entries || [])
+    .filter((entry) => isSpendingEntry(entry) && entrySpendAmount(entry) > 0)
+    .map((entry) => ({ entry, spend: roundCurrencyAmount(entrySpendAmount(entry)) }))
+    .sort((left, right) => right.spend - left.spend || String(left.entry.date || "").localeCompare(String(right.entry.date || "")))
+    .slice(0, limit);
+}
+
+function totalsByPrimaryCategory(entries) {
+  const totals = new Map();
+  for (const entry of entries || []) {
+    if (!isSpendingEntry(entry)) continue;
+    const key = primaryCategory(entry.category || "uncategorized") || "uncategorized";
+    totals.set(key, roundCurrencyAmount((totals.get(key) || 0) + entrySpendAmount(entry)));
+  }
+  return totals;
+}
+
+// Biggest movers first, in either direction, so a category that vanished is as
+// visible as one that doubled.
+function compareCategoryTotals(currentEntries, previousEntries, options = {}) {
+  const limit = Number(options.limit) > 0 ? Number(options.limit) : 5;
+  const current = totalsByPrimaryCategory(currentEntries);
+  const previous = totalsByPrimaryCategory(previousEntries);
+  const keys = new Set([...current.keys(), ...previous.keys()]);
+  const rows = [];
+  for (const key of keys) {
+    const now = current.get(key) || 0;
+    const before = previous.get(key) || 0;
+    const delta = roundCurrencyAmount(now - before);
+    if (delta === 0) continue;
+    rows.push({
+      key,
+      label: titleCaseSegment(key),
+      current: now,
+      previous: before,
+      delta,
+      pct: before > 0 ? Math.round((delta / before) * 100) : null,
+    });
+  }
+  rows.sort((left, right) => Math.abs(right.delta) - Math.abs(left.delta) || left.key.localeCompare(right.key));
+  return { rows: rows.slice(0, limit), previousTotal: sumBy(Array.from(previous.values()), (value) => value) };
+}
+
+// Trip-tagged spending never reaches home totals (see isSpendingEntry), which
+// made a week away look frugal. This is that spending, per trip.
+function summarizeTripSpend(entries) {
+  const trips = new Map();
+  for (const entry of entries || []) {
+    if (!entry?.holidayKey || isPlannedExpenseEntry(entry)) continue;
+    if (entry.isIncome || entry.isGoalContribution || entry.entryType === "goal-withdrawal" || entry.entryType === "balance") continue;
+    const key = entry.holidayKey;
+    // A name taken from the tag is lower case ("japan"); a trip note's own name
+    // is kept as written.
+    const raw = String(entry.holidayName || String(key).split("/").pop() || key);
+    const label = raw === raw.toLowerCase() ? titleCaseSegment(raw) : raw;
+    const trip = trips.get(key) || { key, label, total: 0, count: 0 };
+    trip.total = roundCurrencyAmount(trip.total + entrySpendAmount(entry));
+    trip.count += 1;
+    trips.set(key, trip);
+  }
+  const rows = Array.from(trips.values()).sort((left, right) => right.total - left.total);
+  return { rows, total: sumBy(rows, (row) => row.total) };
+}
+
+// Payments logged under the bill prefix (`subscriptions/<cadence>/<bill>`),
+// named from `labels` (category → bill name) when the bill is known.
+function summarizeBillPayments(entries, options = {}) {
+  const prefix = normalizeCategoryPath(options.prefix || "subscriptions") || "subscriptions";
+  const labels = options.labels instanceof Map ? options.labels : new Map(Object.entries(options.labels || {}));
+  const bills = new Map();
+  for (const entry of entries || []) {
+    if (!isSpendingEntry(entry)) continue;
+    const category = normalizeCategoryPath(entry.category || "");
+    if (!category.startsWith(`${prefix}/`)) continue;
+    const bill = bills.get(category) || {
+      category,
+      label: labels.get(category) || titleCaseSegment(category.split("/").pop() || category),
+      total: 0,
+      count: 0,
+      dates: [],
+    };
+    bill.total = roundCurrencyAmount(bill.total + entrySpendAmount(entry));
+    bill.count += 1;
+    if (entry.date) bill.dates.push(entry.date);
+    bills.set(category, bill);
+  }
+  const rows = Array.from(bills.values()).sort((left, right) => right.total - left.total);
+  return { rows, total: sumBy(rows, (row) => row.total), count: rows.reduce((sum, row) => sum + row.count, 0) };
+}
+
+// The period before this one. A calendar period steps back a calendar period —
+// September is compared with August, not with the 30 days before it, which for
+// March would have been a stretch of January and February. A custom range steps
+// back by its own length.
+function previousPeriodRange(range, options = {}) {
+  const start = parseIsoDate(range?.start);
+  const end = parseIsoDate(range?.end);
+  if (!start || !end) return null;
+  const period = String(range.period || "").toLowerCase();
+  const weekStartsOn = options.weekStartsOn || "monday";
+  if (["week", "fortnight", "month", "bimonth", "quarter", "year"].includes(period)) {
+    const aligned = toPeriodRange({ period, referenceDate: start, weekStartsOn });
+    if (aligned.start === start && aligned.end === end) {
+      return toPeriodRange({ period, referenceDate: addDays(start, -1), weekStartsOn });
+    }
+  }
+  const span = daysBetweenInclusive(start, end);
+  const previousEnd = addDays(start, -1);
+  return { period, start: addDays(previousEnd, -(span - 1)), end: previousEnd };
+}
+
+function nextPeriodRange(range, options = {}) {
+  const start = parseIsoDate(range?.start);
+  const end = parseIsoDate(range?.end);
+  if (!start || !end) return null;
+  const period = String(range.period || "").toLowerCase();
+  const weekStartsOn = options.weekStartsOn || "monday";
+  if (["week", "fortnight", "month", "bimonth", "quarter", "year"].includes(period)) {
+    const aligned = toPeriodRange({ period, referenceDate: start, weekStartsOn });
+    if (aligned.start === start && aligned.end === end) {
+      return toPeriodRange({ period, referenceDate: addDays(end, 1), weekStartsOn });
+    }
+  }
+  const span = daysBetweenInclusive(start, end);
+  return { period, start: addDays(end, 1), end: addDays(end, span) };
+}
+
+// --- Dashboard sections ------------------------------------------------------
+
+const DASHBOARD_SECTIONS = [
+  "summary",
+  "income",
+  "uncategorised",
+  "categories",
+  "trend",
+  "changes",
+  "merchants",
+  "largest",
+  "budgets",
+  "bills",
+  "trips",
+  "savings",
+  "portfolio",
+];
+
+// What a dashboard showed before sections existed, plus the uncategorised
+// callout: totals quietly include "Uncategorized", and saying so is a fix, not a
+// feature. Weekly and monthly reviews get everything.
+const DASHBOARD_BASE_SECTIONS = ["summary", "uncategorised", "categories", "trend", "budgets", "savings"];
+
+const DASHBOARD_SECTION_ALIASES = {
+  uncategorized: "uncategorised",
+  pie: "categories",
+  donut: "categories",
+  daily: "trend",
+  dailyspend: "trend",
+  savingsrate: "income",
+  topmerchants: "merchants",
+  largesttransactions: "largest",
+  transactions: "largest",
+  categorychanges: "changes",
+  trip: "trips",
+  tripspend: "trips",
+  recurring: "bills",
+  subscriptions: "bills",
+  goals: "savings",
+  networth: "portfolio",
+};
+
+// `show:` lists exactly the sections wanted (`defaults` and `all` expand in
+// place, so `show: defaults, merchants` adds one); `hide:` removes from
+// whatever that leaves. Unknown names come back so the block can say so.
+function resolveDashboardSections(config = {}, period = "week") {
+  const normalize = (token) => {
+    const key = String(token || "").trim().toLowerCase().replace(/[\s_-]+/g, "");
+    return DASHBOARD_SECTION_ALIASES[key] || key;
+  };
+  // Commas separate names; a name may have spaces ("top merchants"). A piece
+  // that isn't a name as a whole is tried word by word ("budgets trend").
+  const known = (key) => DASHBOARD_SECTIONS.includes(key) || ["all", "defaults", "default"].includes(key);
+  const parse = (value) =>
+    String(value || "")
+      .split(/[,;]+/)
+      .flatMap((piece) => (known(normalize(piece)) ? [normalize(piece)] : piece.trim().split(/\s+/).map(normalize)))
+      .filter(Boolean);
+  const normalizedPeriod = String(period || "").toLowerCase();
+  const defaults = normalizedPeriod === "week" || normalizedPeriod === "month" ? DASHBOARD_SECTIONS : DASHBOARD_BASE_SECTIONS;
+  const unknown = [];
+  const shown = parse(config.show);
+  let chosen;
+  if (shown.length) {
+    chosen = new Set();
+    for (const token of shown) {
+      if (token === "all") DASHBOARD_SECTIONS.forEach((key) => chosen.add(key));
+      else if (token === "defaults" || token === "default") defaults.forEach((key) => chosen.add(key));
+      else if (DASHBOARD_SECTIONS.includes(token)) chosen.add(token);
+      else unknown.push(token);
+    }
+  } else {
+    chosen = new Set(defaults);
+  }
+  for (const token of parse(config.hide)) {
+    if (DASHBOARD_SECTIONS.includes(token)) chosen.delete(token);
+    else if (token !== "all" && token !== "defaults" && token !== "default") unknown.push(token);
+  }
+  return { sections: DASHBOARD_SECTIONS.filter((key) => chosen.has(key)), unknown };
+}
+
+const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+
+function formatDayMonthYear(iso) {
+  const date = parseIsoDate(iso);
+  if (!date) return "";
+  return `${Number(date.slice(8, 10))} ${MONTH_NAMES[Number(date.slice(5, 7)) - 1].slice(0, 3)} ${date.slice(0, 4)}`;
+}
+
+// A heading for a period: "Week of 7 Sep 2026", "September 2026", "2026 Q3".
+function describePeriodTitle(range) {
+  const start = parseIsoDate(range?.start);
+  const end = parseIsoDate(range?.end);
+  if (!start || !end) return "";
+  const period = String(range.period || "").toLowerCase();
+  const aligned = (name) => {
+    const expected = toPeriodRange({ period: name, referenceDate: start, weekStartsOn: range.weekStartsOn || "monday" });
+    return expected.start === start && expected.end === end;
+  };
+  if (period === "year" && aligned("year")) return start.slice(0, 4);
+  if (period === "quarter" && aligned("quarter")) return `${start.slice(0, 4)} Q${Math.floor((Number(start.slice(5, 7)) - 1) / 3) + 1}`;
+  if (period === "month" && aligned("month")) return `${MONTH_NAMES[Number(start.slice(5, 7)) - 1]} ${start.slice(0, 4)}`;
+  if (period === "week" && daysBetweenInclusive(start, end) === 7) return `Week of ${formatDayMonthYear(start)}`;
+  if (start === end) return formatDayMonthYear(start);
+  return `${formatDayMonthYear(start)} to ${formatDayMonthYear(end)}`;
+}
+
+function describeChange(delta, previous, currency, periodWord) {
+  if (!(previous > 0)) return "";
+  const arrow = delta > 0 ? "▲" : delta < 0 ? "▼" : "—";
+  const pct = Math.round((delta / previous) * 100);
+  return `${arrow} ${formatCurrency(Math.abs(delta), currency)} (${pct >= 0 ? "+" : ""}${pct}%) vs previous ${periodWord}`;
+}
+
+function escapeTableCell(value) {
+  return String(value ?? "").replace(/\|/g, "\\|").replace(/\s+/g, " ").trim();
+}
+
+// A frozen weekly or monthly review: the same questions the live dashboard
+// answers, as plain markdown that will still say the same thing next year.
+function buildShortPeriodReviewLines(entries, options = {}) {
+  const period = options.period === "month" ? "month" : "week";
+  const currency = options.currency || "AUD";
+  const weekStartsOn = options.weekStartsOn || "monday";
+  const range = toPeriodRange({ period, referenceDate: options.referenceDate, weekStartsOn });
+  const previous = previousPeriodRange(range, { weekStartsOn });
+  const goalKeys = options.goalKeys || [];
+  const inRange = (entries || []).filter((entry) => isDateInRange(entry.date, range));
+  const inPrevious = (entries || []).filter((entry) => isDateInRange(entry.date, previous));
+
+  const savings = summarizeIncomeAndSavings(inRange, { goalKeys });
+  const previousSpend = sumBy(inPrevious.filter((entry) => isSpendingEntry(entry)), entrySpendAmount);
+  const uncategorised = summarizeUncategorised(inRange);
+  const trips = summarizeTripSpend(inRange);
+  const bills = summarizeBillPayments(inRange, { prefix: options.recurringPrefix, labels: options.billLabels });
+  const changes = compareCategoryTotals(inRange, inPrevious, { limit: 100 });
+  const categoryTotals = Array.from(totalsByPrimaryCategory(inRange).entries())
+    .map(([key, value]) => ({ key, label: titleCaseSegment(key), value }))
+    .sort((left, right) => right.value - left.value)
+    .slice(0, 8);
+  const merchants = summarizeTopMerchants(inRange, { limit: 5 });
+  const largest = largestTransactions(inRange, { limit: 5 });
+  const transfers = classifyIncomeEntries(inRange, { goalKeys });
+
+  const label =
+    period === "month"
+      ? `${MONTH_NAMES[Number(range.start.slice(5, 7)) - 1]} ${range.start.slice(0, 4)}`
+      : `week of ${formatDayMonthYear(range.start)}`;
+  const lines = [`## Finance review: ${label}`, ""];
+  lines.push(`- Period: ${range.start} to ${range.end}`);
+  const change = describeChange(roundCurrencyAmount(savings.spending - previousSpend), previousSpend, currency, period);
+  lines.push(`- Spent: ${formatCurrency(savings.spending, currency)}${change ? ` (${change})` : ""}`);
+  lines.push(`- Income: ${formatCurrency(savings.income, currency)}`);
+  if (savings.savingsRate === null) {
+    lines.push("- Savings rate: no income logged");
+  } else {
+    const verb = savings.saved >= 0 ? "Saved" : "Overspent";
+    lines.push(`- ${verb}: ${formatCurrency(Math.abs(savings.saved), currency)} (${Math.round(savings.savingsRate * 100)}% savings rate)`);
+  }
+  if (uncategorised.count) {
+    lines.push(
+      `- Uncategorised: ${uncategorised.count} entr${uncategorised.count === 1 ? "y" : "ies"}, ${formatCurrency(uncategorised.total, currency)}`
+    );
+  }
+  if (bills.count) {
+    lines.push(`- Bills paid: ${bills.count} (${formatCurrency(bills.total, currency)})`);
+  }
+  if (trips.rows.length) {
+    const parts = trips.rows.map((trip) => `${trip.label} ${formatCurrency(trip.total, currency)}`);
+    lines.push(`- Trip spending, not counted above: ${parts.join(", ")}`);
+  }
+
+  if (categoryTotals.length) {
+    const changeByKey = new Map(changes.rows.map((row) => [row.key, row]));
+    lines.push("", "### Where it went", "");
+    lines.push(`| Category | Spent | Share | vs previous ${period} |`);
+    lines.push("| --- | ---: | ---: | ---: |");
+    for (const category of categoryTotals) {
+      const pct = savings.spending > 0 ? Math.round((category.value / savings.spending) * 100) : 0;
+      const row = changeByKey.get(category.key);
+      const delta = row ? `${row.delta > 0 ? "▲" : "▼"} ${formatCurrency(Math.abs(row.delta), currency)}` : "—";
+      lines.push(`| ${escapeTableCell(category.label)} | ${formatCurrency(category.value, currency)} | ${pct}% | ${delta} |`);
+    }
+  }
+
+  if (merchants.rows.length) {
+    lines.push("", "### Top merchants", "");
+    lines.push("| Merchant | Spent | Visits |");
+    lines.push("| --- | ---: | ---: |");
+    for (const row of merchants.rows) {
+      lines.push(`| ${escapeTableCell(row.label)} | ${formatCurrency(row.total, currency)} | ${row.count} |`);
+    }
+  }
+
+  if (largest.length) {
+    lines.push("", "### Largest transactions", "");
+    for (const { entry, spend } of largest) {
+      const name = cleanMerchantDisplay(entry.merchant || "") || displayCategoryPath(entry.category || "uncategorized");
+      lines.push(`- ${entry.date} · ${name} · ${displayCategoryPath(entry.category || "uncategorized")} · ${formatCurrency(spend, currency)}`);
+    }
+  }
+
+  const contributedTotal = sumBy(transfers.contributions, (entry) => entry.amount);
+  const withdrawnTotal = sumBy(transfers.withdrawals, (entry) => entry.amount);
+  const settledTotal = sumBy(transfers.settleUps, (entry) => entry.amount);
+  if (contributedTotal || withdrawnTotal || settledTotal) {
+    lines.push("", "### Transfers", "");
+    if (contributedTotal) lines.push(`- Savings contributions: ${formatCurrency(contributedTotal, currency)} (${transfers.contributions.length})`);
+    if (withdrawnTotal) lines.push(`- Savings withdrawals: ${formatCurrency(withdrawnTotal, currency)} (${transfers.withdrawals.length})`);
+    if (settledTotal) lines.push(`- Settled repayments received: ${formatCurrency(settledTotal, currency)} (${transfers.settleUps.length})`);
+  }
 
   return lines;
 }
@@ -5179,6 +5609,21 @@ module.exports = {
   buildMonthlyIncomeExpense,
   buildCumulativeBalanceSeries,
   buildPeriodReviewLines,
+  classifyIncomeEntries,
+  summarizeIncomeAndSavings,
+  isUncategorisedEntry,
+  summarizeUncategorised,
+  summarizeTopMerchants,
+  largestTransactions,
+  compareCategoryTotals,
+  summarizeTripSpend,
+  summarizeBillPayments,
+  previousPeriodRange,
+  nextPeriodRange,
+  DASHBOARD_SECTIONS,
+  resolveDashboardSections,
+  formatDayMonthYear,
+  describePeriodTitle,
   buildHierarchicalCategoryGroups,
   categoryBaseColor,
   categoryShadeColor,

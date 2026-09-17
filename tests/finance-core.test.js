@@ -2778,3 +2778,181 @@ test("net worth over time carries balances and portfolio value forward", () => {
     { date: "2026-09-01", value: 6500 },
   ]);
 });
+
+// --- Weekly and monthly reviews ----------------------------------------------------
+
+const REVIEW_ENTRIES = [
+  // previous week (Mon 2026-08-31 .. Sun 2026-09-06)
+  { entryType: "spending", category: "food/groceries", amount: 100, myShare: 100, merchant: "Woolworths/cnr Brisbane H", date: "2026-09-02" },
+  { entryType: "spending", category: "transport", amount: 40, myShare: 40, merchant: "Translink", date: "2026-09-03" },
+  // this week (Mon 2026-09-07 .. Sun 2026-09-13)
+  { entryType: "spending", category: "food/groceries", amount: 60, myShare: 60, merchant: "WOOLWORTHS/cnr Brisbane H", date: "2026-09-07" },
+  { entryType: "spending", category: "food/groceries", amount: 90, myShare: 90, merchant: "Woolworths/8 Sherwood Roa", date: "2026-09-09" },
+  { entryType: "spending", category: "medical", amount: 480, myShare: 480, merchant: "The Good Group Cli", date: "2026-09-09" },
+  { entryType: "spending", category: "food/restaurants", amount: 120, myShare: 60, merchant: "Nobu", date: "2026-09-10" },
+  { entryType: "spending", category: "uncategorized", amount: 33.23, myShare: 33.23, merchant: "Hillgate Hill Dbs", date: "2026-09-11" },
+  { entryType: "spending", category: "subscriptions/monthly/nbn", amount: 66.5, myShare: 66.5, merchant: "Aussie Broadband", date: "2026-09-12" },
+  { entryType: "spending", category: "shopping", amount: 12, myShare: 12, merchant: "", date: "2026-09-12" },
+  { entryType: "income", isIncome: true, category: "salary", goalKey: "salary", amount: 2000, date: "2026-09-10" },
+  { entryType: "income", isIncome: true, category: "dividend/vas-ax", goalKey: "dividend/vas-ax", amount: 50, date: "2026-09-11" },
+  { entryType: "income", isIncome: true, isGoalContribution: true, category: "iphone", goalKey: "iphone", amount: 300, date: "2026-09-11" },
+  { entryType: "income", isIncome: true, category: "settleup/sam", goalKey: "", amount: 60, date: "2026-09-12" },
+  { entryType: "spending", category: "food", holidayKey: "26/japan", holidayName: "Japan", amount: 210, myShare: 210, merchant: "Lawson", date: "2026-09-08" },
+  { entryType: "spending", category: "planned/hotel", holidayKey: "26/japan", isPlannedExpense: true, amount: 900, date: "2026-09-08" },
+];
+
+test("savings rate counts earned income against home spending, leaving transfers and trips out", () => {
+  const range = { start: "2026-09-07", end: "2026-09-13" };
+  const week = REVIEW_ENTRIES.filter((entry) => core.isDateInRange(entry.date, range));
+  const summary = core.summarizeIncomeAndSavings(week, { goalKeys: ["iphone"] });
+  // salary + dividend; the goal contribution and the settle-up are transfers
+  assert.equal(summary.income, 2050);
+  // 60 + 90 + 480 + 60 (my share of Nobu) + 33.23 + 66.5 + 12; trip spend excluded
+  assert.equal(summary.spending, 801.73);
+  assert.equal(summary.saved, 1248.27);
+  assert.equal(Math.round(summary.savingsRate * 100), 61);
+  assert.deepEqual(summary.sources.map((row) => row.key), ["salary", "dividend"]);
+});
+
+test("with no income the savings rate is null, not a huge negative", () => {
+  const summary = core.summarizeIncomeAndSavings([{ entryType: "spending", category: "food", amount: 20, date: "2026-09-01" }]);
+  assert.equal(summary.income, 0);
+  assert.equal(summary.savingsRate, null);
+});
+
+test("top merchants group a shop's branches and keep unnamed spending apart", () => {
+  const result = core.summarizeTopMerchants(REVIEW_ENTRIES.filter((entry) => entry.date >= "2026-09-07"), { limit: 3 });
+  assert.equal(result.rows[0].label, "The Good Group Cli");
+  const woolworths = result.rows.find((row) => row.key === "woolworths");
+  assert.equal(woolworths.total, 150);
+  assert.equal(woolworths.count, 2);
+  assert.equal(woolworths.label, "Woolworths", "the latest spelling, cleaned");
+  assert.equal(result.rows.length, 3);
+  assert.equal(result.unnamedCount, 1);
+  assert.equal(result.unnamedTotal, 12);
+  assert.ok(!result.rows.some((row) => row.key === "lawson"), "trip spending is not a home merchant");
+});
+
+test("largest transactions rank by my share, not the bill total", () => {
+  const rows = core.largestTransactions(REVIEW_ENTRIES, { limit: 10 });
+  assert.equal(rows[0].spend, 480);
+  const nobu = rows.find((row) => row.entry.merchant === "Nobu");
+  assert.equal(nobu.spend, 60);
+  assert.ok(!rows.some((row) => row.entry.holidayKey), "no trip or planned entries");
+});
+
+test("category changes rank the biggest movers in either direction", () => {
+  const previous = REVIEW_ENTRIES.filter((entry) => entry.date < "2026-09-07");
+  const current = REVIEW_ENTRIES.filter((entry) => entry.date >= "2026-09-07");
+  const { rows, previousTotal } = core.compareCategoryTotals(current, previous, { limit: 10 });
+  assert.equal(previousTotal, 140);
+  assert.equal(rows[0].key, "medical");
+  assert.equal(rows[0].pct, null, "new this period, so no percentage");
+  const food = rows.find((row) => row.key === "food");
+  assert.equal(food.delta, 110); // 210 vs 100
+  assert.equal(food.pct, 110);
+  const transport = rows.find((row) => row.key === "transport");
+  assert.equal(transport.delta, -40);
+});
+
+test("trip spending is summarised per trip without planned expenses", () => {
+  const trips = core.summarizeTripSpend(REVIEW_ENTRIES);
+  assert.equal(trips.rows.length, 1);
+  assert.equal(trips.rows[0].label, "Japan");
+  assert.equal(trips.total, 210);
+});
+
+test("bill payments are grouped by bill and named from the bill list", () => {
+  const bills = core.summarizeBillPayments(REVIEW_ENTRIES, {
+    prefix: "subscriptions",
+    labels: new Map([["subscriptions/monthly/nbn", "Aussie Broadband NBN"]]),
+  });
+  assert.equal(bills.count, 1);
+  assert.equal(bills.total, 66.5);
+  assert.equal(bills.rows[0].label, "Aussie Broadband NBN");
+});
+
+test("the previous period is the previous calendar period, or the same length for custom ranges", () => {
+  assert.deepEqual(core.previousPeriodRange({ period: "month", start: "2026-03-01", end: "2026-03-31" }), {
+    period: "month",
+    start: "2026-02-01",
+    end: "2026-02-28",
+  });
+  assert.deepEqual(core.previousPeriodRange({ period: "week", start: "2026-09-07", end: "2026-09-13" }), {
+    period: "week",
+    start: "2026-08-31",
+    end: "2026-09-06",
+  });
+  assert.deepEqual(core.previousPeriodRange({ period: "month", start: "2026-03-05", end: "2026-03-14" }), {
+    period: "month",
+    start: "2026-02-23",
+    end: "2026-03-04",
+  });
+  assert.deepEqual(core.nextPeriodRange({ period: "month", start: "2026-01-01", end: "2026-01-31" }), {
+    period: "month",
+    start: "2026-02-01",
+    end: "2026-02-28",
+  });
+});
+
+test("dashboard sections: week and month get everything, show and hide adjust it", () => {
+  assert.deepEqual(core.resolveDashboardSections({}, "month").sections, core.DASHBOARD_SECTIONS);
+  assert.deepEqual(core.resolveDashboardSections({}, "year").sections, [
+    "summary",
+    "uncategorised",
+    "categories",
+    "trend",
+    "budgets",
+    "savings",
+  ]);
+  const custom = core.resolveDashboardSections({ show: "defaults, top merchants", hide: "trend, sparkles" }, "year");
+  assert.deepEqual(custom.sections, ["summary", "uncategorised", "categories", "merchants", "budgets", "savings"]);
+  assert.deepEqual(custom.unknown, ["sparkles"]);
+  assert.deepEqual(core.resolveDashboardSections({ show: "Budgets, uncategorized" }, "week").sections, ["uncategorised", "budgets"]);
+  assert.deepEqual(core.resolveDashboardSections({ hide: "all" }, "week").sections, core.DASHBOARD_SECTIONS, "hide: all is ignored, not an error");
+});
+
+test("a weekly review is a frozen summary with savings rate, merchants and trips", () => {
+  const lines = core.buildPeriodReviewLines(REVIEW_ENTRIES, {
+    period: "week",
+    referenceDate: "2026-09-10",
+    goalKeys: ["iphone"],
+    recurringPrefix: "subscriptions",
+    billLabels: { "subscriptions/monthly/nbn": "Aussie Broadband NBN" },
+  });
+  const text = lines.join("\n");
+  assert.equal(lines[0], "## Finance review: week of 7 Sep 2026");
+  assert.match(text, /Period: 2026-09-07 to 2026-09-13/);
+  assert.match(text, /Spent: \$801\.73 \(▲ \$661\.73 \(\+473%\) vs previous week\)/);
+  assert.match(text, /Income: \$2,050\.00/);
+  assert.match(text, /Saved: \$1,248\.27 \(61% savings rate\)/);
+  assert.match(text, /Uncategorised: 1 entry, \$33\.23/);
+  assert.match(text, /Bills paid: 1 \(\$66\.50\)/);
+  assert.match(text, /Trip spending, not counted above: Japan \$210\.00/);
+  assert.match(text, /\| Medical \| \$480\.00 \| 60% \| ▲ \$480\.00 \|/);
+  assert.match(text, /\| Woolworths \| \$150\.00 \| 2 \|/);
+  assert.match(text, /- 2026-09-09 · The Good Group Cli · Medical · \$480\.00/);
+  assert.match(text, /Savings contributions: \$300\.00 \(1\)/);
+  assert.match(text, /Settled repayments received: \$60\.00 \(1\)/);
+});
+
+test("a monthly review names the month and says when there is no income", () => {
+  const lines = core.buildPeriodReviewLines(
+    [{ entryType: "spending", category: "food", amount: 25, myShare: 25, merchant: "Cafe | Bar", date: "2026-08-04" }],
+    { period: "month", referenceDate: "2026-08-20" }
+  );
+  const text = lines.join("\n");
+  assert.equal(lines[0], "## Finance review: August 2026");
+  assert.match(text, /Spent: \$25\.00\n/, "no comparison when last month had nothing");
+  assert.match(text, /Savings rate: no income logged/);
+  assert.match(text, /\| Cafe \\\| Bar \| \$25\.00 \| 1 \|/, "pipes in a merchant don't break the table");
+  assert.doesNotMatch(text, /### Transfers/, "an empty transfers section is left out");
+});
+
+test("period titles read like headings", () => {
+  assert.equal(core.describePeriodTitle({ period: "week", start: "2026-09-07", end: "2026-09-13" }), "Week of 7 Sep 2026");
+  assert.equal(core.describePeriodTitle({ period: "month", start: "2026-09-01", end: "2026-09-30" }), "September 2026");
+  assert.equal(core.describePeriodTitle({ period: "quarter", start: "2026-07-01", end: "2026-09-30" }), "2026 Q3");
+  assert.equal(core.describePeriodTitle({ period: "year", start: "2026-01-01", end: "2026-12-31" }), "2026");
+  assert.equal(core.describePeriodTitle({ period: "month", start: "2026-09-05", end: "2026-09-14" }), "5 Sep 2026 to 14 Sep 2026");
+});

@@ -1,6 +1,6 @@
 "use strict";
 
-const { ItemView, Menu, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, normalizePath, requestUrl } = require("obsidian");
+const { ItemView, MarkdownRenderChild, Menu, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, normalizePath, requestUrl } = require("obsidian");
 
 const core = (() => {
   const DAY_MS = 24 * 60 * 60 * 1000;
@@ -2980,6 +2980,7 @@ const core = (() => {
   // `#log/income/<key>` tag is only a real contribution when <key> matches one;
   // otherwise it's just regular income under that name (e.g. salary).
   function buildPeriodReviewLines(entries, options = {}) {
+    if (options.period === "week" || options.period === "month") return buildShortPeriodReviewLines(entries, options);
     const period = options.period === "quarter" ? "quarter" : "year";
     const currency = options.currency || "AUD";
     const range = toPeriodRange({ period, referenceDate: options.referenceDate });
@@ -2989,18 +2990,9 @@ const core = (() => {
     const spendEntries = inRange.filter((entry) => isSpendingEntry(entry));
     const totalSpend = roundCurrencyAmount(spendEntries.reduce((sum, entry) => sum + entrySpendAmount(entry), 0));
 
-    const incomeEntries = inRange.filter((entry) => entry.entryType === "income");
-    const contributions = incomeEntries.filter((entry) => goalKeys.has(entry.goalKey));
-    const settleUps = incomeEntries.filter(
-      (entry) => !goalKeys.has(entry.goalKey) && normalizeCategoryPath(entry.category || "").startsWith("settleup/")
-    );
-    const runwayContributions = incomeEntries.filter(
-      (entry) => !goalKeys.has(entry.goalKey) && RUNWAY_LEGACY_KEYS.has(normalizeCategoryPath(entry.category || ""))
-    );
-    const regularIncome = incomeEntries.filter(
-      (entry) => !goalKeys.has(entry.goalKey) && !settleUps.includes(entry) && !runwayContributions.includes(entry)
-    );
-    const withdrawals = inRange.filter((entry) => entry.entryType === "goal-withdrawal");
+    const { contributions, settleUps, runwayContributions, regularIncome, withdrawals } = classifyIncomeEntries(inRange, {
+      goalKeys: Array.from(goalKeys),
+    });
 
     const totalIncome = roundCurrencyAmount(regularIncome.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
     const contributedTotal = roundCurrencyAmount(contributions.reduce((sum, entry) => sum + Number(entry.amount || 0), 0));
@@ -3054,6 +3046,444 @@ const core = (() => {
     lines.push(`- Savings withdrawals: ${formatCurrency(withdrawnTotal, currency)} (${withdrawals.length})`);
     lines.push(`- Settled repayments received: ${formatCurrency(settledTotal, currency)} (${settleUps.length})`);
     lines.push(`- Runway contributions: ${formatCurrency(runwayTotal, currency)} (${runwayContributions.length})`);
+
+    return lines;
+  }
+
+  // Income, split by what it really is. Only the first group is money earned:
+  // the rest are transfers. `goalKeys` must be the vault's actual goal keys — an
+  // `#log/income/<key>` tag is a contribution only when <key> names a goal;
+  // otherwise it is ordinary income under that name (salary, dividend/vas-ax).
+  function classifyIncomeEntries(entries, options = {}) {
+    const goalKeys = new Set((options.goalKeys || []).map((key) => normalizeCategoryPath(key)).filter(Boolean));
+    const incomeEntries = (entries || []).filter((entry) => entry?.entryType === "income");
+    const contributions = incomeEntries.filter((entry) => goalKeys.has(entry.goalKey));
+    const settleUps = incomeEntries.filter(
+      (entry) => !goalKeys.has(entry.goalKey) && normalizeCategoryPath(entry.category || "").startsWith("settleup/")
+    );
+    const runwayContributions = incomeEntries.filter(
+      (entry) => !goalKeys.has(entry.goalKey) && RUNWAY_LEGACY_KEYS.has(normalizeCategoryPath(entry.category || ""))
+    );
+    const regularIncome = incomeEntries.filter(
+      (entry) => !goalKeys.has(entry.goalKey) && !settleUps.includes(entry) && !runwayContributions.includes(entry)
+    );
+    const withdrawals = (entries || []).filter((entry) => entry?.entryType === "goal-withdrawal");
+    return { contributions, settleUps, runwayContributions, regularIncome, withdrawals };
+  }
+
+  const sumBy = (list, amountOf) => roundCurrencyAmount((list || []).reduce((sum, item) => sum + Number(amountOf(item) || 0), 0));
+
+  // Savings rate = (income − home spending) ÷ income. Goal contributions, settle-
+  // ups and runway top-ups are transfers, so they are neither income nor spend;
+  // trip spending is paid from a trip's savings and is reported on its own. With
+  // no income the rate is null — "no income logged", not −∞%.
+  function summarizeIncomeAndSavings(entries, options = {}) {
+    const { regularIncome } = classifyIncomeEntries(entries, options);
+    const income = sumBy(regularIncome, (entry) => entry.amount);
+    const spending = sumBy((entries || []).filter((entry) => isSpendingEntry(entry)), entrySpendAmount);
+    const saved = roundCurrencyAmount(income - spending);
+    const sources = new Map();
+    for (const entry of regularIncome) {
+      const key = primaryCategory(entry.category || "income") || "income";
+      const row = sources.get(key) || { key, label: titleCaseSegment(key), total: 0, count: 0 };
+      row.total = roundCurrencyAmount(row.total + Number(entry.amount || 0));
+      row.count += 1;
+      sources.set(key, row);
+    }
+    return {
+      income,
+      incomeCount: regularIncome.length,
+      saved,
+      savingsRate: income > 0 ? saved / income : null,
+      sources: Array.from(sources.values()).sort((left, right) => right.total - left.total),
+      spending,
+    };
+  }
+
+  function isUncategorisedEntry(entry) {
+    return isSpendingEntry(entry) && (!entry.category || entry.category === "uncategorized");
+  }
+
+  function summarizeUncategorised(entries) {
+    const list = (entries || []).filter((entry) => isUncategorisedEntry(entry));
+    return { count: list.length, total: sumBy(list, entrySpendAmount) };
+  }
+
+  // Merchants by what was spent there, grouped the way the inbox groups them so
+  // "Woolworths/cnr Brisbane H" and "Woolworths/8 Sherwood Roa" are one shop.
+  // Entries with no merchant are counted separately rather than lumped together
+  // as a fake shop called "(no merchant)".
+  function summarizeTopMerchants(entries, options = {}) {
+    const limit = Number(options.limit) > 0 ? Number(options.limit) : 5;
+    const groups = new Map();
+    let unnamedCount = 0;
+    let unnamedTotal = 0;
+    for (const entry of entries || []) {
+      if (!isSpendingEntry(entry)) continue;
+      const merchant = normalizeWhitespace(entry.merchant || "");
+      const root = merchantRootKey(merchant);
+      const spend = entrySpendAmount(entry);
+      if (!root) {
+        unnamedCount += 1;
+        unnamedTotal = roundCurrencyAmount(unnamedTotal + spend);
+        continue;
+      }
+      const group = groups.get(root) || { key: root, label: "", total: 0, count: 0, lastDate: "" };
+      group.total = roundCurrencyAmount(group.total + spend);
+      group.count += 1;
+      const date = parseIsoDate(entry.date) || "";
+      if (!group.label || date >= group.lastDate) {
+        group.label = cleanMerchantDisplay(merchant);
+        group.lastDate = date;
+      }
+      groups.set(root, group);
+    }
+    const rows = Array.from(groups.values())
+      .filter((group) => group.total > 0)
+      .sort((left, right) => right.total - left.total || right.count - left.count || left.label.localeCompare(right.label));
+    return { rows: rows.slice(0, limit), merchantCount: rows.length, unnamedCount, unnamedTotal };
+  }
+
+  function largestTransactions(entries, options = {}) {
+    const limit = Number(options.limit) > 0 ? Number(options.limit) : 5;
+    return (entries || [])
+      .filter((entry) => isSpendingEntry(entry) && entrySpendAmount(entry) > 0)
+      .map((entry) => ({ entry, spend: roundCurrencyAmount(entrySpendAmount(entry)) }))
+      .sort((left, right) => right.spend - left.spend || String(left.entry.date || "").localeCompare(String(right.entry.date || "")))
+      .slice(0, limit);
+  }
+
+  function totalsByPrimaryCategory(entries) {
+    const totals = new Map();
+    for (const entry of entries || []) {
+      if (!isSpendingEntry(entry)) continue;
+      const key = primaryCategory(entry.category || "uncategorized") || "uncategorized";
+      totals.set(key, roundCurrencyAmount((totals.get(key) || 0) + entrySpendAmount(entry)));
+    }
+    return totals;
+  }
+
+  // Biggest movers first, in either direction, so a category that vanished is as
+  // visible as one that doubled.
+  function compareCategoryTotals(currentEntries, previousEntries, options = {}) {
+    const limit = Number(options.limit) > 0 ? Number(options.limit) : 5;
+    const current = totalsByPrimaryCategory(currentEntries);
+    const previous = totalsByPrimaryCategory(previousEntries);
+    const keys = new Set([...current.keys(), ...previous.keys()]);
+    const rows = [];
+    for (const key of keys) {
+      const now = current.get(key) || 0;
+      const before = previous.get(key) || 0;
+      const delta = roundCurrencyAmount(now - before);
+      if (delta === 0) continue;
+      rows.push({
+        key,
+        label: titleCaseSegment(key),
+        current: now,
+        previous: before,
+        delta,
+        pct: before > 0 ? Math.round((delta / before) * 100) : null,
+      });
+    }
+    rows.sort((left, right) => Math.abs(right.delta) - Math.abs(left.delta) || left.key.localeCompare(right.key));
+    return { rows: rows.slice(0, limit), previousTotal: sumBy(Array.from(previous.values()), (value) => value) };
+  }
+
+  // Trip-tagged spending never reaches home totals (see isSpendingEntry), which
+  // made a week away look frugal. This is that spending, per trip.
+  function summarizeTripSpend(entries) {
+    const trips = new Map();
+    for (const entry of entries || []) {
+      if (!entry?.holidayKey || isPlannedExpenseEntry(entry)) continue;
+      if (entry.isIncome || entry.isGoalContribution || entry.entryType === "goal-withdrawal" || entry.entryType === "balance") continue;
+      const key = entry.holidayKey;
+      // A name taken from the tag is lower case ("japan"); a trip note's own name
+      // is kept as written.
+      const raw = String(entry.holidayName || String(key).split("/").pop() || key);
+      const label = raw === raw.toLowerCase() ? titleCaseSegment(raw) : raw;
+      const trip = trips.get(key) || { key, label, total: 0, count: 0 };
+      trip.total = roundCurrencyAmount(trip.total + entrySpendAmount(entry));
+      trip.count += 1;
+      trips.set(key, trip);
+    }
+    const rows = Array.from(trips.values()).sort((left, right) => right.total - left.total);
+    return { rows, total: sumBy(rows, (row) => row.total) };
+  }
+
+  // Payments logged under the bill prefix (`subscriptions/<cadence>/<bill>`),
+  // named from `labels` (category → bill name) when the bill is known.
+  function summarizeBillPayments(entries, options = {}) {
+    const prefix = normalizeCategoryPath(options.prefix || "subscriptions") || "subscriptions";
+    const labels = options.labels instanceof Map ? options.labels : new Map(Object.entries(options.labels || {}));
+    const bills = new Map();
+    for (const entry of entries || []) {
+      if (!isSpendingEntry(entry)) continue;
+      const category = normalizeCategoryPath(entry.category || "");
+      if (!category.startsWith(`${prefix}/`)) continue;
+      const bill = bills.get(category) || {
+        category,
+        label: labels.get(category) || titleCaseSegment(category.split("/").pop() || category),
+        total: 0,
+        count: 0,
+        dates: [],
+      };
+      bill.total = roundCurrencyAmount(bill.total + entrySpendAmount(entry));
+      bill.count += 1;
+      if (entry.date) bill.dates.push(entry.date);
+      bills.set(category, bill);
+    }
+    const rows = Array.from(bills.values()).sort((left, right) => right.total - left.total);
+    return { rows, total: sumBy(rows, (row) => row.total), count: rows.reduce((sum, row) => sum + row.count, 0) };
+  }
+
+  // The period before this one. A calendar period steps back a calendar period —
+  // September is compared with August, not with the 30 days before it, which for
+  // March would have been a stretch of January and February. A custom range steps
+  // back by its own length.
+  function previousPeriodRange(range, options = {}) {
+    const start = parseIsoDate(range?.start);
+    const end = parseIsoDate(range?.end);
+    if (!start || !end) return null;
+    const period = String(range.period || "").toLowerCase();
+    const weekStartsOn = options.weekStartsOn || "monday";
+    if (["week", "fortnight", "month", "bimonth", "quarter", "year"].includes(period)) {
+      const aligned = toPeriodRange({ period, referenceDate: start, weekStartsOn });
+      if (aligned.start === start && aligned.end === end) {
+        return toPeriodRange({ period, referenceDate: addDays(start, -1), weekStartsOn });
+      }
+    }
+    const span = daysBetweenInclusive(start, end);
+    const previousEnd = addDays(start, -1);
+    return { period, start: addDays(previousEnd, -(span - 1)), end: previousEnd };
+  }
+
+  function nextPeriodRange(range, options = {}) {
+    const start = parseIsoDate(range?.start);
+    const end = parseIsoDate(range?.end);
+    if (!start || !end) return null;
+    const period = String(range.period || "").toLowerCase();
+    const weekStartsOn = options.weekStartsOn || "monday";
+    if (["week", "fortnight", "month", "bimonth", "quarter", "year"].includes(period)) {
+      const aligned = toPeriodRange({ period, referenceDate: start, weekStartsOn });
+      if (aligned.start === start && aligned.end === end) {
+        return toPeriodRange({ period, referenceDate: addDays(end, 1), weekStartsOn });
+      }
+    }
+    const span = daysBetweenInclusive(start, end);
+    return { period, start: addDays(end, 1), end: addDays(end, span) };
+  }
+
+  // --- Dashboard sections ------------------------------------------------------
+
+  const DASHBOARD_SECTIONS = [
+    "summary",
+    "income",
+    "uncategorised",
+    "categories",
+    "trend",
+    "changes",
+    "merchants",
+    "largest",
+    "budgets",
+    "bills",
+    "trips",
+    "savings",
+    "portfolio",
+  ];
+
+  // What a dashboard showed before sections existed, plus the uncategorised
+  // callout: totals quietly include "Uncategorized", and saying so is a fix, not a
+  // feature. Weekly and monthly reviews get everything.
+  const DASHBOARD_BASE_SECTIONS = ["summary", "uncategorised", "categories", "trend", "budgets", "savings"];
+
+  const DASHBOARD_SECTION_ALIASES = {
+    uncategorized: "uncategorised",
+    pie: "categories",
+    donut: "categories",
+    daily: "trend",
+    dailyspend: "trend",
+    savingsrate: "income",
+    topmerchants: "merchants",
+    largesttransactions: "largest",
+    transactions: "largest",
+    categorychanges: "changes",
+    trip: "trips",
+    tripspend: "trips",
+    recurring: "bills",
+    subscriptions: "bills",
+    goals: "savings",
+    networth: "portfolio",
+  };
+
+  // `show:` lists exactly the sections wanted (`defaults` and `all` expand in
+  // place, so `show: defaults, merchants` adds one); `hide:` removes from
+  // whatever that leaves. Unknown names come back so the block can say so.
+  function resolveDashboardSections(config = {}, period = "week") {
+    const normalize = (token) => {
+      const key = String(token || "").trim().toLowerCase().replace(/[\s_-]+/g, "");
+      return DASHBOARD_SECTION_ALIASES[key] || key;
+    };
+    // Commas separate names; a name may have spaces ("top merchants"). A piece
+    // that isn't a name as a whole is tried word by word ("budgets trend").
+    const known = (key) => DASHBOARD_SECTIONS.includes(key) || ["all", "defaults", "default"].includes(key);
+    const parse = (value) =>
+      String(value || "")
+        .split(/[,;]+/)
+        .flatMap((piece) => (known(normalize(piece)) ? [normalize(piece)] : piece.trim().split(/\s+/).map(normalize)))
+        .filter(Boolean);
+    const normalizedPeriod = String(period || "").toLowerCase();
+    const defaults = normalizedPeriod === "week" || normalizedPeriod === "month" ? DASHBOARD_SECTIONS : DASHBOARD_BASE_SECTIONS;
+    const unknown = [];
+    const shown = parse(config.show);
+    let chosen;
+    if (shown.length) {
+      chosen = new Set();
+      for (const token of shown) {
+        if (token === "all") DASHBOARD_SECTIONS.forEach((key) => chosen.add(key));
+        else if (token === "defaults" || token === "default") defaults.forEach((key) => chosen.add(key));
+        else if (DASHBOARD_SECTIONS.includes(token)) chosen.add(token);
+        else unknown.push(token);
+      }
+    } else {
+      chosen = new Set(defaults);
+    }
+    for (const token of parse(config.hide)) {
+      if (DASHBOARD_SECTIONS.includes(token)) chosen.delete(token);
+      else if (token !== "all" && token !== "defaults" && token !== "default") unknown.push(token);
+    }
+    return { sections: DASHBOARD_SECTIONS.filter((key) => chosen.has(key)), unknown };
+  }
+
+  const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+
+  function formatDayMonthYear(iso) {
+    const date = parseIsoDate(iso);
+    if (!date) return "";
+    return `${Number(date.slice(8, 10))} ${MONTH_NAMES[Number(date.slice(5, 7)) - 1].slice(0, 3)} ${date.slice(0, 4)}`;
+  }
+
+  // A heading for a period: "Week of 7 Sep 2026", "September 2026", "2026 Q3".
+  function describePeriodTitle(range) {
+    const start = parseIsoDate(range?.start);
+    const end = parseIsoDate(range?.end);
+    if (!start || !end) return "";
+    const period = String(range.period || "").toLowerCase();
+    const aligned = (name) => {
+      const expected = toPeriodRange({ period: name, referenceDate: start, weekStartsOn: range.weekStartsOn || "monday" });
+      return expected.start === start && expected.end === end;
+    };
+    if (period === "year" && aligned("year")) return start.slice(0, 4);
+    if (period === "quarter" && aligned("quarter")) return `${start.slice(0, 4)} Q${Math.floor((Number(start.slice(5, 7)) - 1) / 3) + 1}`;
+    if (period === "month" && aligned("month")) return `${MONTH_NAMES[Number(start.slice(5, 7)) - 1]} ${start.slice(0, 4)}`;
+    if (period === "week" && daysBetweenInclusive(start, end) === 7) return `Week of ${formatDayMonthYear(start)}`;
+    if (start === end) return formatDayMonthYear(start);
+    return `${formatDayMonthYear(start)} to ${formatDayMonthYear(end)}`;
+  }
+
+  function describeChange(delta, previous, currency, periodWord) {
+    if (!(previous > 0)) return "";
+    const arrow = delta > 0 ? "▲" : delta < 0 ? "▼" : "—";
+    const pct = Math.round((delta / previous) * 100);
+    return `${arrow} ${formatCurrency(Math.abs(delta), currency)} (${pct >= 0 ? "+" : ""}${pct}%) vs previous ${periodWord}`;
+  }
+
+  function escapeTableCell(value) {
+    return String(value ?? "").replace(/\|/g, "\\|").replace(/\s+/g, " ").trim();
+  }
+
+  // A frozen weekly or monthly review: the same questions the live dashboard
+  // answers, as plain markdown that will still say the same thing next year.
+  function buildShortPeriodReviewLines(entries, options = {}) {
+    const period = options.period === "month" ? "month" : "week";
+    const currency = options.currency || "AUD";
+    const weekStartsOn = options.weekStartsOn || "monday";
+    const range = toPeriodRange({ period, referenceDate: options.referenceDate, weekStartsOn });
+    const previous = previousPeriodRange(range, { weekStartsOn });
+    const goalKeys = options.goalKeys || [];
+    const inRange = (entries || []).filter((entry) => isDateInRange(entry.date, range));
+    const inPrevious = (entries || []).filter((entry) => isDateInRange(entry.date, previous));
+
+    const savings = summarizeIncomeAndSavings(inRange, { goalKeys });
+    const previousSpend = sumBy(inPrevious.filter((entry) => isSpendingEntry(entry)), entrySpendAmount);
+    const uncategorised = summarizeUncategorised(inRange);
+    const trips = summarizeTripSpend(inRange);
+    const bills = summarizeBillPayments(inRange, { prefix: options.recurringPrefix, labels: options.billLabels });
+    const changes = compareCategoryTotals(inRange, inPrevious, { limit: 100 });
+    const categoryTotals = Array.from(totalsByPrimaryCategory(inRange).entries())
+      .map(([key, value]) => ({ key, label: titleCaseSegment(key), value }))
+      .sort((left, right) => right.value - left.value)
+      .slice(0, 8);
+    const merchants = summarizeTopMerchants(inRange, { limit: 5 });
+    const largest = largestTransactions(inRange, { limit: 5 });
+    const transfers = classifyIncomeEntries(inRange, { goalKeys });
+
+    const label =
+      period === "month"
+        ? `${MONTH_NAMES[Number(range.start.slice(5, 7)) - 1]} ${range.start.slice(0, 4)}`
+        : `week of ${formatDayMonthYear(range.start)}`;
+    const lines = [`## Finance review: ${label}`, ""];
+    lines.push(`- Period: ${range.start} to ${range.end}`);
+    const change = describeChange(roundCurrencyAmount(savings.spending - previousSpend), previousSpend, currency, period);
+    lines.push(`- Spent: ${formatCurrency(savings.spending, currency)}${change ? ` (${change})` : ""}`);
+    lines.push(`- Income: ${formatCurrency(savings.income, currency)}`);
+    if (savings.savingsRate === null) {
+      lines.push("- Savings rate: no income logged");
+    } else {
+      const verb = savings.saved >= 0 ? "Saved" : "Overspent";
+      lines.push(`- ${verb}: ${formatCurrency(Math.abs(savings.saved), currency)} (${Math.round(savings.savingsRate * 100)}% savings rate)`);
+    }
+    if (uncategorised.count) {
+      lines.push(
+        `- Uncategorised: ${uncategorised.count} entr${uncategorised.count === 1 ? "y" : "ies"}, ${formatCurrency(uncategorised.total, currency)}`
+      );
+    }
+    if (bills.count) {
+      lines.push(`- Bills paid: ${bills.count} (${formatCurrency(bills.total, currency)})`);
+    }
+    if (trips.rows.length) {
+      const parts = trips.rows.map((trip) => `${trip.label} ${formatCurrency(trip.total, currency)}`);
+      lines.push(`- Trip spending, not counted above: ${parts.join(", ")}`);
+    }
+
+    if (categoryTotals.length) {
+      const changeByKey = new Map(changes.rows.map((row) => [row.key, row]));
+      lines.push("", "### Where it went", "");
+      lines.push(`| Category | Spent | Share | vs previous ${period} |`);
+      lines.push("| --- | ---: | ---: | ---: |");
+      for (const category of categoryTotals) {
+        const pct = savings.spending > 0 ? Math.round((category.value / savings.spending) * 100) : 0;
+        const row = changeByKey.get(category.key);
+        const delta = row ? `${row.delta > 0 ? "▲" : "▼"} ${formatCurrency(Math.abs(row.delta), currency)}` : "—";
+        lines.push(`| ${escapeTableCell(category.label)} | ${formatCurrency(category.value, currency)} | ${pct}% | ${delta} |`);
+      }
+    }
+
+    if (merchants.rows.length) {
+      lines.push("", "### Top merchants", "");
+      lines.push("| Merchant | Spent | Visits |");
+      lines.push("| --- | ---: | ---: |");
+      for (const row of merchants.rows) {
+        lines.push(`| ${escapeTableCell(row.label)} | ${formatCurrency(row.total, currency)} | ${row.count} |`);
+      }
+    }
+
+    if (largest.length) {
+      lines.push("", "### Largest transactions", "");
+      for (const { entry, spend } of largest) {
+        const name = cleanMerchantDisplay(entry.merchant || "") || displayCategoryPath(entry.category || "uncategorized");
+        lines.push(`- ${entry.date} · ${name} · ${displayCategoryPath(entry.category || "uncategorized")} · ${formatCurrency(spend, currency)}`);
+      }
+    }
+
+    const contributedTotal = sumBy(transfers.contributions, (entry) => entry.amount);
+    const withdrawnTotal = sumBy(transfers.withdrawals, (entry) => entry.amount);
+    const settledTotal = sumBy(transfers.settleUps, (entry) => entry.amount);
+    if (contributedTotal || withdrawnTotal || settledTotal) {
+      lines.push("", "### Transfers", "");
+      if (contributedTotal) lines.push(`- Savings contributions: ${formatCurrency(contributedTotal, currency)} (${transfers.contributions.length})`);
+      if (withdrawnTotal) lines.push(`- Savings withdrawals: ${formatCurrency(withdrawnTotal, currency)} (${transfers.withdrawals.length})`);
+      if (settledTotal) lines.push(`- Settled repayments received: ${formatCurrency(settledTotal, currency)} (${transfers.settleUps.length})`);
+    }
 
     return lines;
   }
@@ -5182,6 +5612,21 @@ const core = (() => {
     buildMonthlyIncomeExpense,
     buildCumulativeBalanceSeries,
     buildPeriodReviewLines,
+    classifyIncomeEntries,
+    summarizeIncomeAndSavings,
+    isUncategorisedEntry,
+    summarizeUncategorised,
+    summarizeTopMerchants,
+    largestTransactions,
+    compareCategoryTotals,
+    summarizeTripSpend,
+    summarizeBillPayments,
+    previousPeriodRange,
+    nextPeriodRange,
+    DASHBOARD_SECTIONS,
+    resolveDashboardSections,
+    formatDayMonthYear,
+    describePeriodTitle,
     buildHierarchicalCategoryGroups,
     categoryBaseColor,
     categoryShadeColor,
@@ -5406,6 +5851,19 @@ const RUNWAY_BLOCK = "finance-runway";
 const BILL_BLOCK = "finance-bill";
 const DAILY_BUDGET_VIEW = "finance-tracker-daily";
 const FINANCE_INBOX_VIEW = "finance-tracker-inbox";
+const FINANCE_HUB_VIEW = "finance-tracker-hub";
+
+// The hub's tabs, in order. Ids are what commands and saved layouts refer to,
+// so they stay stable even if a label changes.
+const FINANCE_HUB_TABS = [
+  { id: "today", label: "Today" },
+  { id: "inbox", label: "Inbox" },
+  { id: "budgets", label: "Budgets" },
+  { id: "bills", label: "Bills" },
+  { id: "goals", label: "Goals & trips" },
+  { id: "portfolio", label: "Portfolio" },
+  { id: "reviews", label: "Reviews" },
+];
 // Cadence display names live in core.RECURRING_CADENCES alongside the maths;
 // this reads them from there rather than keeping a second copy in sync.
 function cadenceLabel(cadence) {
@@ -6056,57 +6514,26 @@ class FinanceTrackerPlugin extends Plugin {
       console.warn("[finance-tracker] Obsidian protocol handlers are not available in this app version.");
     }
 
-    this.registerMarkdownCodeBlockProcessor(DASHBOARD_BLOCK, async (source, el, ctx) => {
-      await this.renderDashboard(source, el, ctx);
-    });
-
-    this.registerMarkdownCodeBlockProcessor(HOLIDAY_DASHBOARD_BLOCK, async (source, el, ctx) => {
-      await this.renderHolidayDashboard(source, el, ctx);
-    });
-
-    this.registerMarkdownCodeBlockProcessor(SAVINGS_DASHBOARD_BLOCK, async (source, el, ctx) => {
-      await this.renderSavingsDashboard(source, el, ctx);
-    });
-
-    this.registerMarkdownCodeBlockProcessor(RECURRING_BLOCK, async (source, el, ctx) => {
-      await this.renderRecurringBlock(source, el, ctx);
-    });
-
-    this.registerMarkdownCodeBlockProcessor(SPLITS_BLOCK, async (source, el, ctx) => {
-      await this.renderSplitsBlock(source, el, ctx);
-    });
-
-    this.registerMarkdownCodeBlockProcessor(FORECAST_BLOCK, async (source, el, ctx) => {
-      await this.renderForecastBlock(source, el, ctx);
-    });
-
-    this.registerMarkdownCodeBlockProcessor(NETWORTH_BLOCK, async (source, el, ctx) => {
-      await this.renderNetWorthBlock(source, el, ctx);
-    });
-
-    this.registerMarkdownCodeBlockProcessor(QUERY_BLOCK, async (source, el, ctx) => {
-      await this.renderQueryBlock(source, el, ctx);
-    });
-
-    this.registerMarkdownCodeBlockProcessor(GOALS_BLOCK, async (source, el, ctx) => {
-      await this.renderGoalsBlock(source, el, ctx);
-    });
-
-    this.registerMarkdownCodeBlockProcessor(RUNWAY_BLOCK, async (source, el, ctx) => {
-      await this.renderRunwayBlock(source, el, ctx);
-    });
-
-    this.registerMarkdownCodeBlockProcessor(BILL_BLOCK, async (source, el, ctx) => {
-      await this.renderBillBlock(source, el, ctx);
-    });
-
-    this.registerMarkdownCodeBlockProcessor(PORTFOLIO_BLOCK, async (source, el, ctx) => {
-      await this.renderPortfolioBlock(source, el, ctx);
-    });
+    // Every block re-renders when the notes behind it change, so a weekly review
+    // left open beside today's note keeps up with what gets logged.
+    this.registerFinanceBlock(DASHBOARD_BLOCK, this.renderDashboard);
+    this.registerFinanceBlock(HOLIDAY_DASHBOARD_BLOCK, this.renderHolidayDashboard);
+    this.registerFinanceBlock(SAVINGS_DASHBOARD_BLOCK, this.renderSavingsDashboard);
+    this.registerFinanceBlock(RECURRING_BLOCK, this.renderRecurringBlock);
+    this.registerFinanceBlock(SPLITS_BLOCK, this.renderSplitsBlock);
+    this.registerFinanceBlock(FORECAST_BLOCK, this.renderForecastBlock);
+    this.registerFinanceBlock(NETWORTH_BLOCK, this.renderNetWorthBlock);
+    this.registerFinanceBlock(QUERY_BLOCK, this.renderQueryBlock);
+    this.registerFinanceBlock(GOALS_BLOCK, this.renderGoalsBlock);
+    this.registerFinanceBlock(RUNWAY_BLOCK, this.renderRunwayBlock);
+    this.registerFinanceBlock(BILL_BLOCK, this.renderBillBlock);
+    this.registerFinanceBlock(PORTFOLIO_BLOCK, this.renderPortfolioBlock);
 
     this.registerView(DAILY_BUDGET_VIEW, (leaf) => new DailyBudgetView(leaf, this));
     this.registerView(FINANCE_INBOX_VIEW, (leaf) => new FinanceInboxView(leaf, this));
+    this.registerView(FINANCE_HUB_VIEW, (leaf) => this.createHubView(leaf));
 
+    this.addRibbonIcon("wallet", "Open finance hub", () => this.activateHubView());
     this.addRibbonIcon("coins", "Daily budget", () => this.activateDailyBudgetView());
     this.addRibbonIcon("circle-plus", "Quick add transaction", () => this.openQuickAdd());
 
@@ -6122,9 +6549,31 @@ class FinanceTrackerPlugin extends Plugin {
     });
 
     this.addCommand({
-      id: "finance-tracker-open-inbox",
-      name: "Open categorisation inbox",
-      callback: () => this.activateInboxView(),
+      id: "finance-tracker-open-hub",
+      name: "Open finance hub",
+      callback: () => this.activateHubView(),
+    });
+
+    // One command per tab, so any of them can have a hotkey. The inbox keeps the
+    // id it shipped with.
+    for (const tab of FINANCE_HUB_TABS) {
+      this.addCommand({
+        id: tab.id === "inbox" ? "finance-tracker-open-inbox" : `finance-tracker-open-hub-${tab.id}`,
+        name: `Open finance hub: ${tab.label.toLowerCase()}`,
+        callback: () => this.activateHubView(tab.id),
+      });
+    }
+
+    this.addCommand({
+      id: "finance-tracker-insert-weekly-review",
+      name: "Insert weekly review",
+      editorCallback: (editor, view) => this.insertPeriodReview(editor, view, "week"),
+    });
+
+    this.addCommand({
+      id: "finance-tracker-insert-monthly-review",
+      name: "Insert monthly review",
+      editorCallback: (editor, view) => this.insertPeriodReview(editor, view, "month"),
     });
 
     this.addCommand({
@@ -6296,7 +6745,7 @@ class FinanceTrackerPlugin extends Plugin {
     this.addCommand({
       id: "finance-tracker-insert-block",
       name: "Insert a finance block",
-      editorCallback: (editor) => new InsertBlockModal(this.app, this, editor).open(),
+      editorCallback: (editor, view) => this.openInsertBlock(editor, view?.file?.path || ""),
     });
 
     this.app.workspace.onLayoutReady(() => {
@@ -6349,15 +6798,10 @@ class FinanceTrackerPlugin extends Plugin {
     }
   }
 
+  // The inbox lives in the hub now. The standalone view stays registered so a
+  // workspace saved with it open still loads.
   async activateInboxView() {
-    const existing = this.app.workspace.getLeavesOfType(FINANCE_INBOX_VIEW);
-    if (existing.length) {
-      this.app.workspace.revealLeaf(existing[0]);
-      return;
-    }
-    const leaf = this.app.workspace.getLeaf(true);
-    await leaf.setViewState({ type: FINANCE_INBOX_VIEW, active: true });
-    this.app.workspace.revealLeaf(leaf);
+    return this.activateHubView("inbox");
   }
 
   async activateDailyBudgetView() {
@@ -6377,6 +6821,8 @@ class FinanceTrackerPlugin extends Plugin {
   onunload() {
     clearTimeout(this._inboxDrainTimer);
     clearTimeout(this._statusBarTimer);
+    clearTimeout(this._dataChangedTimer);
+    this._liveBlocks?.clear();
   }
 
   async loadSettings() {
@@ -7532,13 +7978,84 @@ class FinanceTrackerPlugin extends Plugin {
     this.registerInterval(this._gistPollTimer);
   }
 
+  // Called after every write the plugin makes. It no longer refreshes only the
+  // sidebar: the hub, the inbox and every open finance block depend on the same
+  // notes, and all of them are brought up to date together.
   refreshDailyBudgetView() {
-    const leaves = this.app.workspace.getLeavesOfType(DAILY_BUDGET_VIEW);
-    for (const leaf of leaves) {
-      if (leaf.view && typeof leaf.view.refresh === "function") {
-        leaf.view.refresh();
+    this.notifyFinanceDataChanged();
+  }
+
+  // Debounced, so a burst — a batch capture, a migration, Sync bringing in a
+  // week of notes — costs one refresh. Rendering never writes a note, so a
+  // refresh cannot trigger another one.
+  notifyFinanceDataChanged() {
+    clearTimeout(this._dataChangedTimer);
+    this._dataChangedTimer = setTimeout(() => {
+      this._dataChangedTimer = null;
+      this.refreshFinanceSurfaces().catch((error) => console.warn("[finance-tracker] refresh failed", error));
+    }, 500);
+  }
+
+  async refreshFinanceSurfaces() {
+    for (const type of [DAILY_BUDGET_VIEW, FINANCE_INBOX_VIEW, FINANCE_HUB_VIEW]) {
+      for (const leaf of this.app.workspace.getLeavesOfType(type)) {
+        if (typeof leaf.view?.refresh === "function") leaf.view.refresh();
       }
     }
+    for (const block of Array.from(this._liveBlocks || [])) {
+      await block.refresh().catch((error) => console.warn("[finance-tracker] block refresh failed", error));
+    }
+    this._scheduleStatusBarUpdate();
+  }
+
+  // Notes whose changes can move a number somewhere: daily notes, the budgets
+  // folder (budgets, goals, trips, bills) and the portfolio note.
+  isFinanceSourcePath(path) {
+    const value = String(path || "");
+    if (!value.endsWith(".md")) return false;
+    const folders = [this.settings.dailyNotesFolder, this.settings.budgetsFolderPath, this.settings.budgetArchiveFolderPath]
+      .map((folder) => String(folder || "").trim())
+      .filter(Boolean)
+      .map((folder) => normalizePath(`${folder}/`));
+    if (folders.some((folder) => value.startsWith(folder))) return true;
+    return typeof this.getPortfolioNotePath === "function" && value === this.getPortfolioNotePath();
+  }
+
+  registerFinanceBlock(type, render) {
+    this.registerMarkdownCodeBlockProcessor(type, async (source, el, ctx) => {
+      this.trackLiveBlock(el, ctx, () => render.call(this, source, el, ctx));
+      await render.call(this, source, el, ctx);
+    });
+  }
+
+  // Ties a rendered block to the note's lifecycle: registered while the note is
+  // open, dropped when it closes. A block holding focus — someone typing into
+  // it — is left alone and caught up once focus moves on.
+  trackLiveBlock(el, ctx, rerender) {
+    if (typeof ctx?.addChild !== "function" || typeof MarkdownRenderChild !== "function") return null;
+    const blocks = this._liveBlocks || (this._liveBlocks = new Set());
+    const child = new MarkdownRenderChild(el);
+    const entry = {
+      el,
+      refresh: async () => {
+        const active = typeof document !== "undefined" ? document.activeElement : null;
+        if (active && typeof el.contains === "function" && el.contains(active)) {
+          if (!entry.waiting) {
+            entry.waiting = true;
+            el.addEventListener("focusout", () => {
+              entry.waiting = false;
+              window.setTimeout(() => entry.refresh(), 0);
+            }, { once: true });
+          }
+          return;
+        }
+        await rerender();
+      },
+    };
+    child.onload = () => blocks.add(entry);
+    child.onunload = () => blocks.delete(entry);
+    ctx.addChild(child);
+    return entry;
   }
 
   _scheduleStatusBarUpdate() {
@@ -7670,19 +8187,32 @@ class FinanceTrackerPlugin extends Plugin {
           this.invalidateIndexEntry(file.path);
           this._scheduleStatusBarUpdate();
         }
+        if (this.isFinanceSourcePath(file.path)) this.notifyFinanceDataChanged();
       })
     );
     this.registerEvent(
       this.app.vault.on("create", (file) => {
         // A note arriving from Sync, or from another device, changes the numbers
         // exactly as much as one edited here does.
-        if (!file?.path?.startsWith(normalizePath(`${this.settings.dailyNotesFolder}/`))) return;
+        if (_ftSelfWrites.has(file?.path) || !this.isFinanceSourcePath(file?.path)) return;
+        this.notifyFinanceDataChanged();
+        if (!file.path.startsWith(normalizePath(`${this.settings.dailyNotesFolder}/`))) return;
         this.invalidateIndexEntry(file.path);
         this._scheduleStatusBarUpdate();
       })
     );
-    this.registerEvent(this.app.vault.on("delete", (file) => this.invalidateIndexEntry(file.path)));
-    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.invalidateIndexEntry(oldPath)));
+    this.registerEvent(
+      this.app.vault.on("delete", (file) => {
+        this.invalidateIndexEntry(file.path);
+        if (this.isFinanceSourcePath(file.path)) this.notifyFinanceDataChanged();
+      })
+    );
+    this.registerEvent(
+      this.app.vault.on("rename", (file, oldPath) => {
+        this.invalidateIndexEntry(oldPath);
+        if (this.isFinanceSourcePath(file.path) || this.isFinanceSourcePath(oldPath)) this.notifyFinanceDataChanged();
+      })
+    );
     this.registerEvent(
       this.app.workspace.on("file-open", (file) => {
         if (!file || !file.path) return;
@@ -8921,6 +9451,7 @@ class FinanceTrackerPlugin extends Plugin {
           carryMissedSavings: holiday.carryMissedSavings,
           currency: holiday.currency,
           dueDate: holiday.savingsDueDate,
+          endDate: holiday.endDate || "",
           file,
           goalKey: holiday.savingsGoalKey,
           goalName: holiday.holidayName,
@@ -10623,6 +11154,7 @@ class FinanceTrackerPlugin extends Plugin {
       tooltip: "Quick add a transaction",
     });
     addAction(headerActions, "Budgets", () => this.openDefaultBudgetNote(), { errorPrefix: "Opening budgets note" });
+    addAction(headerActions, "Hub", () => this.activateHubView(), { opensModal: true, tooltip: "Open the finance hub" });
 
     // Summary cards: Today + this period (+ trip cards when one is running).
     // Collected first, rendered once, so the conditional cards join the same
@@ -12765,18 +13297,28 @@ class FinanceTrackerPlugin extends Plugin {
     }
   }
 
-  // --- Year/quarter review command --------------------------------------------------
+  // --- Frozen period reviews ---------------------------------------------------------
 
-  // Computes the finished markdown for "Insert yearly review" / "Insert
-  // quarterly review" — a frozen snapshot as of today, not a live block.
-  async buildPeriodReview(period) {
+  // The finished markdown for the review commands and the Insert a finance block
+  // list — a snapshot as of now, for the period containing `referenceDate`, not
+  // a live block.
+  async buildPeriodReview(period, referenceDate = core.todayIsoLocal()) {
     const entries = await this.collectAllTransactions();
     const goalKeys = (await this.collectSavingsGoalDefinitions()).map((goal) => goal.goalKey).filter(Boolean);
+    const recurringPrefix = core.normalizeCategoryPath(this.settings.recurringTagPrefix || "subscriptions") || "subscriptions";
+    let billLabels = new Map();
+    if (period === "week" || period === "month") {
+      const recurring = await this.detectRecurring(core.todayIsoLocal(), recurringPrefix);
+      billLabels = new Map(recurring.items.map((item) => [core.normalizeCategoryPath(item.category || ""), item.label]));
+    }
     return core.buildPeriodReviewLines(entries, {
       period,
-      referenceDate: core.todayIsoLocal(),
+      referenceDate: core.parseIsoDate(referenceDate) || core.todayIsoLocal(),
       currency: this.settings.defaultCurrency,
       goalKeys,
+      weekStartsOn: this.settings.weekStartsOn,
+      recurringPrefix,
+      billLabels,
     });
   }
 
@@ -13109,16 +13651,21 @@ class FinanceTrackerPlugin extends Plugin {
     el.empty();
 
     const config = parseConfigBlock(source);
-    const referenceDate = this.getReferenceDateForSource(ctx.sourcePath);
+    // The hub's Reviews tab steps through periods with no note behind them, so
+    // it hands the date over directly.
+    const referenceDate = core.parseIsoDate(ctx?.referenceDate) || this.getReferenceDateForSource(ctx?.sourcePath);
+    const weekStartsOn = this.settings.weekStartsOn;
     const range = core.toPeriodRange({
       period: config.period || "week",
       referenceDate,
       start: config.start,
       end: config.end,
-      weekStartsOn: this.settings.weekStartsOn,
+      weekStartsOn,
     });
     const currency = core.normalizeCurrency(config.currency || this.settings.defaultCurrency);
     const groupBy = String(config.groupby || this.settings.dashboardDefaultGroupBy || "primary").toLowerCase();
+    const { sections, unknown } = core.resolveDashboardSections(config, range.period);
+    const on = new Set(sections);
 
     const wrapper = el.createDiv({ cls: "finance-tracker-dashboard" });
     const header = wrapper.createDiv({ cls: "finance-tracker-header" });
@@ -13138,34 +13685,61 @@ class FinanceTrackerPlugin extends Plugin {
     const filterReal = (list) => list.filter((entry) => core.isSpendingEntry(entry));
     const entries = filterReal(allEntries);
 
-    // Previous comparable period (same length, immediately before) for the delta card.
+    // The previous period: last month for a month, last week for a week, the
+    // same number of days before for a custom range.
     const spanDays = core.daysBetweenInclusive(range.start, range.end);
-    const prevEnd = core.addDays(range.start, -1);
-    const prevStart = core.addDays(prevEnd, -(spanDays - 1));
-    const prevEntries = filterReal(await this.collectTransactionsForRange({ period: range.period, start: prevStart, end: prevEnd }));
+    const previousRange = core.previousPeriodRange(range, { weekStartsOn });
+    const prevEntries = filterReal(await this.collectTransactionsForRange(previousRange));
     const previousTotal = core.roundCurrencyAmount(prevEntries.reduce((sum, entry) => sum + core.entrySpendAmount(entry), 0));
 
-    this.renderSummary(wrapper, entries, currency, range, { previousTotal });
+    if (on.has("summary")) this.renderSummary(wrapper, entries, currency, range, { previousTotal });
 
-    // Honour the Default grouping setting. This was hardcoded to "full", so a
-    // vault set to "Primary category" still got subcategory rings it had asked
-    // not to see.
-    const hierarchy = core.buildHierarchicalCategoryGroups(entries, groupBy);
-    this.renderPieChart(wrapper, hierarchy, currency, Number(this.settings.dashboardSliceLabelThreshold || 0.08));
-
-    const budgets = await this.loadBudgets("default");
-    const budgetProgress = this.buildBudgetProgress(entries, budgets, range, groupBy, referenceDate);
-
-    const allBudget = budgets.find((budget) => budget.category === "all");
-    let perDayBudget = 0;
-    if (allBudget) {
-      const scaled = core.scaleBudgetLimit(Number(allBudget.limit || 0), allBudget.period, range, referenceDate || range.start, this.settings.weekStartsOn);
-      perDayBudget = spanDays > 0 ? core.roundCurrencyAmount(scaled / spanDays) : 0;
+    if (on.has("income")) {
+      const goalKeys = (await this.collectSavingsGoalDefinitions()).map((goal) => goal.goalKey).filter(Boolean);
+      this.renderIncomeSection(wrapper, allEntries, currency, range, goalKeys);
     }
-    this.renderSpendTrend(wrapper, entries, range, currency, { perDayBudget });
 
-    this.renderBudgets(wrapper, budgetProgress, currency);
-    await this.renderSavingsActivity(wrapper, allEntries, currency, range, referenceDate);
+    if (on.has("uncategorised")) this.renderUncategorisedCallout(wrapper, entries, currency, range);
+
+    if (on.has("categories")) {
+      // Honour the Default grouping setting. This was hardcoded to "full", so a
+      // vault set to "Primary category" still got subcategory rings it had asked
+      // not to see.
+      const hierarchy = core.buildHierarchicalCategoryGroups(entries, groupBy);
+      this.renderPieChart(wrapper, hierarchy, currency, Number(this.settings.dashboardSliceLabelThreshold || 0.08));
+    }
+
+    const budgets = on.has("trend") || on.has("budgets") ? await this.loadBudgets("default") : [];
+    if (on.has("trend")) {
+      const allBudget = budgets.find((budget) => budget.category === "all");
+      let perDayBudget = 0;
+      if (allBudget) {
+        const scaled = core.scaleBudgetLimit(Number(allBudget.limit || 0), allBudget.period, range, referenceDate || range.start, weekStartsOn);
+        perDayBudget = spanDays > 0 ? core.roundCurrencyAmount(scaled / spanDays) : 0;
+      }
+      this.renderSpendTrend(wrapper, entries, range, currency, { perDayBudget });
+    }
+
+    if (on.has("changes")) this.renderCategoryChanges(wrapper, entries, prevEntries, currency, range);
+    if (on.has("merchants")) this.renderTopMerchants(wrapper, entries, currency);
+    if (on.has("largest")) this.renderLargestTransactions(wrapper, entries, currency);
+
+    if (on.has("budgets")) {
+      const budgetProgress = this.buildBudgetProgress(entries, budgets, range, groupBy, referenceDate);
+      this.renderBudgets(wrapper, budgetProgress, currency);
+    }
+
+    if (on.has("bills")) await this.renderBillsForPeriod(wrapper, allEntries, currency, range);
+    if (on.has("trips")) this.renderTripSpendSection(wrapper, allEntries, currency);
+    if (on.has("savings")) await this.renderSavingsActivity(wrapper, allEntries, currency, range, referenceDate);
+    if (on.has("portfolio")) await this.renderPortfolioChange(wrapper, allEntries, currency, range);
+
+    if (unknown.length) {
+      wrapper.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: `Unknown section name${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}. Sections: ${core.DASHBOARD_SECTIONS.join(", ")}.`,
+      });
+    }
   }
 }
 
@@ -14411,34 +14985,535 @@ class LogTradeModal extends Modal {
   }
 }
 
+// --- Finance hub ------------------------------------------------------------------
+// What each hub tab shows. Almost all of it is the render code the blocks and
+// the sidebar already use, given a fresh element and no source note.
+
+const HUB_REVIEW_PERIODS = [
+  ["week", "Week"],
+  ["month", "Month"],
+  ["quarter", "Quarter"],
+  ["year", "Year"],
+];
+
+Object.assign(FinanceTrackerPlugin.prototype, {
+  createHubView(leaf) {
+    return new FinanceHubView(leaf, this);
+  },
+
+  openInsertBlock(editor, sourcePath = "") {
+    const modal = new InsertBlockModal(this.app, this, editor, sourcePath);
+    modal.open();
+    return modal;
+  },
+
+  async activateHubView(tab = "") {
+    const { workspace } = this.app;
+    let leaf = workspace.getLeavesOfType(FINANCE_HUB_VIEW)[0];
+    if (!leaf) {
+      leaf = workspace.getLeaf(true);
+      await leaf.setViewState({ type: FINANCE_HUB_VIEW, active: true, state: tab ? { tab } : {} });
+    } else if (tab && typeof leaf.view?.showTab === "function") {
+      await leaf.view.showTab(tab);
+    }
+    workspace.revealLeaf(leaf);
+    return leaf;
+  },
+
+  async renderHubTab(tab, host, view) {
+    switch (tab) {
+      case "inbox":
+        return this.renderHubInbox(host, view);
+      case "budgets":
+        return this.renderHubBudgets(host, view);
+      case "bills":
+        return this.renderRecurringBlock("", host.createDiv(), { sourcePath: "" });
+      case "goals":
+        return this.renderHubGoals(host, view);
+      case "portfolio":
+        return this.renderHubPortfolio(host, view);
+      case "reviews":
+        return this.renderHubReviews(host, view);
+      default:
+        return this.renderDailyBudgetCheckInto(host.createDiv(), core.todayIsoLocal(), "full");
+    }
+  },
+
+  // Bills that want attention now, bills still unclaimed, then the
+  // categorisation inbox. Legacy vaults without bill notes get a pointer to the
+  // Bills tab rather than a second copy of the old list.
+  async hubBillsNeedingAttention(referenceDate = core.todayIsoLocal()) {
+    const recurring = await this.detectRecurring(referenceDate);
+    if (!recurring.billsMode) {
+      const due = recurring.items.filter((item) => item.active !== false && (item.status === "overdue" || item.status === "due"));
+      return { recurring, due, suggestions: [] };
+    }
+    const live = recurring.items.filter((item) => item.active);
+    const due = live.filter((item) => ["overdue", "soon"].includes(this.billGroupFor(item, referenceDate)));
+    const ignored = new Set(this.settings.ignoredBillSuggestions || []);
+    const suggestions = (recurring.suggestions || []).filter((suggestion) => !ignored.has(suggestion.id));
+    return { recurring, due, live, suggestions };
+  },
+
+  async countInboxItems() {
+    const entries = await this.collectAllTransactions();
+    const uncategorised = entries.filter((entry) => core.isUncategorisedEntry(entry)).length;
+    const failed = typeof this.failedCaptureFiles === "function" ? this.failedCaptureFiles().length : 0;
+    const bills = await this.hubBillsNeedingAttention();
+    return uncategorised + failed + bills.due.length + bills.suggestions.length;
+  },
+
+  async renderHubInbox(host, view) {
+    const today = core.todayIsoLocal();
+    const currency = core.normalizeCurrency(this.settings.defaultCurrency);
+    const rerender = () => view.refresh();
+    const { recurring, due, live, suggestions } = await this.hubBillsNeedingAttention(today);
+
+    if (due.length || suggestions.length) {
+      const wrapper = host.createDiv({ cls: "finance-tracker-dashboard finance-bills finance-hub-inbox-bills" });
+      if (due.length) {
+        const section = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-bills-group is-overdue" });
+        section.createEl("h4", { text: `Bills due (${due.length})` });
+        if (recurring.billsMode) {
+          for (const item of due) this.renderBillRow(section, item, { currency, referenceDate: today, rerender, live });
+        } else {
+          for (const item of due) {
+            renderRowTitle(section.createDiv({ cls: "finance-tracker-budget-card" }), item.label, core.formatCurrency(item.nextDueAmount || item.lastAmount, currency));
+          }
+          addAction(section.createDiv({ cls: "finance-tracker-header-actions" }), "Open bills", () => view.showTab("bills"), { opensModal: true });
+        }
+      }
+      if (suggestions.length) {
+        const section = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-bills-suggestions" });
+        section.createEl("h4", { text: `Looks recurring (${suggestions.length})` });
+        for (const suggestion of suggestions) this.renderBillSuggestion(section, suggestion, { currency, rerender, live });
+      }
+    }
+
+    await this.renderCategorisationInboxInto(host.createDiv(), { title: "Needs a category" });
+  },
+
+  async renderHubBudgets(host, view) {
+    const budgets = await this.loadBudgets("default");
+    const order = ["day", "week", "fortnight", "month", "bimonth", "quarter", "year"];
+    const periods = Array.from(new Set(budgets.map((budget) => core.normalizeBudgetPeriod(budget.period)))).sort(
+      (left, right) => order.indexOf(left) - order.indexOf(right)
+    );
+
+    const toolbar = host.createDiv({ cls: "finance-hub-toolbar" });
+    if (!budgets.length) {
+      addAction(toolbar, "Open budgets note", () => this.openDefaultBudgetNote(), { primary: true, errorPrefix: "Opening budgets note" });
+      host.createDiv({
+        cls: "finance-tracker-empty",
+        text: "No budgets yet. Add rows to the budgets note (category, limit, period) and they show up here.",
+      });
+      return;
+    }
+
+    const fallback = core.normalizeBudgetPeriod(this.settings.budgetCheckPeriod || "week");
+    const period = periods.includes(view.budgetPeriod) ? view.budgetPeriod : periods.includes(fallback) ? fallback : periods[0];
+    this.renderHubChips(toolbar, periods.map((key) => [key, core.titleCaseSegment(key)]), period, (key) => {
+      view.budgetPeriod = key;
+      view.app.workspace?.requestSaveLayout?.();
+      return view.render({ resetScroll: true });
+    });
+
+    await this.renderDashboard(
+      [`period: ${period}`, `title: This ${period}`, "show: summary, uncategorised, budgets, categories, trend"].join("\n"),
+      host.createDiv(),
+      { sourcePath: "" }
+    );
+  },
+
+  async renderHubGoals(host, view) {
+    const toolbar = host.createDiv({ cls: "finance-hub-toolbar" });
+    addAction(toolbar, "New goal", () => new SavingsGoalModal(this.app, this, async () => view.refresh()).open(), {
+      opensModal: true,
+    });
+    addAction(toolbar, this.settings.tripModeActive ? "End trip mode" : "Start trip mode", async () => {
+      if (this.settings.tripModeActive) await this.endTrip();
+      else await this.startTrip();
+      await view.refresh();
+    }, { errorPrefix: "Trip mode" });
+
+    await this.renderGoalsBlock("", host.createDiv(), { sourcePath: "" });
+
+    const today = core.todayIsoLocal();
+    const trips = (await this.collectSavingsGoalDefinitions()).filter((goal) => goal.goalType === "holiday");
+    if (!trips.length) return;
+    const wrapper = host.createDiv({ cls: "finance-tracker-dashboard" });
+    const section = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-hub-trips" });
+    section.createEl("h4", { text: "Trips" });
+    const activePath = this.settings.tripModeActive ? this.settings.activeTripGoalPath || "" : "";
+    for (const trip of trips) {
+      const row = section.createDiv({ cls: "finance-tracker-budget-card" });
+      renderRowTitle(row, trip.goalName, trip.file?.path === activePath ? "Trip mode on" : "");
+      row.createDiv({ cls: "finance-tracker-budget-meta", text: this.describeTripTiming(trip, today) });
+      const actions = row.createDiv({ cls: "finance-tracker-header-actions" });
+      if (trip.file) {
+        addAction(actions, "Open note", () => this.app.workspace.getLeaf(false).openFile(trip.file), {
+          errorPrefix: "Opening the trip",
+        });
+      }
+    }
+  },
+
+  describeTripTiming(trip, today = core.todayIsoLocal()) {
+    const start = core.parseIsoDate(trip.startDate || "");
+    const end = core.parseIsoDate(trip.endDate || "");
+    if (!start) return "No dates yet";
+    if (today < start) {
+      const days = core.daysBetweenInclusive(today, start) - 1;
+      return `Starts ${start} · in ${days} day${days === 1 ? "" : "s"}`;
+    }
+    if (!end || today <= end) return `On now · since ${start}${end ? ` · until ${end}` : ""}`;
+    return `Finished ${end}`;
+  },
+
+  async renderHubPortfolio(host) {
+    const toolbar = host.createDiv({ cls: "finance-hub-toolbar" });
+    addAction(toolbar, "Open portfolio note", () => this.openPortfolioNote(), { errorPrefix: "Opening the portfolio" });
+    await this.renderPortfolioBlock("", host.createDiv(), { sourcePath: this.getPortfolioNotePath() });
+  },
+
+  async renderHubReviews(host, view) {
+    const today = core.todayIsoLocal();
+    const period = HUB_REVIEW_PERIODS.some(([key]) => key === view.reviewPeriod) ? view.reviewPeriod : "week";
+    const anchor = core.parseIsoDate(view.reviewAnchor) || today;
+    const weekStartsOn = this.settings.weekStartsOn;
+    const range = core.toPeriodRange({ period, referenceDate: anchor, weekStartsOn });
+    const isCurrent = core.isDateInRange(today, range);
+
+    const toolbar = host.createDiv({ cls: "finance-hub-toolbar" });
+    this.renderHubChips(toolbar, HUB_REVIEW_PERIODS, period, (key) => {
+      view.reviewPeriod = key;
+      view.app.workspace?.requestSaveLayout?.();
+      return view.render({ resetScroll: true });
+    });
+
+    const nav = toolbar.createDiv({ cls: "finance-hub-review-nav" });
+    const goTo = (anchorDate) => {
+      view.reviewAnchor = anchorDate;
+      return view.render({ resetScroll: true });
+    };
+    addAction(nav, "‹", () => goTo(core.previousPeriodRange(range, { weekStartsOn }).start), { tooltip: `Previous ${period}` });
+    const current = addAction(nav, `This ${period}`, () => goTo(""));
+    if (isCurrent) current.disabled = true;
+    addAction(nav, "›", () => goTo(core.nextPeriodRange(range, { weekStartsOn }).start), { tooltip: `Next ${period}` });
+
+    addAction(toolbar, "Copy as text", async () => {
+      const lines = await this.buildPeriodReview(period, range.start);
+      const text = `${lines.join("\n")}\n`;
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        new Notice("Review copied. Paste it into a note to keep it.");
+      } else {
+        new Notice("Copying isn't available here. Use Insert weekly review in a note instead.");
+      }
+    }, { errorPrefix: "Copying the review", tooltip: "Copy a frozen snapshot of this review as markdown" });
+
+    const title = core.describePeriodTitle(range);
+    await this.renderDashboard([`period: ${period}`, `title: ${title}`, "show: all"].join("\n"), host.createDiv(), {
+      sourcePath: "",
+      referenceDate: anchor,
+    });
+  },
+
+  renderHubChips(host, options, selected, onSelect) {
+    const chips = host.createDiv({ cls: "finance-hub-chips", attr: { role: "group" } });
+    for (const [key, label] of options) {
+      const chip = chips.createEl("button", { cls: "finance-hub-chip", text: label, attr: { "aria-pressed": String(key === selected) } });
+      if (key === selected) chip.addClass("is-active");
+      chip.addEventListener("click", () => (key !== selected ? onSelect(key) : undefined));
+    }
+    return chips;
+  },
+
+  // "Insert weekly review" / "Insert monthly review": the period is the note's
+  // own — a review inserted into W19 covers week 19, not whatever week it is
+  // when you get round to writing it up.
+  async insertPeriodReview(editor, view, period) {
+    const referenceDate = this.getReferenceDateForSource(view?.file?.path || "");
+    const lines = await this.buildPeriodReview(period, referenceDate);
+    editor.replaceSelection(`${lines.join("\n")}\n`);
+  },
+});
+// --- Dashboard sections -----------------------------------------------------------
+// The review sections of `finance-dashboard`. Each one renders nothing when it
+// has nothing to say, so a quiet week doesn't fill up with empty cards. The
+// numbers come from finance-core; these only lay them out.
+
+function periodWordFor(range) {
+  const period = String(range?.period || "").toLowerCase();
+  return ["day", "week", "fortnight", "month", "quarter", "year"].includes(period) ? period : "period";
+}
+
+function formatSignedChange(delta, currency) {
+  const arrow = delta > 0 ? "▲" : delta < 0 ? "▼" : "—";
+  return `${arrow} ${core.formatCurrency(Math.abs(delta), currency)}`;
+}
+
+Object.assign(FinanceTrackerPlugin.prototype, {
+  renderIncomeSection(wrapper, allEntries, currency, range, goalKeys = []) {
+    const summary = core.summarizeIncomeAndSavings(allEntries, { goalKeys });
+    const word = periodWordFor(range);
+    const section = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-dashboard-income" });
+    section.createEl("h4", { text: "Income and savings" });
+    if (!summary.incomeCount) {
+      section.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: `No income logged this ${word}, so there's no savings rate. Log pay as #log/income/salary to see one.`,
+      });
+      return;
+    }
+    const rate = Math.round(summary.savingsRate * 100);
+    renderStatCards(section, [
+      { label: "Income", value: core.formatCurrency(summary.income, currency) },
+      { label: "Spent", value: core.formatCurrency(summary.spending, currency) },
+      {
+        label: summary.saved >= 0 ? "Saved" : "Overspent",
+        value: core.formatCurrency(Math.abs(summary.saved), currency),
+        cls: summary.saved < 0 ? "is-over" : "",
+      },
+      { label: "Savings rate", value: `${rate}%`, cls: rate < 0 ? "is-over" : "" },
+    ]);
+    if (summary.sources.length > 1) {
+      section.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: `From ${summary.sources.map((row) => `${row.label} ${core.formatCurrency(row.total, currency)}`).join(" · ")}`,
+      });
+    }
+    section.createDiv({
+      cls: "finance-tracker-budget-meta",
+      text: "Goal contributions, settle-ups and trip spending are transfers, so they're left out.",
+    });
+  },
+
+  renderUncategorisedCallout(wrapper, entries, currency, range) {
+    const { count, total } = core.summarizeUncategorised(entries);
+    if (!count) return;
+    const callout = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-dashboard-callout" });
+    callout.createDiv({
+      cls: "finance-dashboard-callout-text",
+      text: `${count} entr${count === 1 ? "y" : "ies"} this ${periodWordFor(range)} (${core.formatCurrency(total, currency)}) ${
+        count === 1 ? "has" : "have"
+      } no category yet, so ${count === 1 ? "it's" : "they're"} counted as Uncategorized.`,
+    });
+    addAction(callout.createDiv({ cls: "finance-tracker-header-actions" }), "Open inbox", () => this.activateHubView("inbox"), {
+      primary: true,
+      opensModal: true,
+    });
+  },
+
+  renderCategoryChanges(wrapper, entries, previousEntries, currency, range) {
+    const { rows, previousTotal } = core.compareCategoryTotals(entries, previousEntries, { limit: 6 });
+    // Against an empty previous period every category is "new", which says
+    // nothing.
+    if (!rows.length || !(previousTotal > 0)) return;
+    const section = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-dashboard-changes" });
+    section.createEl("h4", { text: `Change vs previous ${periodWordFor(range)}` });
+    const list = section.createDiv({ cls: "finance-tracker-budget-list" });
+    for (const row of rows) {
+      const item = list.createDiv({ cls: "finance-tracker-budget-card" });
+      item.addClass(row.delta > 0 ? "is-up" : "is-down");
+      renderRowTitle(item, row.label, formatSignedChange(row.delta, currency));
+      const pct = row.pct === null ? "new" : `${row.pct >= 0 ? "+" : ""}${row.pct}%`;
+      item.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: `${core.formatCurrency(row.previous, currency)} → ${core.formatCurrency(row.current, currency)} (${pct})`,
+      });
+    }
+  },
+
+  renderTopMerchants(wrapper, entries, currency) {
+    const result = core.summarizeTopMerchants(entries, { limit: 5 });
+    if (!result.rows.length) return;
+    const spend = entries.reduce((sum, entry) => sum + core.entrySpendAmount(entry), 0);
+    const section = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-dashboard-merchants" });
+    section.createEl("h4", { text: "Top merchants" });
+    const list = section.createDiv({ cls: "finance-tracker-budget-list" });
+    for (const row of result.rows) {
+      const item = list.createDiv({ cls: "finance-tracker-budget-card" });
+      renderRowTitle(item, row.label, core.formatCurrency(row.total, currency));
+      const share = spend > 0 ? Math.round((row.total / spend) * 100) : 0;
+      item.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: `${row.count} visit${row.count === 1 ? "" : "s"} · ${share}% of spending`,
+      });
+    }
+    if (result.unnamedCount) {
+      section.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: `${result.unnamedCount} entr${result.unnamedCount === 1 ? "y" : "ies"} (${core.formatCurrency(result.unnamedTotal, currency)}) ${
+          result.unnamedCount === 1 ? "has" : "have"
+        } no merchant.`,
+      });
+    }
+  },
+
+  renderLargestTransactions(wrapper, entries, currency) {
+    const rows = core.largestTransactions(entries, { limit: 5 });
+    if (!rows.length) return;
+    const section = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-dashboard-largest" });
+    section.createEl("h4", { text: "Largest transactions" });
+    const list = section.createDiv({ cls: "finance-tracker-budget-list" });
+    for (const { entry, spend } of rows) {
+      const item = list.createDiv({ cls: "finance-tracker-budget-card is-clickable" });
+      const name = core.cleanMerchantDisplay(entry.merchant || "") || entry.categoryDisplay || core.displayCategoryPath(entry.category || "uncategorized");
+      renderRowTitle(item, name, core.formatCurrency(spend, currency));
+      const bits = [entry.date, core.displayCategoryPath(entry.category || "uncategorized")];
+      if (spend < Number(entry.amount || 0)) bits.push(`your share of ${core.formatCurrency(entry.amount, currency)}`);
+      item.createDiv({ cls: "finance-tracker-budget-meta", text: bits.filter(Boolean).join(" · ") });
+      item.setAttribute("aria-label", "Edit this transaction");
+      item.addEventListener("click", () => this.openEditTransaction(entry));
+    }
+  },
+
+  // What was paid in the period, and — for a period that isn't over yet — what
+  // is still to come in it and in the one after. A past week only gets the
+  // first part: "due next week" for a week in May is history, not a plan.
+  async renderBillsForPeriod(wrapper, allEntries, currency, range) {
+    const today = core.todayIsoLocal();
+    const prefix = core.normalizeCategoryPath(this.settings.recurringTagPrefix || "subscriptions") || "subscriptions";
+    const recurring = await this.detectRecurring(today, prefix);
+    const labels = new Map(recurring.items.map((item) => [core.normalizeCategoryPath(item.category || ""), item.label]));
+    const paid = core.summarizeBillPayments(allEntries, { prefix, labels });
+
+    let stillDue = [];
+    let dueNext = [];
+    let nextRange = null;
+    if (range.end >= today) {
+      nextRange = core.nextPeriodRange(range, { weekStartsOn: this.settings.weekStartsOn });
+      const from = range.start > today ? range.start : today;
+      const { occurrences } = core.sumRecurringDueWithin(recurring, from, nextRange.end);
+      stillDue = occurrences.filter((occurrence) => occurrence.date <= range.end);
+      dueNext = occurrences.filter((occurrence) => occurrence.date > range.end);
+    }
+    if (!paid.count && !stillDue.length && !dueNext.length) return;
+
+    const word = periodWordFor(range);
+    const section = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-dashboard-bills" });
+    section.createEl("h4", { text: "Bills" });
+
+    const group = (title, rows) => {
+      section.createDiv({ cls: "finance-dashboard-subheading", text: title });
+      const list = section.createDiv({ cls: "finance-tracker-budget-list" });
+      for (const row of rows) {
+        const item = list.createDiv({ cls: "finance-tracker-budget-card" });
+        renderRowTitle(item, row.label, core.formatCurrency(row.amount, currency));
+        if (row.meta) item.createDiv({ cls: "finance-tracker-budget-meta", text: row.meta });
+      }
+    };
+
+    if (paid.count) {
+      group(
+        `Paid this ${word}: ${core.formatCurrency(paid.total, currency)}`,
+        paid.rows.map((row) => ({
+          label: row.label,
+          amount: row.total,
+          meta: row.count > 1 ? `${row.count} payments` : row.dates[0] || "",
+        }))
+      );
+    }
+    const occurrenceRows = (list) => list.map((occurrence) => ({ label: occurrence.label, amount: occurrence.amount, meta: occurrence.date }));
+    if (stillDue.length) group(`Still due this ${word}`, occurrenceRows(stillDue));
+    if (dueNext.length) {
+      const total = core.roundCurrencyAmount(dueNext.reduce((sum, occurrence) => sum + Number(occurrence.amount || 0), 0));
+      group(`Due next ${word}: ${core.formatCurrency(total, currency)}`, occurrenceRows(dueNext));
+    }
+  },
+
+  renderTripSpendSection(wrapper, allEntries, currency) {
+    const trips = core.summarizeTripSpend(allEntries);
+    if (!trips.rows.length) return;
+    const section = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-dashboard-trips" });
+    section.createEl("h4", { text: `Trip spending: ${core.formatCurrency(trips.total, currency)}` });
+    section.createDiv({
+      cls: "finance-tracker-budget-meta",
+      text: "Paid from trip savings, so it isn't in the totals above.",
+    });
+    const list = section.createDiv({ cls: "finance-tracker-budget-list" });
+    for (const trip of trips.rows) {
+      const item = list.createDiv({ cls: "finance-tracker-budget-card" });
+      renderRowTitle(item, trip.label, core.formatCurrency(trip.total, currency));
+      item.createDiv({ cls: "finance-tracker-budget-meta", text: `${trip.count} entr${trip.count === 1 ? "y" : "ies"}` });
+    }
+  },
+
+  // Money moved into and out of shares during the period, dividends received,
+  // and — when there is price history for both ends — how the value changed.
+  // Never fetches: a dashboard in a weekly note is not a reason to call out.
+  async renderPortfolioChange(wrapper, allEntries, currency, range) {
+    const portfolio = await this.loadPortfolio();
+    if (!portfolio?.exists || !portfolio.trades?.length) return;
+    const today = core.todayIsoLocal();
+    const model = await this.buildPortfolioModel(range.end < today ? range.end : today);
+    const fx = this.portfolioFx(portfolio);
+    const audValue = (trade, sign) => {
+      if (Number.isFinite(trade.audCost)) return trade.audCost;
+      const rate = trade.currency === "AUD" ? 1 : Number(fx[trade.currency]) || 0;
+      return (trade.units * trade.price + sign * (trade.fees || 0)) * rate;
+    };
+    const inRange = portfolio.trades.filter((trade) => core.isDateInRange(trade.date, range));
+    const bought = core.roundCurrencyAmount(inRange.filter((trade) => trade.type === "buy").reduce((sum, trade) => sum + audValue(trade, 1), 0));
+    const sold = core.roundCurrencyAmount(inRange.filter((trade) => trade.type === "sell").reduce((sum, trade) => sum + audValue(trade, -1), 0));
+    const dividends = core.roundCurrencyAmount(
+      allEntries
+        .filter((entry) => entry.entryType === "income" && core.normalizeCategoryPath(entry.category || "").startsWith("dividend/"))
+        .reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
+    );
+
+    const series = model.series || [];
+    const pointAt = (date) => series.filter((point) => point.date <= date).pop() || null;
+    const startPoint = pointAt(core.addDays(range.start, -1));
+    const endPoint = pointAt(range.end);
+
+    const cards = [];
+    if (core.isDateInRange(today, range) && model.value?.totals?.valueAud > 0) {
+      cards.push({ label: "Value now", value: core.formatCurrency(model.value.totals.valueAud, currency) });
+    }
+    if (startPoint?.complete && endPoint?.complete && startPoint.date !== endPoint.date) {
+      const change = core.roundCurrencyAmount(endPoint.valueAud - startPoint.valueAud);
+      cards.push({
+        label: "Value change",
+        value: formatSignedChange(change, currency),
+        hint: bought || sold ? "includes buying and selling" : "",
+      });
+    }
+    if (bought) cards.push({ label: "Bought", value: core.formatCurrency(bought, currency) });
+    if (sold) cards.push({ label: "Sold", value: core.formatCurrency(sold, currency) });
+    if (dividends) cards.push({ label: "Dividends", value: core.formatCurrency(dividends, currency) });
+
+    const section = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-dashboard-portfolio" });
+    section.createEl("h4", { text: "Portfolio" });
+    if (cards.length) {
+      renderStatCards(section, cards);
+    } else {
+      section.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: `No trades or dividends this ${periodWordFor(range)}, and no price history to compare values with.`,
+      });
+    }
+    section.createDiv({ cls: "finance-tracker-budget-meta", text: "For information only, not financial advice." });
+  },
+});
 class DailyBudgetView extends ItemView {
   constructor(leaf, plugin) {
     super(leaf);
     this.plugin = plugin;
-    this._refreshTimer = null;
   }
 
   getViewType() { return DAILY_BUDGET_VIEW; }
   getDisplayText() { return "Daily budget"; }
   getIcon() { return "coins"; }
 
+  // Note changes reach this view through the plugin's single, debounced
+  // refresh (notifyFinanceDataChanged), shared with the hub and open blocks.
   async onOpen() {
-    this.registerEvent(
-      this.app.vault.on("modify", (file) => {
-        if (_ftSelfWrites.has(file.path)) return;
-        const prefix = normalizePath(this.plugin.settings.dailyNotesFolder + "/");
-        if (file.path.startsWith(prefix)) {
-          clearTimeout(this._refreshTimer);
-          this._refreshTimer = setTimeout(() => this.refresh(), 400);
-        }
-      })
-    );
     await this.refresh();
   }
 
-  async onClose() {
-    clearTimeout(this._refreshTimer);
-  }
+  async onClose() {}
 
   async refresh() {
     try {
@@ -14452,13 +15527,13 @@ class DailyBudgetView extends ItemView {
 }
 
 // The inbox is a view rather than a modal: it is somewhere you work through a
-// backlog, and a modal cannot stay open beside the notes it is about. The finance
-// hub will embed the same render method as one of its tabs.
+// backlog, and a modal cannot stay open beside the notes it is about. It is now
+// the hub's Inbox tab; this standalone view is kept registered only so a
+// workspace saved with it open still loads.
 class FinanceInboxView extends ItemView {
   constructor(leaf, plugin) {
     super(leaf);
     this.plugin = plugin;
-    this._refreshTimer = null;
   }
 
   getViewType() { return FINANCE_INBOX_VIEW; }
@@ -14466,20 +15541,10 @@ class FinanceInboxView extends ItemView {
   getIcon() { return "inbox"; }
 
   async onOpen() {
-    this.registerEvent(
-      this.app.vault.on("modify", (file) => {
-        if (_ftSelfWrites.has(file.path)) return;
-        if (!file?.path?.startsWith(normalizePath(`${this.plugin.settings.dailyNotesFolder}/`))) return;
-        clearTimeout(this._refreshTimer);
-        this._refreshTimer = setTimeout(() => this.refresh(), 500);
-      })
-    );
     await this.refresh();
   }
 
-  async onClose() {
-    clearTimeout(this._refreshTimer);
-  }
+  async onClose() {}
 
   async refresh() {
     try {
@@ -14494,6 +15559,122 @@ class FinanceInboxView extends ItemView {
   }
 }
 
+// The finance hub: one place for everything beyond logging. Each tab renders
+// what a code block or the sidebar already renders, so a fix to one shows up in
+// both, and the blocks keep working inside notes.
+class FinanceHubView extends ItemView {
+  constructor(leaf, plugin) {
+    super(leaf);
+    this.plugin = plugin;
+    this.tab = "today";
+    this.budgetPeriod = "";
+    this.reviewPeriod = "week";
+    this.reviewAnchor = "";
+    this._renderId = 0;
+    this._opened = false;
+  }
+
+  getViewType() { return FINANCE_HUB_VIEW; }
+  getDisplayText() { return "Finance"; }
+  getIcon() { return "wallet"; }
+
+  getState() {
+    const base = typeof super.getState === "function" ? super.getState() : {};
+    return { ...base, tab: this.tab, reviewPeriod: this.reviewPeriod, budgetPeriod: this.budgetPeriod };
+  }
+
+  async setState(state, result) {
+    if (state && FINANCE_HUB_TABS.some((tab) => tab.id === state.tab)) this.tab = state.tab;
+    if (state?.reviewPeriod) this.reviewPeriod = state.reviewPeriod;
+    if (typeof state?.budgetPeriod === "string") this.budgetPeriod = state.budgetPeriod;
+    if (typeof super.setState === "function") await super.setState(state, result);
+    if (this._opened) await this.render({ resetScroll: true });
+  }
+
+  async onOpen() {
+    this._opened = true;
+    await this.render();
+  }
+
+  async onClose() {
+    this._opened = false;
+    this._renderId += 1;
+  }
+
+  async showTab(id) {
+    if (!FINANCE_HUB_TABS.some((tab) => tab.id === id)) return;
+    this.tab = id;
+    this.app.workspace?.requestSaveLayout?.();
+    await this.render({ resetScroll: true });
+  }
+
+  // Called when notes change. Typing into a field in the hub (a category
+  // search, say) must not be wiped by a refresh, so that waits for focus to
+  // leave.
+  refresh() {
+    const active = typeof document !== "undefined" ? document.activeElement : null;
+    const typing = active && /^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName || "");
+    if (typing && typeof this.contentEl.contains === "function" && this.contentEl.contains(active)) {
+      if (!this._waitingForBlur) {
+        this._waitingForBlur = true;
+        active.addEventListener(
+          "blur",
+          () => {
+            this._waitingForBlur = false;
+            window.setTimeout(() => this.refresh(), 0);
+          },
+          { once: true }
+        );
+      }
+      return Promise.resolve();
+    }
+    return this.render();
+  }
+
+  async render(options = {}) {
+    const renderId = ++this._renderId;
+    const root = this.contentEl;
+    const scrollTop = options.resetScroll ? 0 : Number(root.scrollTop) || 0;
+    root.empty();
+    root.addClass("finance-hub");
+
+    const nav = root.createDiv({ cls: "finance-hub-tabs", attr: { role: "tablist" } });
+    let inboxButton = null;
+    for (const tab of FINANCE_HUB_TABS) {
+      const selected = tab.id === this.tab;
+      const button = nav.createEl("button", {
+        cls: "finance-hub-tab",
+        text: tab.label,
+        attr: { role: "tab", "aria-selected": String(selected), "data-tab": tab.id },
+      });
+      if (selected) button.addClass("is-active");
+      if (tab.id === "inbox") inboxButton = button;
+      button.addEventListener("click", () => this.showTab(tab.id));
+    }
+
+    const body = root.createDiv({ cls: "finance-hub-body" });
+    try {
+      await this.plugin.renderHubTab(this.tab, body, this);
+    } catch (error) {
+      if (renderId !== this._renderId) return;
+      body.empty();
+      body.createDiv({ cls: "finance-tracker-empty", text: `This tab failed to render: ${error?.message || error}` });
+    }
+    if (renderId !== this._renderId) return;
+    if (scrollTop) root.scrollTop = scrollTop;
+
+    // The badge is worked out after the tab so it never holds the tab up.
+    try {
+      const count = await this.plugin.countInboxItems();
+      if (renderId === this._renderId && count > 0 && inboxButton) {
+        inboxButton.createSpan({ cls: "finance-hub-badge", text: count > 99 ? "99+" : String(count) });
+        inboxButton.setAttribute("aria-label", `Inbox, ${count} waiting`);
+      }
+    } catch (_error) {
+      // A missing badge is not worth an error on top of the tab.
+    }
+  }
+}
 class QuickAddTransactionModal extends Modal {
   constructor(app, plugin, options = {}) {
     super(app);
@@ -16783,7 +17964,7 @@ const INSERTABLE_BLOCKS = [
     name: "Dashboard",
     block: DASHBOARD_BLOCK,
     body: "period: week",
-    description: "Spend for a period: totals, category donut, daily trend, budget progress.",
+    description: "Spend for a period: totals, income and savings rate, categories, top merchants, bills and budgets.",
   },
   {
     name: "Recurring payments",
@@ -16822,10 +18003,16 @@ const INSERTABLE_BLOCKS = [
     description: "Projects income minus bills and spending forward month by month.",
   },
   {
-    name: "Net worth",
+    name: "Accounts & portfolio",
     block: NETWORTH_BLOCK,
     body: "",
-    description: "Balance snapshots per account and the net-worth line over time.",
+    description: "Account balances plus the share portfolio, and net worth over time.",
+  },
+  {
+    name: "Portfolio",
+    block: PORTFOLIO_BLOCK,
+    body: "",
+    description: "Holdings, value, gains, dividends and trades from the portfolio note.",
   },
   {
     name: "Query",
@@ -16836,10 +18023,11 @@ const INSERTABLE_BLOCKS = [
 ];
 
 class InsertBlockModal extends Modal {
-  constructor(app, plugin, editor) {
+  constructor(app, plugin, editor, sourcePath = "") {
     super(app);
     this.plugin = plugin;
     this.editor = editor;
+    this.sourcePath = sourcePath;
   }
 
   onOpen() {
@@ -16864,15 +18052,19 @@ class InsertBlockModal extends Modal {
 
     // Reviews compute once and paste finished numbers — a frozen snapshot, not
     // a live block — but this is where someone looks for "put finance in a note".
+    // The period is the note's own: a weekly note gets its week.
+    const referenceDate = this.plugin.getReferenceDateForSource(this.sourcePath);
     for (const [period, name, description] of [
-      ["year", "Year in review", "Totals, best/worst month, top categories and transfers for this year — inserted as plain text."],
-      ["quarter", "Quarter in review", "The same summary, scoped to this quarter."],
+      ["week", "Weekly review", "Spent, income and savings rate, where it went, top merchants and largest transactions for this note's week, as plain text."],
+      ["month", "Monthly review", "The same review for this note's month."],
+      ["quarter", "Quarter in review", "Totals, best and worst month, top categories and transfers for the quarter."],
+      ["year", "Year in review", "The same summary for the whole year."],
     ]) {
       const option = list.createDiv({ cls: "finance-tracker-holiday-result" });
       option.createDiv({ cls: "finance-tracker-holiday-result-title", text: name });
       option.createDiv({ cls: "finance-tracker-holiday-result-path", text: description });
       option.addEventListener("click", async () => {
-        const lines = await this.plugin.buildPeriodReview(period);
+        const lines = await this.plugin.buildPeriodReview(period, referenceDate);
         insert(`${lines.join("\n")}\n`);
       });
     }
