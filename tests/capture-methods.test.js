@@ -2107,3 +2107,22 @@ test("the runway block says whether the chosen account covers it", async () => {
   await plugin.renderRunwayBlock("", none, onSeptember20);
   assert.match(none.allText(), /Choose the account this comes out of/);
 });
+
+
+test("fetching a trip rate makes one request and explains a currency it can't get", async () => {
+  const { plugin } = makePlugin();
+  const urls = [];
+  requestUrlHandler = async ({ url }) => {
+    urls.push(url);
+    if (url.includes("base=FJD")) return { status: 404, json: { message: "not found" }, text: "" };
+    return { status: 200, json: { amount: 1, base: "JPY", date: "2026-09-16", rates: { AUD: 0.00904 } }, text: "" };
+  };
+
+  const rate = await plugin.fetchExchangeRate("JPY", "AUD");
+  assert.deepEqual(rate, { rate: 0.00904, date: "2026-09-16", base: "JPY", target: "AUD" });
+  assert.deepEqual(urls, ["https://api.frankfurter.dev/v1/latest?base=JPY&symbols=AUD"]);
+
+  await assert.rejects(plugin.fetchExchangeRate("FJD", "AUD"), /doesn't publish a rate for FJD/);
+  await assert.rejects(plugin.fetchExchangeRate("¥", "AUD"), /three-letter/);
+  assert.equal(urls.length, 2, "an invalid code never reaches the network");
+});

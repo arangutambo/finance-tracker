@@ -2750,6 +2750,27 @@ function deriveTripTag(name, options = {}) {
   return `${base}-${counter}`;
 }
 
+// --- Trip exchange rates -----------------------------------------------------------
+// "Fetch current rate" asks Frankfurter for the European Central Bank's daily
+// reference rate. Free, no key, about thirty currencies. The rate is written the
+// way trip notes already hold them: how much of the home currency one unit of
+// the trip currency is worth.
+const FRANKFURTER_URL = "https://api.frankfurter.dev/v1/latest";
+
+function buildExchangeRateUrl(from, to) {
+  const base = String(from || "").trim().toUpperCase().replace(/\s+CASH$/, "");
+  const target = String(to || "").trim().toUpperCase();
+  if (!/^[A-Z]{3}$/.test(base) || !/^[A-Z]{3}$/.test(target)) return "";
+  return `${FRANKFURTER_URL}?base=${base}&symbols=${target}`;
+}
+
+function parseExchangeRateResponse(json, to) {
+  const target = String(to || "").trim().toUpperCase();
+  const rate = Number(json?.rates?.[target]);
+  if (!Number.isFinite(rate) || rate <= 0) return null;
+  return { rate, date: parseIsoDate(json?.date) || "", base: String(json?.base || "").toUpperCase(), target };
+}
+
 // --- Goal and trip prompts ------------------------------------------------------
 // Moments a goal or trip needs a decision: a goal reaching its target or its due
 // date, a trip starting or ending. Each prompt has a key that includes the date
@@ -5798,6 +5819,8 @@ module.exports = {
   parseGoalDefinition,
   computeSinkingFund,
   buildGoalPrompts,
+  buildExchangeRateUrl,
+  parseExchangeRateResponse,
   compareRunwayToBalance,
   slugifyName,
   deriveGoalKey,

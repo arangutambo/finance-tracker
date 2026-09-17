@@ -232,7 +232,7 @@ class ExchangeRateModal extends Modal {
       endDate: holidayMeta?.endDate || core.todayIsoLocal(),
       rate: "",
       scope: "flat",
-      sourceCurrency: "",
+      sourceCurrency: core.normalizeCurrency(holidayMeta?.tripCurrency || "", ""),
       startDate: holidayMeta?.startDate || core.todayIsoLocal(),
       targetCurrency: holidayMeta?.currency || plugin.settings.defaultCurrency,
     };
@@ -293,12 +293,32 @@ class ExchangeRateModal extends Modal {
         })
       );
 
-    new Setting(contentEl)
+    let rateText = null;
+    const rateSetting = new Setting(contentEl)
       .setName("Rate")
       .setDesc("How much 1 unit of the source currency is worth in the target currency.")
-      .addText((text) =>
+      .addText((text) => {
+        rateText = text;
+        text.inputEl.setAttribute("inputmode", "decimal");
         text.setPlaceholder("0.00877").setValue(this.form.rate).onChange((value) => {
           this.form.rate = value.trim();
+        });
+      })
+      .addButton((button) =>
+        button.setButtonText("Fetch current rate").onClick(async () => {
+          button.setDisabled(true);
+          try {
+            const result = await this.plugin.fetchExchangeRate(this.form.sourceCurrency, this.form.targetCurrency);
+            this.form.rate = String(result.rate);
+            rateText?.setValue(this.form.rate);
+            rateSetting.setDesc(
+              `European Central Bank reference rate for ${result.date}. Card and cash rates are usually a little worse, so adjust it if you know yours.`
+            );
+          } catch (error) {
+            new Notice(`Couldn't fetch a rate: ${error.message}`);
+          } finally {
+            button.setDisabled(false);
+          }
         })
       );
 

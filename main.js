@@ -2753,6 +2753,27 @@ const core = (() => {
     return `${base}-${counter}`;
   }
 
+  // --- Trip exchange rates -----------------------------------------------------------
+  // "Fetch current rate" asks Frankfurter for the European Central Bank's daily
+  // reference rate. Free, no key, about thirty currencies. The rate is written the
+  // way trip notes already hold them: how much of the home currency one unit of
+  // the trip currency is worth.
+  const FRANKFURTER_URL = "https://api.frankfurter.dev/v1/latest";
+
+  function buildExchangeRateUrl(from, to) {
+    const base = String(from || "").trim().toUpperCase().replace(/\s+CASH$/, "");
+    const target = String(to || "").trim().toUpperCase();
+    if (!/^[A-Z]{3}$/.test(base) || !/^[A-Z]{3}$/.test(target)) return "";
+    return `${FRANKFURTER_URL}?base=${base}&symbols=${target}`;
+  }
+
+  function parseExchangeRateResponse(json, to) {
+    const target = String(to || "").trim().toUpperCase();
+    const rate = Number(json?.rates?.[target]);
+    if (!Number.isFinite(rate) || rate <= 0) return null;
+    return { rate, date: parseIsoDate(json?.date) || "", base: String(json?.base || "").toUpperCase(), target };
+  }
+
   // --- Goal and trip prompts ------------------------------------------------------
   // Moments a goal or trip needs a decision: a goal reaching its target or its due
   // date, a trip starting or ending. Each prompt has a key that includes the date
@@ -5801,6 +5822,8 @@ const core = (() => {
     parseGoalDefinition,
     computeSinkingFund,
     buildGoalPrompts,
+    buildExchangeRateUrl,
+    parseExchangeRateResponse,
     compareRunwayToBalance,
     slugifyName,
     deriveGoalKey,
@@ -14185,6 +14208,27 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     return true;
   },
 
+  // One request, only when asked. Returns { rate, date } or throws with a
+  // message fit for a Notice.
+  async fetchExchangeRate(from, to = this.settings.defaultCurrency) {
+    const url = core.buildExchangeRateUrl(from, to);
+    if (!url) throw new Error("use three-letter currency codes, like JPY");
+    if (core.normalizeCurrency(from).replace(/\s+CASH$/, "") === core.normalizeCurrency(to)) return { rate: 1, date: core.todayIsoLocal() };
+    let response;
+    try {
+      response = await this.requestJson(url);
+    } catch (error) {
+      throw new Error(`couldn't reach the rate service (${error.message || error})`);
+    }
+    if (response.status === 404 || response.status === 422) {
+      throw new Error(`the European Central Bank doesn't publish a rate for ${String(from).toUpperCase()}; type it in instead`);
+    }
+    if (response.status < 200 || response.status >= 300) throw new Error(`the rate service answered ${response.status}`);
+    const parsed = core.parseExchangeRateResponse(response.json, to);
+    if (!parsed) throw new Error("the rate service sent back something unexpected");
+    return parsed;
+  },
+
   openNewGoal(onComplete) {
     const modal = new SavingsGoalModal(this.app, this, onComplete);
     modal.open();
@@ -17901,7 +17945,7 @@ class ExchangeRateModal extends Modal {
       endDate: holidayMeta?.endDate || core.todayIsoLocal(),
       rate: "",
       scope: "flat",
-      sourceCurrency: "",
+      sourceCurrency: core.normalizeCurrency(holidayMeta?.tripCurrency || "", ""),
       startDate: holidayMeta?.startDate || core.todayIsoLocal(),
       targetCurrency: holidayMeta?.currency || plugin.settings.defaultCurrency,
     };
@@ -17962,12 +18006,32 @@ class ExchangeRateModal extends Modal {
         })
       );
 
-    new Setting(contentEl)
+    let rateText = null;
+    const rateSetting = new Setting(contentEl)
       .setName("Rate")
       .setDesc("How much 1 unit of the source currency is worth in the target currency.")
-      .addText((text) =>
+      .addText((text) => {
+        rateText = text;
+        text.inputEl.setAttribute("inputmode", "decimal");
         text.setPlaceholder("0.00877").setValue(this.form.rate).onChange((value) => {
           this.form.rate = value.trim();
+        });
+      })
+      .addButton((button) =>
+        button.setButtonText("Fetch current rate").onClick(async () => {
+          button.setDisabled(true);
+          try {
+            const result = await this.plugin.fetchExchangeRate(this.form.sourceCurrency, this.form.targetCurrency);
+            this.form.rate = String(result.rate);
+            rateText?.setValue(this.form.rate);
+            rateSetting.setDesc(
+              `European Central Bank reference rate for ${result.date}. Card and cash rates are usually a little worse, so adjust it if you know yours.`
+            );
+          } catch (error) {
+            new Notice(`Couldn't fetch a rate: ${error.message}`);
+          } finally {
+            button.setDisabled(false);
+          }
         })
       );
 

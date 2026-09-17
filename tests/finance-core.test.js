@@ -3057,3 +3057,15 @@ test("runway against a balance: covered, short, and how many days it lasts", () 
 
   assert.equal(core.compareRunwayToBalance(runway, null).status, "no-balance");
 });
+
+test("exchange rate requests and responses", () => {
+  assert.equal(core.buildExchangeRateUrl("jpy cash", "AUD"), "https://api.frankfurter.dev/v1/latest?base=JPY&symbols=AUD");
+  assert.equal(core.buildExchangeRateUrl("japanese yen", "AUD"), "");
+  assert.deepEqual(core.parseExchangeRateResponse({ amount: 1, base: "JPY", date: "2026-09-16", rates: { AUD: 0.00904 } }, "AUD"), {
+    rate: 0.00904,
+    date: "2026-09-16",
+    base: "JPY",
+    target: "AUD",
+  });
+  assert.equal(core.parseExchangeRateResponse({ message: "not found" }, "AUD"), null);
+});

@@ -122,6 +122,27 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     return true;
   },
 
+  // One request, only when asked. Returns { rate, date } or throws with a
+  // message fit for a Notice.
+  async fetchExchangeRate(from, to = this.settings.defaultCurrency) {
+    const url = core.buildExchangeRateUrl(from, to);
+    if (!url) throw new Error("use three-letter currency codes, like JPY");
+    if (core.normalizeCurrency(from).replace(/\s+CASH$/, "") === core.normalizeCurrency(to)) return { rate: 1, date: core.todayIsoLocal() };
+    let response;
+    try {
+      response = await this.requestJson(url);
+    } catch (error) {
+      throw new Error(`couldn't reach the rate service (${error.message || error})`);
+    }
+    if (response.status === 404 || response.status === 422) {
+      throw new Error(`the European Central Bank doesn't publish a rate for ${String(from).toUpperCase()}; type it in instead`);
+    }
+    if (response.status < 200 || response.status >= 300) throw new Error(`the rate service answered ${response.status}`);
+    const parsed = core.parseExchangeRateResponse(response.json, to);
+    if (!parsed) throw new Error("the rate service sent back something unexpected");
+    return parsed;
+  },
+
   openNewGoal(onComplete) {
     const modal = new SavingsGoalModal(this.app, this, onComplete);
     modal.open();
