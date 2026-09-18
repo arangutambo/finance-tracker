@@ -1857,3 +1857,39 @@
   .finance-settings-nav-link { flex: 1 1 auto; }
   .finance-runway-balance { padding: 8px 10px; }
 }
+
+/* ---- Stocks: sparklines, watchlist, a holding's page ---- */
+.finance-portfolio-spark { display: block; overflow: visible; }
+.finance-portfolio-spark polyline { fill: none; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.finance-portfolio-spark.is-up polyline { stroke: var(--color-green, #2f855a); }
+.finance-portfolio-spark.is-down polyline { stroke: var(--color-red, #c0392b); }
+.finance-portfolio-spark-cell { width: 84px; }
+.finance-portfolio-watch-row { display: flex; align-items: center; gap: 12px; }
+.finance-portfolio-watch-name { flex: 1 1 auto; min-width: 0; }
+.finance-portfolio-watch-spark { flex: 0 0 84px; }
+.finance-portfolio-watch-figures { flex: 0 0 auto; text-align: right; }
+.finance-ticker-header h2 { margin-bottom: 2px; }
+.finance-ticker-price { margin: 6px 0 10px; }
+.finance-ticker-price-value { font-size: 1.4em; font-weight: var(--font-semibold); }
+.finance-ticker-price-change.is-positive { color: var(--color-green, #2f855a); }
+.finance-ticker-price-change.is-negative { color: var(--color-red, #c0392b); }
+.finance-ticker-ranges { margin-bottom: 8px; }
+.finance-ticker-svg { width: 100%; height: 220px; display: block; overflow: visible; }
+.finance-ticker-line { fill: none; stroke-width: 2; vector-effect: non-scaling-stroke; }
+.finance-ticker-line.is-up { stroke: var(--color-green, #2f855a); }
+.finance-ticker-line.is-down { stroke: var(--color-red, #c0392b); }
+.finance-ticker-cost-line { stroke: var(--text-faint); stroke-dasharray: 5 4; vector-effect: non-scaling-stroke; }
+.finance-ticker-trade { stroke: var(--background-primary); stroke-width: 2; vector-effect: non-scaling-stroke; }
+.finance-ticker-trade.is-buy { fill: var(--color-green, #2f855a); }
+.finance-ticker-trade.is-sell { fill: var(--color-red, #c0392b); }
+.finance-ticker-trade.is-drp { fill: var(--color-blue, #2b6cb0); }
+.finance-ticker-trade.is-split { fill: var(--text-muted); }
+.finance-ticker-dividend { stroke: var(--color-orange, #d97706); stroke-width: 2; vector-effect: non-scaling-stroke; }
+.finance-ticker-legend { margin-top: 4px; }
+.finance-ticker-link { align-self: center; margin-left: auto; }
+.finance-market-today.is-clickable { cursor: pointer; }
+.finance-market-today.is-clickable:hover { background: var(--background-modifier-hover); }
+@media (max-width: 480px) {
+  .finance-portfolio-watch-spark { display: none; }
+  .finance-ticker-svg { height: 180px; }
+}

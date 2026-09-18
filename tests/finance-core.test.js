@@ -3084,3 +3084,103 @@ test("CSV export says what kind of entry each row is", () => {
   assert.match(rows[2], /,balance,,,$/);
   assert.match(rows[3], /,holiday-spending,,2026\/japan,$/);
 });
+
+// --- Stocks: Yahoo requests, watchlist, charts, dividends to log -------------------------
+
+test("Yahoo request paths, the browser header, and quote links", () => {
+  assert.equal(core.yahooChartPath("vas.ax"), "/v8/finance/chart/VAS.AX?range=2y&interval=1d&events=div");
+  assert.equal(core.yahooChartPath("AUDUSD=X", "5d"), "/v8/finance/chart/AUDUSD%3DX?range=5d&interval=1d&events=div");
+  assert.equal(core.yahooSearchPath(" vanguard australian "), "/v1/finance/search?q=vanguard%20australian&quotesCount=8&newsCount=0");
+  assert.deepEqual(core.YAHOO_HOSTS, ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]);
+  assert.match(core.YAHOO_USER_AGENT, /^Mozilla\/5\.0/);
+  assert.equal(core.yahooQuoteUrl("vas.ax"), "https://finance.yahoo.com/quote/VAS.AX");
+});
+
+test("London prices quoted in pence become pounds", () => {
+  const parsed = core.parseYahooChart({
+    chart: {
+      result: [
+        {
+          meta: { symbol: "VUSA.L", currency: "GBp", regularMarketPrice: 9150, chartPreviousClose: 9100, longName: "Vanguard S&P 500" },
+          timestamp: [1789362000],
+          indicators: { quote: [{ close: [9100] }] },
+          events: { dividends: { a: { date: 1789362000, amount: 25 } } },
+        },
+      ],
+    },
+  });
+  assert.equal(parsed.quote.currency, "GBP");
+  assert.equal(parsed.quote.price, 91.5);
+  assert.equal(parsed.quote.previousClose, 91);
+  assert.equal(parsed.history[0].close, 91);
+  assert.equal(parsed.dividends[0].amount, 0.25);
+  assert.deepEqual(core.yahooCurrency("GBP"), { currency: "GBP", divisor: 1 }, "pounds stay pounds");
+});
+
+test("the watchlist reads a list or a line, and drops duplicates and junk", () => {
+  assert.deepEqual(core.parseWatchlist("VGS.AX, ndq.ax  MSFT, VGS.AX"), ["VGS.AX", "NDQ.AX", "MSFT"]);
+  assert.deepEqual(core.parseWatchlist(["VGS.AX", "  ", "BTC-USD"]), ["VGS.AX", "BTC-USD"]);
+  assert.deepEqual(core.parseWatchlist("[\"VGS.AX\", 'NDQ.AX']"), ["VGS.AX", "NDQ.AX"]);
+  assert.deepEqual(core.parseWatchlist(""), []);
+  assert.equal(core.dividendTag("VAS.AX"), "#log/income/dividend/vas-ax");
+});
+
+test("price history slices to a range and reports the change over it", () => {
+  const history = [
+    { date: "2026-06-01", close: 100 },
+    { date: "2026-08-20", close: 104 },
+    { date: "2026-09-01", close: 106 },
+    { date: "2026-09-17", close: 110 },
+    { date: "2026-09-19", close: 999 },
+  ];
+  assert.deepEqual(core.sliceHistory(history, 1, "2026-09-17").map((point) => point.date), ["2026-08-20", "2026-09-01", "2026-09-17"]);
+  assert.equal(core.sliceHistory(history, 0, "2026-09-17").length, 4, "0 means all of it, up to today");
+  assert.deepEqual(core.priceChangeOver(history, 1, "2026-09-17"), { from: 104, to: 110, change: 6, pct: 5.77 });
+  assert.equal(core.priceChangeOver([{ date: "2026-09-17", close: 1 }], 1, "2026-09-17"), null);
+});
+
+test("dividends to log: held before the ex-date, not already logged, not reinvested", () => {
+  const trades = [
+    { date: "2025-10-01", type: "buy", ticker: "VAS.AX", units: 10, currency: "AUD" },
+    { date: "2026-04-01", type: "buy", ticker: "VAS.AX", units: 5, currency: "AUD" },
+    { date: "2026-01-02", type: "buy", ticker: "AAPL", units: 4, currency: "USD" },
+    { date: "2026-07-01", type: "buy", ticker: "VGS.AX", units: 20, currency: "AUD" },
+  ];
+  const dividendEvents = {
+    "VAS.AX": [
+      { date: "2025-07-01", amount: 0.9 }, // before the lookback
+      { date: "2026-01-02", amount: 0.5 }, // held 10; logged below
+      { date: "2026-04-01", amount: 0.6 }, // bought 5 more that day: still 10
+      { date: "2026-07-01", amount: 0.52 }, // held 15; not logged
+    ],
+    AAPL: [{ date: "2026-08-11", amount: 0.26 }],
+    "VGS.AX": [{ date: "2026-07-01", amount: 0.4 }], // bought on the ex-date: none
+  };
+  const entries = [{ entryType: "income", category: "dividend/vas-ax", amount: 5, date: "2026-01-19" }];
+  const found = core.findUnloggedDividends({
+    trades,
+    dividendEvents,
+    entries,
+    fx: { USD: 1.5 },
+    currencies: { AAPL: "USD" },
+    referenceDate: "2026-09-17",
+  });
+  assert.deepEqual(
+    found.map((item) => [item.ticker, item.exDate, item.units, item.amountNative, item.amountAud, item.suggestedDate]),
+    [
+      ["AAPL", "2026-08-11", 4, 1.04, 1.56, "2026-08-25"],
+      ["VAS.AX", "2026-07-01", 15, 7.8, 7.8, "2026-07-15"],
+      ["VAS.AX", "2026-04-01", 10, 6, 6, "2026-04-15"],
+    ]
+  );
+
+  const reinvested = core.findUnloggedDividends({
+    trades: [...trades, { date: "2026-07-20", type: "drp", ticker: "VAS.AX", units: 0.07, currency: "AUD" }],
+    dividendEvents,
+    entries,
+    referenceDate: "2026-09-17",
+    dismissed: ["VAS.AX:2026-04-01"],
+  });
+  assert.deepEqual(reinvested.map((item) => item.id), ["AAPL:2026-08-11"], "a reinvestment counts, and a dismissal sticks");
+  assert.equal(reinvested[0].amountAud, null, "no exchange rate, no AUD estimate");
+});

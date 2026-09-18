@@ -5617,6 +5617,126 @@ const core = (() => {
   }
 
   // query1.finance.yahoo.com/v8/finance/chart/<SYMBOL>?range=…&interval=1d&events=div
+  // --- Yahoo Finance requests ------------------------------------------------------
+  // Yahoo's price feed is free but unofficial, and it refuses requests that don't
+  // look like they come from a browser: without this header every request from
+  // the author's Mac got 429, with it they all succeeded. Two hosts serve the same
+  // data, so a refusal from one is tried on the other before backing off.
+  const YAHOO_HOSTS = ["query1.finance.yahoo.com", "query2.finance.yahoo.com"];
+  const YAHOO_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+  const YAHOO_TIMEOUT_MS = 8000;
+
+  function yahooChartPath(symbol, range = "2y") {
+    return `/v8/finance/chart/${encodeURIComponent(normalizeTicker(symbol))}?range=${range}&interval=1d&events=div`;
+  }
+
+  function yahooSearchPath(query) {
+    return `/v1/finance/search?q=${encodeURIComponent(String(query || "").trim())}&quotesCount=8&newsCount=0`;
+  }
+
+  // Currencies Yahoo quotes in a minor unit. The case matters: "GBp" is pence,
+  // "GBP" is pounds.
+  const YAHOO_MINOR_UNITS = { GBp: ["GBP", 100], GBX: ["GBP", 100], ZAc: ["ZAR", 100], ILA: ["ILS", 100] };
+
+  function yahooCurrency(raw) {
+    const code = String(raw || "").trim();
+    const minor = YAHOO_MINOR_UNITS[code];
+    if (minor) return { currency: minor[0], divisor: minor[1] };
+    return { currency: normalizeCurrency(code, ""), divisor: 1 };
+  }
+
+  function yahooQuoteUrl(ticker) {
+    return `https://finance.yahoo.com/quote/${encodeURIComponent(normalizeTicker(ticker))}`;
+  }
+
+  // --- Watchlist, holding charts, dividends to log ------------------------------------
+
+  // The portfolio note's `watchlist:` property, as a list or a comma-separated line.
+  function parseWatchlist(value) {
+    const raw = Array.isArray(value) ? value.join(",") : String(value || "").replace(/^\[|\]$/g, "");
+    const seen = new Set();
+    const tickers = [];
+    for (const piece of raw.split(/[,\s]+/)) {
+      const ticker = normalizeTicker(piece.replace(/^["']|["']$/g, ""));
+      if (!ticker || !/^[A-Z0-9^][A-Z0-9.\-=^]*$/.test(ticker) || seen.has(ticker)) continue;
+      seen.add(ticker);
+      tickers.push(ticker);
+    }
+    return tickers;
+  }
+
+  // "VAS.AX" → #log/income/dividend/vas-ax
+  function dividendTag(ticker) {
+    const slug = normalizeTicker(ticker).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+    return `#log/income/dividend/${slug}`;
+  }
+
+  // Closes within the last `months` of `referenceDate` (all of them for 0).
+  function sliceHistory(history, months, referenceDate = todayIsoLocal()) {
+    const points = (history || []).filter((point) => point && point.close > 0 && point.date <= referenceDate);
+    if (!(months > 0)) return points;
+    const cutoff = addMonths(referenceDate, -months);
+    return points.filter((point) => point.date >= cutoff);
+  }
+
+  function priceChangeOver(history, months, referenceDate = todayIsoLocal()) {
+    const points = sliceHistory(history, months, referenceDate);
+    if (points.length < 2) return null;
+    const from = points[0].close;
+    const to = points[points.length - 1].close;
+    return { from, to, change: Number((to - from).toFixed(4)), pct: from > 0 ? Number((((to - from) / from) * 100).toFixed(2)) : null };
+  }
+
+  // Dividends Yahoo says a holding paid, that you held units for, and that have
+  // no dividend (or reinvestment) logged near them. Units are those held at the
+  // close before the ex-date — buying on the ex-date doesn't earn that dividend.
+  // The amount is an estimate: withholding, franking and rounding all move it.
+  function findUnloggedDividends(options = {}) {
+    const referenceDate = parseIsoDate(options.referenceDate) || todayIsoLocal();
+    const since = addMonths(referenceDate, -(Number(options.lookbackMonths) || 12));
+    const trades = (options.trades || []).slice().sort((left, right) => String(left.date).localeCompare(String(right.date)));
+    const dismissed = new Set(options.dismissed || []);
+    const fx = options.fx || {};
+    const currencies = options.currencies || {};
+    const logged = (options.entries || []).filter(
+      (entry) => entry?.entryType === "income" && normalizeCategoryPath(entry.category || "").startsWith("dividend/")
+    );
+    const out = [];
+    for (const [ticker, events] of Object.entries(options.dividendEvents || {})) {
+      const key = tickerKey(ticker);
+      for (const event of events || []) {
+        const exDate = parseIsoDate(event.date);
+        if (!exDate || exDate > referenceDate || exDate < since || !(event.amount > 0)) continue;
+        const id = `${ticker}:${exDate}`;
+        if (dismissed.has(id)) continue;
+        const units = unitsHeldOn(trades, addDays(exDate, -1)).get(ticker) || 0;
+        if (!(units > 1e-9)) continue;
+        const windowEnd = addDays(exDate, 75);
+        const windowStart = addDays(exDate, -7);
+        const alreadyLogged =
+          logged.some((entry) => tickerKey(entry.category.slice("dividend/".length)) === key && entry.date >= windowStart && entry.date <= windowEnd) ||
+          trades.some((trade) => trade.ticker === ticker && trade.type === "drp" && trade.date >= exDate && trade.date <= windowEnd);
+        if (alreadyLogged) continue;
+        const tradeCurrency = trades.find((trade) => trade.ticker === ticker)?.currency || "AUD";
+        const currency = normalizeCurrency(currencies[ticker] || tradeCurrency);
+        const rate = currency === "AUD" ? 1 : Number(fx[currency]) || null;
+        const native = roundCurrencyAmount(units * event.amount);
+        out.push({
+          id,
+          ticker,
+          exDate,
+          perUnit: event.amount,
+          units: Number(units.toFixed(4)),
+          currency,
+          amountNative: native,
+          amountAud: rate ? roundCurrencyAmount(native * rate) : null,
+          suggestedDate: addDays(exDate, 14) < referenceDate ? addDays(exDate, 14) : referenceDate,
+        });
+      }
+    }
+    return out.sort((left, right) => right.exDate.localeCompare(left.exDate) || left.ticker.localeCompare(right.ticker));
+  }
+
   function parseYahooChart(json) {
     const result = json?.chart?.result?.[0];
     if (!result) {
@@ -5624,26 +5744,31 @@ const core = (() => {
       return { error: message };
     }
     const meta = result.meta || {};
+    // London quotes in pence ("GBp"), Johannesburg in cents: converted to the major
+    // unit here, so every figure downstream is in pounds and rand.
+    const { currency, divisor } = yahooCurrency(meta.currency);
+    const major = (value) => Number((Number(value) / divisor).toFixed(4));
     const timestamps = result.timestamp || [];
     const closes = result.indicators?.quote?.[0]?.close || [];
     const history = [];
     timestamps.forEach((seconds, index) => {
       const close = Number(closes[index]);
-      if (close > 0) history.push({ date: isoFromUnixSeconds(seconds), close: Number(close.toFixed(4)) });
+      if (close > 0) history.push({ date: isoFromUnixSeconds(seconds), close: major(close) });
     });
     const dividends = Object.values(result.events?.dividends || {})
-      .map((dividend) => ({ date: isoFromUnixSeconds(dividend.date), amount: Number(dividend.amount) }))
+      .map((dividend) => ({ date: isoFromUnixSeconds(dividend.date), amount: major(dividend.amount) }))
       .filter((dividend) => dividend.date && dividend.amount > 0)
       .sort((left, right) => left.date.localeCompare(right.date));
 
-    const price = Number(meta.regularMarketPrice);
+    const price = major(meta.regularMarketPrice);
+    const previousClose = major(meta.chartPreviousClose ?? meta.previousClose);
     return {
       quote: price > 0
         ? {
-            currency: normalizeCurrency(meta.currency || "", ""),
+            currency,
             exchange: meta.exchangeName || meta.fullExchangeName || "",
             name: meta.longName || meta.shortName || meta.symbol || "",
-            previousClose: Number(meta.chartPreviousClose ?? meta.previousClose) || null,
+            previousClose: previousClose > 0 ? previousClose : null,
             price,
             time: isoFromUnixSeconds(meta.regularMarketTime),
             type: meta.instrumentType || "",
@@ -5784,6 +5909,18 @@ const core = (() => {
     tickerKey,
     tickerMarket,
     parseTradesTable,
+    YAHOO_HOSTS,
+    YAHOO_USER_AGENT,
+    YAHOO_TIMEOUT_MS,
+    yahooChartPath,
+    yahooSearchPath,
+    yahooCurrency,
+    yahooQuoteUrl,
+    parseWatchlist,
+    dividendTag,
+    sliceHistory,
+    priceChangeOver,
+    findUnloggedDividends,
     parsePriceOverrides,
     heldTwelveMonths,
     buildHoldings,
@@ -6031,6 +6168,8 @@ const DEFAULT_SETTINGS = {
   priceSheetUrl: "",
   priceRefreshMinutes: 60,
   marketCache: {},
+  // Dividends Yahoo reported that you chose not to log, as "TICKER:ex-date".
+  dismissedDividends: [],
   autoLogRecurring: false,
   quickAddUseNoteDate: false,
   tripModeActive: false,
@@ -6258,6 +6397,36 @@ function serializeExchangeRatePeriods(periods) {
     .map((period) => `${period.start}..${period.end}:${serializeFlatExchangeRates(period.rates || {})}`)
     .filter(Boolean)
     .join("; ");
+}
+
+// Writes a list property as a one-line flow sequence (`key: [A, B]`), removing
+// the key's existing value whether it was a line or an indented block list —
+// Obsidian's Properties editor writes lists as blocks, and replacing only the
+// key's own line would leave orphaned "- item" lines behind.
+function setFrontmatterList(content, key, items) {
+  const text = String(content || "");
+  const line = `${key}: ${items.length ? `[${items.join(", ")}]` : ""}`;
+  const match = text.match(/^---\n([\s\S]*?)\n---/);
+  if (!match) return `---\n${line}\n---\n\n${text}`;
+  const out = [];
+  let found = false;
+  let skipping = false;
+  for (const current of match[1].split("\n")) {
+    if (skipping) {
+      if (/^\s*-\s/.test(current) || /^\s+\S/.test(current)) continue;
+      skipping = false;
+    }
+    const keyMatch = current.match(/^([A-Za-z0-9_-]+)\s*:/);
+    if (keyMatch && keyMatch[1].toLowerCase() === String(key).toLowerCase()) {
+      out.push(line);
+      found = true;
+      skipping = true;
+      continue;
+    }
+    out.push(current);
+  }
+  if (!found) out.push(line);
+  return text.replace(match[0], `---\n${out.join("\n")}\n---`);
 }
 
 function updateFrontmatterValue(content, key, value) {
@@ -11532,6 +11701,10 @@ class FinanceTrackerPlugin extends Plugin {
     // Goals and trips that need a decision today: due, done, starting, over.
     await this.renderGoalPrompts(wrapper, { referenceDate });
 
+    // In the hub, the day's move in your shares. The sidebar leaves it out: it
+    // re-renders often, and prices are the hub's business.
+    if (options.inHub) await this.renderMarketToday(wrapper);
+
     // Mini pie chart (sidebar-friendly: SVG centred + compact legend below)
     const hierarchy = core.buildHierarchicalCategoryGroups(spendEntries, "primary");
     if (hierarchy.slices.length) {
@@ -14837,6 +15010,8 @@ Object.assign(FinanceTrackerPlugin.prototype, {
       "price_overrides: ",
       "# AUD per unit of a foreign currency, e.g. USD=1.51",
       "fx_rates: ",
+      "# Tickers to follow without owning them, e.g. [VGS.AX, NDQ.AX]",
+      "watchlist: ",
       "---",
       "",
       "# 📈 Portfolio",
@@ -14852,7 +15027,8 @@ Object.assign(FinanceTrackerPlugin.prototype, {
       "Type is buy, sell, drp (dividend reinvestment) or split. For a split, Units is",
       "the ratio: 2 for a 2-for-1, 0.5 for a 1-for-2 consolidation. For a trade in",
       "another currency, AUD cost is what actually left your account, fees included.",
-      "Log dividends in your daily notes as `#log/income/dividend/<ticker>`.",
+      "Dividends are logged in your daily notes as `#log/income/dividend/<ticker>`; with",
+      "prices from Yahoo, the portfolio lists the ones you were paid and haven't logged.",
       "",
       "| Date | Type | Ticker | Units | Price | Fees | Currency | AUD cost | Account | Note |",
       "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | --- | --- |",
@@ -14868,9 +15044,13 @@ Object.assign(FinanceTrackerPlugin.prototype, {
 
   async loadPortfolio() {
     const file = this.app.vault.getAbstractFileByPath(this.getPortfolioNotePath());
-    if (!(file instanceof TFile)) return { exists: false, trades: [], warnings: [], overrides: {}, fxOverrides: {} };
+    if (!(file instanceof TFile)) return { exists: false, trades: [], warnings: [], overrides: {}, fxOverrides: {}, watchlist: [] };
     const content = await this.app.vault.cachedRead(file);
     const frontmatter = parseFrontmatter(content);
+    // Obsidian's own frontmatter reader understands block lists; ours reads the
+    // one-line form, and covers the moment before the cache catches up.
+    const cached = this.app.metadataCache?.getFileCache?.(file)?.frontmatter;
+    const watchlistValue = cached && "watchlist" in cached ? cached.watchlist : frontmatter.watchlist;
     const { trades, warnings } = core.parseTradesTable(content);
     const fxOverrides = {};
     for (const [currency, rate] of Object.entries(core.parsePriceOverrides(frontmatter.fx_rates || ""))) {
@@ -14884,6 +15064,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
       warnings,
       overrides: core.parsePriceOverrides(frontmatter.price_overrides || ""),
       fxOverrides,
+      watchlist: core.parseWatchlist(watchlistValue || ""),
     };
   },
 
@@ -14914,9 +15095,39 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     return { ...this.marketCache().fx, ...(portfolio?.fxOverrides || {}) };
   },
 
-  async requestJson(url) {
-    const response = await requestUrl({ url, method: "GET", throw: false, headers: { Accept: "application/json" } });
-    return { status: response.status, json: response.json, text: response.text };
+  async requestJson(url, headers = {}) {
+    const response = await requestUrl({ url, method: "GET", throw: false, headers: { Accept: "application/json", ...headers } });
+    let json = null;
+    try {
+      json = response.json;
+    } catch (_error) {
+      // A refusal page is HTML, and reading it as JSON throws.
+    }
+    return { status: response.status, json, text: response.text };
+  },
+
+  // One Yahoo request: each host in turn, with a browser's User-Agent and a
+  // timeout. `refused` only when every host refused.
+  async yahooJson(path) {
+    let last = { status: 0, refused: true };
+    for (const host of core.YAHOO_HOSTS) {
+      let response;
+      try {
+        response = await Promise.race([
+          this.requestJson(`https://${host}${path}`, { "User-Agent": core.YAHOO_USER_AGENT }),
+          new Promise((_, reject) => window.setTimeout(() => reject(new Error("timed out")), this._yahooTimeoutMs ?? core.YAHOO_TIMEOUT_MS)),
+        ]);
+      } catch (error) {
+        last = { status: 0, refused: true, error: error.message };
+        continue;
+      }
+      if (response.status === 429 || response.status >= 500 || response.status === 0) {
+        last = { status: response.status, refused: true };
+        continue;
+      }
+      return response;
+    }
+    return last;
   },
 
   // Refreshes prices from the chosen source. Respects the refresh interval and
@@ -14937,7 +15148,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     }
 
     const portfolio = options.portfolio || (await this.loadPortfolio());
-    const tickers = Array.from(new Set(portfolio.trades.map((trade) => trade.ticker)));
+    const tickers = Array.from(new Set([...portfolio.trades.map((trade) => trade.ticker), ...(portfolio.watchlist || [])]));
     const currencies = Array.from(new Set(portfolio.trades.map((trade) => trade.currency).filter((currency) => currency !== "AUD")));
     if (!tickers.length) return { skipped: "no-trades" };
 
@@ -14982,9 +15193,9 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     const pause = () => new Promise((resolve) => setTimeout(resolve, this._yahooThrottleMs ?? YAHOO_THROTTLE_MS));
 
     const fetchChart = async (symbol) => {
-      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=2y&interval=1d&events=div`;
-      const response = await this.requestJson(url);
-      if (response.status === 429 || response.status >= 500) return { refused: true, status: response.status };
+      const response = await this.yahooJson(core.yahooChartPath(symbol));
+      if (response.refused) return { refused: true, status: response.status };
+      if (response.status === 404) return { error: `${symbol}: Yahoo doesn't know this ticker` };
       if (response.status >= 400) return { error: `${symbol}: ${response.status}` };
       return core.parseYahooChart(response.json);
     };
@@ -14993,7 +15204,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
       if (index) await pause();
       const chart = await fetchChart(ticker);
       if (chart.refused) {
-        return { updated, refused: true, error: `Yahoo refused requests (${chart.status}). Cached prices are shown until it recovers.` };
+        return { updated, refused: true, error: `Yahoo refused requests${chart.status ? ` (${chart.status})` : ""}. Cached prices are shown until it recovers.` };
       }
       if (chart.error || !chart.quote) {
         errors.push(chart.error || `${ticker}: no price`);
@@ -15010,7 +15221,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
       // AUDUSD=X is US dollars per Australian dollar; the portfolio wants the
       // reverse, AUD per unit of the foreign currency.
       const chart = await fetchChart(`AUD${currency}=X`);
-      if (chart.refused) return { updated, refused: true, error: `Yahoo refused requests (${chart.status}).` };
+      if (chart.refused) return { updated, refused: true, error: `Yahoo refused requests${chart.status ? ` (${chart.status})` : ""}.` };
       if (!chart.quote?.price) continue;
       cache.fx[currency] = Number((1 / chart.quote.price).toFixed(6));
       cache.fxHistory[currency] = chart.history.map((point) => ({ date: point.date, audPerUnit: Number((1 / point.close).toFixed(6)) }));
@@ -15032,9 +15243,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     const blocked = cache.backoffUntil && Date.parse(cache.backoffUntil) > Date.now();
     if (this.settings.priceSource !== "yahoo" || blocked || String(query || "").trim().length < 2) return own;
 
-    const response = await this.requestJson(
-      `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(String(query).trim())}&quotesCount=8&newsCount=0`
-    );
+    const response = await this.yahooJson(core.yahooSearchPath(query));
     if (response.status !== 200) return own;
     const found = core.parseYahooSearch(response.json).filter((result) => !own.some((item) => item.symbol === result.symbol));
     return [...own, ...found];
@@ -15068,17 +15277,96 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     for (const row of dividends.rows) for (const payment of row.payments) cashflows.push({ date: payment.date, amount: payment.amount });
     if (value.totals.valueAud > 0) cashflows.push({ date: referenceDate, amount: value.totals.valueAud });
 
+    // Tickers followed but not held: price, today, the last month.
+    const held = new Set(value.rows.map((row) => row.ticker));
+    const watchlist = (portfolio.watchlist || []).filter((ticker) => !held.has(ticker)).map((ticker) => {
+      const quote = quotes[ticker] || null;
+      const price = Number(quote?.price);
+      const previous = Number(quote?.previousClose);
+      const history = cache.history[ticker] || [];
+      return {
+        ticker,
+        name: quote?.name || "",
+        currency: quote?.currency || (core.tickerMarket(ticker) === "US" ? "USD" : "AUD"),
+        price: price > 0 ? price : null,
+        dayChangePct: price > 0 && previous > 0 ? Number((((price - previous) / previous) * 100).toFixed(2)) : null,
+        month: core.priceChangeOver(history, 1, referenceDate),
+        spark: core.sliceHistory(history, 1, referenceDate),
+        stale: Boolean(quote?.stale),
+      };
+    });
+
+    const currencies = Object.fromEntries(Object.entries(quotes).map(([ticker, quote]) => [ticker, quote?.currency || ""]));
+    const dividendsToLog = core.findUnloggedDividends({
+      trades: portfolio.trades,
+      dividendEvents: cache.dividends,
+      entries: await this.collectAllTransactions(),
+      fx,
+      currencies,
+      referenceDate,
+      dismissed: this.settings.dismissedDividends || [],
+    });
+
     return {
       cache,
       dividends,
+      dividendsToLog,
       holdings,
       portfolio,
       quotes,
       series,
       source: this.settings.priceSource || "manual",
       value,
+      watchlist,
       xirr: core.computeXirr(cashflows),
     };
+  },
+
+  async addToWatchlist(ticker) {
+    const symbol = core.normalizeTicker(ticker);
+    if (!symbol) throw new Error("type a ticker, like VGS.AX");
+    const file = await this.ensurePortfolioNote();
+    const portfolio = await this.loadPortfolio();
+    if ((portfolio.watchlist || []).includes(symbol)) return false;
+    const content = await this.app.vault.read(file);
+    await _ftModify(this.app, file, setFrontmatterList(content, "watchlist", [...portfolio.watchlist, symbol]));
+    // Fetched straight away, rather than waiting out the refresh interval.
+    if ((this.settings.priceSource || "manual") !== "manual") {
+      await this.refreshPrices({ force: true, portfolio: { ...portfolio, watchlist: [...portfolio.watchlist, symbol] } });
+    }
+    this.refreshDailyBudgetView();
+    return true;
+  },
+
+  async removeFromWatchlist(ticker) {
+    const symbol = core.normalizeTicker(ticker);
+    const file = this.app.vault.getAbstractFileByPath(this.getPortfolioNotePath());
+    if (!(file instanceof TFile)) return false;
+    const portfolio = await this.loadPortfolio();
+    if (!portfolio.watchlist.includes(symbol)) return false;
+    const content = await this.app.vault.read(file);
+    await _ftModify(this.app, file, setFrontmatterList(content, "watchlist", portfolio.watchlist.filter((item) => item !== symbol)));
+    this.refreshDailyBudgetView();
+    return true;
+  },
+
+  // Logs a dividend as income in the day's note, with where the figure came from.
+  async logDividend(item, amount, date) {
+    const value = core.roundCurrencyAmount(amount);
+    if (!(value > 0)) throw new Error("the amount must be more than zero");
+    const lines = [
+      `- ${core.formatCurrency(value, this.settings.defaultCurrency)} ${core.dividendTag(item.ticker)}`,
+      `\t- ${item.ticker} dividend, ex ${item.exDate} (${item.units} units × ${core.formatCurrencyWithCode(item.perUnit, item.currency)})`,
+    ];
+    const file = await this.appendFinanceLines(core.parseIsoDate(date) || core.todayIsoLocal(), lines);
+    this.refreshDailyBudgetView();
+    return file;
+  },
+
+  async dismissDividend(id) {
+    this.settings.dismissedDividends = Array.from(new Set([...(this.settings.dismissedDividends || []), id]));
+    await this.saveSettings();
+    this.refreshDailyBudgetView();
   },
 });
 
@@ -15109,6 +15397,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     header.createEl("h3", { text: config.title || "Portfolio" });
     const actions = header.createDiv({ cls: "finance-tracker-header-actions" });
     addAction(actions, "Log trade", () => this.openLogTrade({ onSaved: rerender }), { primary: true, opensModal: true });
+    addAction(actions, "Add to watchlist", () => this.openAddToWatchlist({ onSaved: rerender }), { opensModal: true });
 
     let model = await this.buildPortfolioModel(referenceDate);
     if (!model.portfolio.exists) {
@@ -15138,7 +15427,13 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     wrapper.createDiv({ cls: "finance-tracker-budget-meta finance-portfolio-source", text: this.describePriceSource(model) });
 
     if (!model.portfolio.trades.length) {
-      wrapper.createDiv({ cls: "finance-tracker-empty", text: "No trades yet. Log one, or add rows to the Trades table below." });
+      wrapper.createDiv({
+        cls: "finance-tracker-empty",
+        text: model.watchlist.length
+          ? "No trades yet. Your watchlist is below; log a trade when you buy."
+          : "No trades yet. Log one, add rows to the Trades table below, or add a ticker to your watchlist to follow it first.",
+      });
+      this.renderWatchlist(wrapper, model, rerender);
       return;
     }
 
@@ -15160,6 +15455,8 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     ]);
 
     this.renderHoldingsTable(wrapper, model, currency);
+    this.renderDividendsToLog(wrapper, model, rerender);
+    this.renderWatchlist(wrapper, model, rerender);
 
     if (model.value.missing.length) {
       wrapper.createDiv({
@@ -15248,7 +15545,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     const scroller = section.createDiv({ cls: "finance-portfolio-scroll" });
     const table = scroller.createEl("table", { cls: "finance-tracker-table" });
     const head = table.createEl("thead").createEl("tr");
-    for (const label of ["Holding", "Units", "Avg cost", "Price", "Value", "Gain", "Today", "Weight"]) head.createEl("th", { text: label });
+    for (const label of ["Holding", "Month", "Units", "Avg cost", "Price", "Value", "Gain", "Today", "Weight"]) head.createEl("th", { text: label });
     const body = table.createEl("tbody");
 
     for (const row of model.value.rows) {
@@ -15256,6 +15553,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
       const name = tr.createEl("td");
       name.createDiv({ text: row.ticker, cls: "finance-portfolio-ticker" });
       if (row.name && row.name !== row.ticker) name.createDiv({ text: row.name, cls: "finance-tracker-budget-meta" });
+      this.renderSparkline(tr.createEl("td", { cls: "finance-portfolio-spark-cell" }), core.sliceHistory(model.cache.history?.[row.ticker], 1));
       tr.createEl("td", { text: String(Number(row.units.toFixed(4))), cls: "is-numeric" });
       tr.createEl("td", { text: core.formatCurrencyWithCode(row.averageCostNative, row.currency), cls: "is-numeric" });
       const price = tr.createEl("td", { cls: "is-numeric" });
@@ -15271,23 +15569,128 @@ Object.assign(FinanceTrackerPlugin.prototype, {
       tr.createEl("td", { text: row.dayChangePct === null ? "—" : `${row.dayChangePct}%`, cls: "is-numeric" });
       tr.createEl("td", { text: `${row.weight}%`, cls: "is-numeric" });
 
-      // A holding's parcels, on click: what was bought when, and which have been
-      // held long enough that the CGT discount would apply to a sale.
-      const detail = body.createEl("tr", { cls: "finance-portfolio-detail is-hidden" });
-      const cell = detail.createEl("td", { attr: { colspan: "8" } });
-      for (const parcel of row.parcels) {
-        cell.createDiv({
-          cls: "finance-tracker-budget-meta",
-          text: `${parcel.acquired} · ${Number(parcel.units.toFixed(4))} units · cost ${core.formatCurrency(parcel.costAud, currency)}${
-            parcel.discountEligible ? " · held 12 months+" : ""
-          }`,
-        });
-      }
-      if (row.realisedAud) {
-        cell.createDiv({ cls: "finance-tracker-budget-meta", text: `Realised so far: ${core.formatCurrency(row.realisedAud, currency)}` });
-      }
-      if (row.accounts.length) cell.createDiv({ cls: "finance-tracker-budget-meta", text: `Held with ${row.accounts.join(", ")}` });
-      tr.addEventListener("click", () => detail.toggleClass("is-hidden", !detail.hasClass("is-hidden")));
+      // The holding's own page: chart, trades, parcels.
+      tr.setAttribute("aria-label", `Open ${row.ticker}`);
+      tr.addEventListener("click", () => this.openTickerDetail(row.ticker));
+    }
+  },
+
+  // Today's move across your shares, for the hub's Today tab. Uses the price
+  // refresh the portfolio already does, so its interval and backoff apply.
+  async renderMarketToday(host) {
+    const portfolio = await this.loadPortfolio();
+    if (!portfolio.exists || !portfolio.trades.length) return false;
+    if ((this.settings.priceSource || "manual") !== "manual") {
+      await this.refreshPrices({ portfolio }).catch(() => {});
+    }
+    const model = await this.buildPortfolioModel();
+    const totals = model.value.totals;
+    if (!(totals.valueAud > 0)) return false;
+
+    const card = host.createDiv({ cls: "finance-tracker-chart-card finance-market-today is-clickable" });
+    card.setAttribute("aria-label", "Open the portfolio");
+    card.createEl("h4", { text: "Shares today" });
+    const day = Number(totals.dayChangeAud) || 0;
+    const before = totals.valueAud - day;
+    const pct = before > 0 ? Number(((day / before) * 100).toFixed(2)) : null;
+    renderStatCards(card, [
+      {
+        label: "Today",
+        value: `${day > 0 ? "+" : day < 0 ? "−" : ""}${core.formatCurrency(Math.abs(day), "AUD")}`,
+        hint: pct === null ? "" : `${pct > 0 ? "+" : ""}${pct}%`,
+        cls: day < 0 ? "is-over" : day > 0 ? "is-down" : "",
+      },
+      { label: "Value", value: core.formatCurrency(totals.valueAud, "AUD") },
+    ]);
+    const moved = model.value.rows.filter((row) => row.dayChangePct !== null && row.dayChangePct !== undefined);
+    const bits = [];
+    if (moved.length) {
+      const biggest = moved.reduce((best, row) => (Math.abs(row.dayChangePct) > Math.abs(best.dayChangePct) ? row : best));
+      bits.push(`Biggest move: ${biggest.ticker} ${biggest.dayChangePct > 0 ? "+" : ""}${biggest.dayChangePct}%`);
+    }
+    if (model.dividendsToLog.length) bits.push(`${model.dividendsToLog.length} dividend${model.dividendsToLog.length === 1 ? "" : "s"} to log`);
+    if (model.value.rows.some((row) => row.stale)) bits.push("some prices are old");
+    if (bits.length) card.createDiv({ cls: "finance-tracker-budget-meta", text: bits.join(" · ") });
+    card.addEventListener("click", () => this.activateHubView("portfolio"));
+    return true;
+  },
+
+  // A month of closes as a small line, rising green or falling red.
+  renderSparkline(host, points, options = {}) {
+    if (!points || points.length < 2) {
+      host.createSpan({ cls: "finance-tracker-budget-meta", text: "—" });
+      return null;
+    }
+    const W = options.width || 80;
+    const H = options.height || 22;
+    const closes = points.map((point) => point.close);
+    const min = Math.min(...closes);
+    const span = Math.max(...closes) - min || 1;
+    const coords = closes
+      .map((close, index) => `${((index * W) / (closes.length - 1)).toFixed(1)},${(H - 2 - ((close - min) / span) * (H - 4)).toFixed(1)}`)
+      .join(" ");
+    const svg = host.createSvg("svg", {
+      cls: ["finance-portfolio-spark", closes[closes.length - 1] >= closes[0] ? "is-up" : "is-down"],
+      attr: { viewBox: `0 0 ${W} ${H}`, width: W, height: H, preserveAspectRatio: "none", role: "img", "aria-label": "Price over the last month" },
+    });
+    svg.createSvg("polyline", { attr: { points: coords } });
+    return svg;
+  },
+
+  renderWatchlist(wrapper, model, rerender) {
+    if (!model.watchlist.length) return;
+    const section = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-portfolio-watchlist" });
+    section.createEl("h4", { text: `Watchlist (${model.watchlist.length})` });
+    if (model.source === "manual" && model.watchlist.some((item) => item.price === null)) {
+      section.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: "Watchlist prices come from a price source. Choose Yahoo or a Google Sheet in Settings → Portfolio, or type prices into price_overrides.",
+      });
+    }
+    const list = section.createDiv({ cls: "finance-tracker-budget-list finance-dashboard-rows" });
+    for (const item of model.watchlist) {
+      const row = list.createDiv({ cls: "finance-tracker-budget-card is-clickable finance-portfolio-watch-row" });
+      row.setAttribute("aria-label", `Open ${item.ticker}`);
+      const left = row.createDiv({ cls: "finance-portfolio-watch-name" });
+      left.createDiv({ cls: "finance-portfolio-ticker", text: item.ticker });
+      if (item.name) left.createDiv({ cls: "finance-tracker-budget-meta", text: item.name });
+      this.renderSparkline(row.createDiv({ cls: "finance-portfolio-watch-spark" }), item.spark);
+      const right = row.createDiv({ cls: "finance-portfolio-watch-figures" });
+      const price = right.createDiv({ cls: "ft-row-amount", text: item.price === null ? "—" : core.formatCurrencyWithCode(item.price, item.currency) });
+      if (item.stale) price.createSpan({ cls: "finance-portfolio-stale", text: " old" });
+      const bits = [];
+      if (item.dayChangePct !== null) bits.push(`${item.dayChangePct > 0 ? "+" : ""}${item.dayChangePct}% today`);
+      if (item.month?.pct !== null && item.month?.pct !== undefined) bits.push(`${item.month.pct > 0 ? "+" : ""}${item.month.pct}% this month`);
+      if (bits.length) right.createDiv({ cls: "finance-tracker-budget-meta", text: bits.join(" · ") });
+      row.addEventListener("click", () => this.openTickerDetail(item.ticker, { onChanged: rerender }));
+    }
+  },
+
+  // Dividends Yahoo says you were paid and haven't logged. Each is an estimate
+  // until you confirm the amount that actually arrived.
+  renderDividendsToLog(wrapper, model, rerender) {
+    const items = model.dividendsToLog || [];
+    if (!items.length) return;
+    const section = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-portfolio-dividends-due" });
+    section.createEl("h4", { text: `Dividends to log (${items.length})` });
+    section.createDiv({
+      cls: "finance-tracker-budget-meta",
+      text: "From Yahoo's dividend history and the units you held before each ex-date. Check the amount against what was paid: withholding and rounding change it.",
+    });
+    const list = section.createDiv({ cls: "finance-tracker-budget-list finance-dashboard-rows" });
+    for (const item of items) {
+      const row = list.createDiv({ cls: "finance-tracker-budget-card" });
+      renderRowTitle(row, `${item.ticker} · ex ${item.exDate}`, item.amountAud === null ? core.formatCurrencyWithCode(item.amountNative, item.currency) : core.formatCurrency(item.amountAud, "AUD"));
+      row.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: `${item.units} units × ${core.formatCurrencyWithCode(item.perUnit, item.currency)} a unit`,
+      });
+      const actions = row.createDiv({ cls: "finance-tracker-header-actions" });
+      addAction(actions, "Log it", () => this.openLogDividend(item, { onSaved: rerender }), { primary: true, opensModal: true });
+      addAction(actions, "Dismiss", async () => {
+        await this.dismissDividend(item.id);
+        await rerender();
+      }, { tooltip: "Don't list this dividend again" });
     }
   },
 
@@ -15400,6 +15803,24 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     return row;
   },
 
+  openTickerDetail(ticker, options = {}) {
+    const modal = new TickerDetailModal(this.app, this, { ticker, ...options });
+    modal.open();
+    return modal;
+  },
+
+  openAddToWatchlist(options = {}) {
+    const modal = new AddToWatchlistModal(this.app, this, options);
+    modal.open();
+    return modal;
+  },
+
+  openLogDividend(item, options = {}) {
+    const modal = new LogDividendModal(this.app, this, item, options);
+    modal.open();
+    return modal;
+  },
+
   openLogTrade(options = {}) {
     const modal = new LogTradeModal(this.app, this, options);
     modal.open();
@@ -15417,6 +15838,7 @@ class LogTradeModal extends Modal {
     super(app);
     this.plugin = plugin;
     this.onSaved = options.onSaved;
+    this.presetTicker = options.ticker || "";
   }
 
   async onOpen() {
@@ -15443,6 +15865,7 @@ class LogTradeModal extends Modal {
       type: "text",
       attr: { placeholder: "VAS.AX or AAPL", "aria-label": "Ticker" },
     });
+    tickerInput.value = this.presetTicker;
     // Suggestions are fetched as you type; a small cache keeps each query to one
     // request, and the list is never allowed to block typing a ticker directly.
     const found = new Map();
@@ -15543,7 +15966,11 @@ class LogTradeModal extends Modal {
         save.disabled = false;
       }
     });
-    window.setTimeout(() => tickerInput.focus(), 0);
+    if (this.presetTicker) {
+      currencySelect.value = core.tickerMarket(this.presetTicker) === "US" ? "USD" : "AUD";
+      syncCurrency();
+    }
+    window.setTimeout(() => (this.presetTicker ? unitsInput : tickerInput).focus(), 0);
   }
 
   onClose() {
@@ -15627,7 +16054,8 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     const uncategorised = entries.filter((entry) => core.isUncategorisedEntry(entry)).length;
     const failed = typeof this.failedCaptureFiles === "function" ? this.failedCaptureFiles().length : 0;
     const bills = await this.hubBillsNeedingAttention();
-    return uncategorised + failed + bills.due.length + bills.suggestions.length;
+    const dividends = await this.dividendsToLogForInbox();
+    return uncategorised + failed + bills.due.length + bills.suggestions.length + (dividends ? dividends.dividendsToLog.length : 0);
   },
 
   async renderHubInbox(host, view) {
@@ -15657,7 +16085,18 @@ Object.assign(FinanceTrackerPlugin.prototype, {
       }
     }
 
+    const dividends = await this.dividendsToLogForInbox();
+    if (dividends) this.renderDividendsToLog(host.createDiv({ cls: "finance-tracker-dashboard" }), dividends, rerender);
+
     await this.renderCategorisationInboxInto(host.createDiv(), { title: "Uncategorised spending" });
+  },
+
+  // The portfolio model, only when there are trades to have earned dividends.
+  async dividendsToLogForInbox() {
+    const portfolio = await this.loadPortfolio();
+    if (!portfolio.exists || !portfolio.trades.length) return null;
+    const model = await this.buildPortfolioModel();
+    return model.dividendsToLog.length ? model : null;
   },
 
   async renderHubBudgets(host, view) {
@@ -17734,6 +18173,358 @@ class BankReconcileModal extends Modal {
   }
 }
 
+// --- Stocks: a holding's page, the watchlist, dividends ---------------------------
+
+const TICKER_RANGES = [
+  ["1M", 1],
+  ["3M", 3],
+  ["6M", 6],
+  ["1Y", 12],
+  ["2Y", 24],
+];
+
+// One ticker, held or watched: its price over time with your trades marked on
+// it, your average cost as a line, and what you hold. Everything drawn comes
+// from the cache the portfolio already keeps — opening this never fetches.
+class TickerDetailModal extends Modal {
+  constructor(app, plugin, options = {}) {
+    super(app);
+    this.plugin = plugin;
+    this.ticker = core.normalizeTicker(options.ticker || "");
+    this.onChanged = options.onChanged;
+    this.months = 6;
+  }
+
+  async onOpen() {
+    this.modalEl?.addClass?.("finance-wide-modal");
+    await this.render();
+  }
+
+  async render() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("finance-ticker-detail");
+    const plugin = this.plugin;
+    const ticker = this.ticker;
+    const model = await plugin.buildPortfolioModel();
+    const row = model.value.rows.find((item) => item.ticker === ticker) || null;
+    const watching = (model.portfolio.watchlist || []).includes(ticker);
+    const quote = model.quotes[ticker] || null;
+    const history = model.cache.history?.[ticker] || [];
+    const currency = quote?.currency || row?.currency || (core.tickerMarket(ticker) === "US" ? "USD" : "AUD");
+    const trades = model.portfolio.trades.filter((trade) => trade.ticker === ticker);
+
+    const header = contentEl.createDiv({ cls: "finance-ticker-header" });
+    header.createEl("h2", { text: ticker });
+    const described = [quote?.name, quote?.exchange].filter((bit) => bit && bit !== ticker);
+    if (described.length) header.createDiv({ cls: "finance-tracker-budget-meta", text: described.join(" · ") });
+
+    const price = Number(quote?.price);
+    const previous = Number(quote?.previousClose);
+    const priceLine = contentEl.createDiv({ cls: "finance-ticker-price" });
+    if (price > 0) {
+      priceLine.createSpan({ cls: "finance-ticker-price-value", text: core.formatCurrencyWithCode(price, currency) });
+      if (previous > 0) {
+        const change = price - previous;
+        const pct = ((change / previous) * 100).toFixed(2);
+        priceLine.createSpan({
+          cls: `finance-ticker-price-change ${change >= 0 ? "is-positive" : "is-negative"}`,
+          text: ` ${change >= 0 ? "+" : "−"}${core.formatCurrencyWithCode(Math.abs(change), currency)} (${change >= 0 ? "+" : ""}${pct}%) today`,
+        });
+      }
+      if (quote?.stale) priceLine.createSpan({ cls: "finance-portfolio-stale", text: " old" });
+    } else {
+      priceLine.createSpan({
+        cls: "finance-tracker-budget-meta",
+        text: "No price yet. Choose Yahoo or a Google Sheet in Settings → Portfolio, or type one into the portfolio note's price_overrides.",
+      });
+    }
+
+    const chips = contentEl.createDiv({ cls: "finance-hub-chips finance-ticker-ranges" });
+    for (const [label, months] of TICKER_RANGES) {
+      const chip = chips.createEl("button", { cls: "finance-hub-chip", text: label, attr: { "aria-pressed": String(months === this.months) } });
+      if (months === this.months) chip.addClass("is-active");
+      chip.addEventListener("click", async () => {
+        this.months = months;
+        await this.render();
+      });
+    }
+    this.drawChart(contentEl.createDiv({ cls: "finance-ticker-chart" }), {
+      history,
+      trades,
+      currency,
+      averageCost: row && row.currency === currency ? row.averageCostNative : null,
+      dividends: model.cache.dividends?.[ticker] || [],
+      source: model.source,
+    });
+
+    if (row) {
+      const firstBought = row.parcels.map((parcel) => parcel.acquired).sort()[0] || "";
+      renderStatCards(contentEl, [
+        { label: "Units", value: String(Number(row.units.toFixed(4))) },
+        { label: "Value", value: row.valueAud === null ? "—" : core.formatCurrency(row.valueAud, "AUD") },
+        { label: "Average cost", value: core.formatCurrencyWithCode(row.averageCostNative, row.currency) },
+        {
+          label: "Gain",
+          value: row.gainAud === null ? "—" : core.formatCurrency(row.gainAud, "AUD"),
+          hint: row.gainPct === null ? "" : `${row.gainPct > 0 ? "+" : ""}${row.gainPct}%`,
+          cls: row.gainAud < 0 ? "is-over" : "",
+        },
+        ...(firstBought ? [{ label: "Held since", value: firstBought }] : []),
+      ]);
+      const parcels = contentEl.createDiv({ cls: "finance-tracker-chart-card" });
+      parcels.createEl("h4", { text: "Parcels" });
+      for (const parcel of row.parcels) {
+        parcels.createDiv({
+          cls: "finance-tracker-budget-meta",
+          text: `${parcel.acquired} · ${Number(parcel.units.toFixed(4))} units · cost ${core.formatCurrency(parcel.costAud, "AUD")}${
+            parcel.discountEligible ? " · held 12 months+" : ""
+          }`,
+        });
+      }
+      if (row.realisedAud) parcels.createDiv({ cls: "finance-tracker-budget-meta", text: `Realised so far: ${core.formatCurrency(row.realisedAud, "AUD")}` });
+      if (row.accounts.length) parcels.createDiv({ cls: "finance-tracker-budget-meta", text: `Held with ${row.accounts.join(", ")}` });
+    } else {
+      contentEl.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: watching ? "On your watchlist. You don't hold any." : "You don't hold any, and it isn't on your watchlist.",
+      });
+    }
+
+    const paid = (model.cache.dividends?.[ticker] || []).slice(-4).reverse();
+    if (paid.length) {
+      const section = contentEl.createDiv({ cls: "finance-tracker-chart-card" });
+      section.createEl("h4", { text: "Recent dividends" });
+      for (const dividend of paid) {
+        section.createDiv({ cls: "finance-tracker-budget-meta", text: `ex ${dividend.date} · ${core.formatCurrencyWithCode(dividend.amount, currency)} a unit` });
+      }
+    }
+
+    const actions = contentEl.createDiv({ cls: "finance-tracker-settings-actions" });
+    addAction(actions, "Log trade", () => {
+      this.close();
+      plugin.openLogTrade({ ticker, onSaved: this.onChanged });
+    }, { primary: true, opensModal: true });
+    if (!row) {
+      addAction(actions, watching ? "Remove from watchlist" : "Add to watchlist", async () => {
+        if (watching) await plugin.removeFromWatchlist(ticker);
+        else await plugin.addToWatchlist(ticker);
+        if (typeof this.onChanged === "function") await this.onChanged();
+        await this.render();
+      }, { errorPrefix: "Watchlist" });
+    }
+    const link = actions.createEl("a", {
+      cls: "finance-ticker-link external-link",
+      text: "Open on Yahoo Finance",
+      attr: { href: core.yahooQuoteUrl(ticker), target: "_blank", rel: "noopener" },
+    });
+    link.setAttribute("aria-label", `${ticker} on Yahoo Finance, in your browser`);
+
+    contentEl.createDiv({
+      cls: "finance-tracker-budget-meta finance-portfolio-disclaimer",
+      text: "Arithmetic on your own records and published prices, not financial or tax advice.",
+    });
+  }
+
+  drawChart(host, options) {
+    const points = core.sliceHistory(options.history, this.months);
+    if (points.length < 2) {
+      host.createDiv({
+        cls: "finance-tracker-empty",
+        text: options.source === "yahoo"
+          ? "No price history yet. It arrives with the next price refresh."
+          : "The chart needs past prices, which come from Yahoo. Typed prices and a sheet only give today's.",
+      });
+      return;
+    }
+    const W = 640;
+    const H = 220;
+    const pad = 12;
+    const closes = points.map((point) => point.close);
+    const levels = [...closes];
+    if (options.averageCost > 0) levels.push(options.averageCost);
+    const min = Math.min(...levels);
+    const max = Math.max(...levels);
+    const span = max - min || 1;
+    const x = (index) => pad + (index * (W - pad * 2)) / (points.length - 1);
+    const y = (value) => H - pad - ((value - min) / span) * (H - pad * 2);
+    const indexFor = (date) => {
+      const found = points.findIndex((point) => point.date >= date);
+      return found === -1 ? points.length - 1 : found;
+    };
+
+    const svg = host.createSvg("svg", {
+      cls: ["finance-ticker-svg"],
+      attr: { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "none", role: "img", "aria-label": `Price over ${this.months} months` },
+    });
+    if (options.averageCost > 0) {
+      const level = y(options.averageCost).toFixed(1);
+      svg.createSvg("line", { cls: ["finance-ticker-cost-line"], attr: { x1: pad, x2: W - pad, y1: level, y2: level } });
+    }
+    const rising = closes[closes.length - 1] >= closes[0];
+    svg.createSvg("polyline", {
+      cls: ["finance-ticker-line", rising ? "is-up" : "is-down"],
+      attr: { points: points.map((point, index) => `${x(index).toFixed(1)},${y(point.close).toFixed(1)}`).join(" ") },
+    });
+
+    const first = points[0].date;
+    for (const dividend of options.dividends || []) {
+      if (dividend.date < first || dividend.date > points[points.length - 1].date) continue;
+      const cx = x(indexFor(dividend.date)).toFixed(1);
+      const tick = svg.createSvg("line", { cls: ["finance-ticker-dividend"], attr: { x1: cx, x2: cx, y1: H - pad, y2: H - pad + 6, "data-kind": "dividend" } });
+      tick.createSvg("title").textContent = `Ex-dividend ${dividend.date}: ${core.formatCurrencyWithCode(dividend.amount, options.currency)} a unit`;
+    }
+    const verbs = { buy: "Bought", sell: "Sold", drp: "Reinvested", split: "Split" };
+    for (const trade of options.trades || []) {
+      if (trade.date < first) continue;
+      const index = indexFor(trade.date);
+      const level = trade.price > 0 && trade.currency === options.currency ? trade.price : points[index].close;
+      const marker = svg.createSvg("circle", {
+        cls: ["finance-ticker-trade", `is-${trade.type}`],
+        attr: { cx: x(index).toFixed(1), cy: y(level).toFixed(1), r: 5, "data-kind": trade.type },
+      });
+      marker.createSvg("title").textContent = `${verbs[trade.type] || trade.type} ${trade.units}${
+        trade.price > 0 ? ` at ${core.formatCurrencyWithCode(trade.price, trade.currency)}` : ""
+      } on ${trade.date}`;
+    }
+
+    const axis = host.createDiv({ cls: "finance-tracker-line-axis" });
+    axis.createSpan({ text: `${first} · ${core.formatCurrencyWithCode(points[0].close, options.currency)}` });
+    axis.createSpan({
+      text: `${points[points.length - 1].date} · ${core.formatCurrencyWithCode(points[points.length - 1].close, options.currency)}`,
+    });
+    const legend = host.createDiv({ cls: "finance-tracker-budget-meta finance-ticker-legend" });
+    const bits = [];
+    if (options.averageCost > 0) bits.push(`dashed line: your average cost, ${core.formatCurrencyWithCode(options.averageCost, options.currency)}`);
+    if ((options.trades || []).some((trade) => trade.date >= first)) bits.push("dots: your trades");
+    if ((options.dividends || []).some((dividend) => dividend.date >= first)) bits.push("ticks: ex-dividend dates");
+    if (bits.length) legend.setText(`${bits.join(" · ")}.`);
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+class AddToWatchlistModal extends Modal {
+  constructor(app, plugin, options = {}) {
+    super(app);
+    this.plugin = plugin;
+    this.onSaved = options.onSaved;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("finance-edit");
+    contentEl.createEl("h3", { text: "Add to watchlist" });
+    contentEl.createEl("p", {
+      cls: "finance-edit-hint",
+      text: "Follow a share or ETF without owning it. It's saved in the portfolio note's watchlist property.",
+    });
+    const row = contentEl.createDiv({ cls: "finance-edit-row" });
+    row.createEl("label", { text: "Ticker" });
+    const input = row.createEl("input", { type: "text", attr: { placeholder: "VGS.AX or MSFT", "aria-label": "Ticker" } });
+    const found = new Map();
+    let pending = "";
+    this.suggest = new FinanceSuggest(input, {
+      scope: this.scope,
+      getItems: (query) => {
+        const key = String(query || "").trim().toLowerCase();
+        if (key.length >= 2 && !found.has(key) && pending !== key) {
+          pending = key;
+          this.plugin
+            .searchTickers(query)
+            .then((results) => {
+              found.set(key, results);
+              if (String(input.value || "").trim().toLowerCase() === key) this.suggest.refresh();
+            })
+            .catch(() => found.set(key, []));
+        }
+        return (found.get(key) || []).slice(0, 8).map((result) => ({ value: result.symbol, label: result.symbol, kind: result.exchange || "", hint: result.name || "" }));
+      },
+    });
+    contentEl.createEl("p", { cls: "finance-edit-hint", text: "ASX tickers end in .AX; US tickers are written plain." });
+
+    const buttons = contentEl.createDiv({ cls: "finance-edit-buttons" });
+    const save = buttons.createEl("button", { text: "Add", cls: "mod-cta" });
+    save.addEventListener("click", async () => {
+      save.disabled = true;
+      try {
+        const ticker = core.normalizeTicker(input.value);
+        const added = await this.plugin.addToWatchlist(ticker);
+        new Notice(added ? `${ticker} is on your watchlist.` : `${ticker} was already on your watchlist.`);
+        this.close();
+        if (typeof this.onSaved === "function") await this.onSaved();
+      } catch (error) {
+        new Notice(`Couldn't add it: ${error.message}`);
+        save.disabled = false;
+      }
+    });
+    window.setTimeout(() => input.focus(), 0);
+  }
+
+  onClose() {
+    this.suggest?.destroy();
+    this.contentEl.empty();
+  }
+}
+
+class LogDividendModal extends Modal {
+  constructor(app, plugin, item, options = {}) {
+    super(app);
+    this.plugin = plugin;
+    this.item = item;
+    this.onSaved = options.onSaved;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    const item = this.item;
+    contentEl.empty();
+    contentEl.addClass("finance-edit");
+    contentEl.createEl("h3", { text: `Log a dividend: ${item.ticker}` });
+    contentEl.createEl("p", {
+      cls: "finance-edit-hint",
+      text: `Ex-date ${item.exDate}: ${item.units} units × ${core.formatCurrencyWithCode(item.perUnit, item.currency)} = ${core.formatCurrencyWithCode(
+        item.amountNative,
+        item.currency
+      )}. Change the amount to what was actually paid in, in ${this.plugin.settings.defaultCurrency}.`,
+    });
+    const amountRow = contentEl.createDiv({ cls: "finance-edit-row" });
+    amountRow.createEl("label", { text: "Amount" });
+    const amount = amountRow.createEl("input", { type: "number", attr: { step: "0.01", inputmode: "decimal", "aria-label": "Amount" } });
+    amount.value = item.amountAud === null ? "" : String(item.amountAud);
+    const dateRow = contentEl.createDiv({ cls: "finance-edit-row" });
+    dateRow.createEl("label", { text: "Paid on" });
+    const date = dateRow.createEl("input", { type: "date", attr: { "aria-label": "Paid on" } });
+    date.value = item.suggestedDate;
+    contentEl.createEl("p", {
+      cls: "finance-edit-hint",
+      text: "It's logged in that day's note as dividend income. If it was reinvested, log the new units as a dividend reinvestment trade too.",
+    });
+
+    const buttons = contentEl.createDiv({ cls: "finance-edit-buttons" });
+    const save = buttons.createEl("button", { text: "Log dividend", cls: "mod-cta" });
+    save.addEventListener("click", async () => {
+      save.disabled = true;
+      try {
+        await this.plugin.logDividend(item, core.parseNumber(amount.value), date.value);
+        new Notice(`Logged the ${item.ticker} dividend.`);
+        this.close();
+        if (typeof this.onSaved === "function") await this.onSaved();
+      } catch (error) {
+        new Notice(`Couldn't log it: ${error.message}`);
+        save.disabled = false;
+      }
+    });
+    window.setTimeout(() => amount.focus(), 0);
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
 class HolidayBudgetModal extends Modal {
   constructor(app, plugin, onComplete) {
     super(app);
@@ -19461,7 +20252,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
         dropdown
           .addOption("manual", "Typed in the portfolio note")
           .addOption("sheet", "A published Google Sheet")
-          .addOption("yahoo", "Yahoo Finance (unofficial)")
+          .addOption("yahoo", "Yahoo Finance (unofficial, with charts and dividends)")
           .setValue(this.plugin.settings.priceSource || "manual")
           .onChange(async (value) => {
             this.plugin.settings.priceSource = value;
@@ -19494,7 +20285,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
       this.plugin
         .loadPortfolio()
         .then((portfolio) => {
-          const tickers = Array.from(new Set(portfolio.trades.map((trade) => trade.ticker)));
+          const tickers = Array.from(new Set([...portfolio.trades.map((trade) => trade.ticker), ...(portfolio.watchlist || [])]));
           const currencies = Array.from(new Set(portfolio.trades.map((trade) => trade.currency)));
           template.value = core.buildPriceSheetTemplate(tickers.length ? tickers : ["VAS.AX", "AAPL"], currencies.length ? currencies : ["USD"]);
         })
@@ -19503,7 +20294,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
     if (source === "yahoo") {
       containerEl.createEl("p", {
         cls: "finance-tracker-settings-section-copy",
-        text: "Yahoo's price feed is free but unofficial: it can refuse requests or change without notice. When it refuses, the plugin backs off and keeps showing the last prices it fetched, marked as old.",
+        text: "Yahoo's price feed is free but unofficial. It only answers requests that look like a web browser's, so the plugin's requests say they are one; Yahoo could change that at any time. When it refuses, the plugin tries its second server, then backs off and keeps showing the last prices it fetched, marked as old. Yahoo also gives price history (for the charts) and dividend history (for Dividends to log), which a sheet doesn't.",
       });
     }
     if (source !== "manual") {

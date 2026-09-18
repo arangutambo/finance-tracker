@@ -1660,13 +1660,13 @@ test("a source that refuses is backed off, and cached prices are still shown", a
 
   const first = await plugin.refreshPrices({ force: true });
   assert.equal(first.refused, true);
-  assert.equal(requests, 1, "it stops at the first refusal instead of trying every ticker");
+  assert.equal(requests, 2, "both hosts, for the first ticker only — not every ticker");
   assert.ok(Date.parse(plugin.settings.marketCache.backoffUntil) > Date.now());
 
   // Even a forced refresh waits out the backoff.
   const second = await plugin.refreshPrices({ force: true });
   assert.equal(second.skipped, "backoff");
-  assert.equal(requests, 1);
+  assert.equal(requests, 2);
 
   const model = await plugin.buildPortfolioModel("2026-09-17");
   const vas = model.value.rows.find((row) => row.ticker === "VAS.AX");
@@ -2215,4 +2215,175 @@ test("an archived goal's dashboard stops asking for a weekly set-aside", async (
   const el = new StubEl();
   await plugin.renderSavingsDashboard("", el, { sourcePath: "Utility/Budgets/Archive/iPhone.md" });
   assert.doesNotMatch(el.allText(), /Set aside \/ week|Behind pace|Nothing saved yet/);
+});
+
+
+// --- Stocks: Yahoo, watchlist, holding pages, dividends to log ------------------------------
+
+test("Yahoo requests look like a browser and fall back to the second host", async () => {
+  const { plugin } = await vaultWithPortfolio({ priceSource: "yahoo" });
+  const seen = [];
+  requestUrlHandler = async (options) => {
+    const url = decodeURIComponent(options.url);
+    seen.push({ url, agent: options.headers?.["User-Agent"] || "" });
+    if (url.startsWith("https://query1.")) return { status: 429, json: null, text: "Too Many Requests" };
+    if (url.includes("VAS.AX")) return { status: 200, json: chartFor("VAS.AX", 109.61, 109.2) };
+    if (url.includes("AAPL")) return { status: 200, json: chartFor("AAPL", 337, 335, "USD") };
+    if (url.includes("AUDUSD=X")) return { status: 200, json: chartFor("AUDUSD=X", 0.71, 0.7, "USD") };
+    return { status: 404, json: null };
+  };
+
+  const result = await plugin.refreshPrices({ force: true });
+
+  assert.equal(result.updated, 2);
+  assert.ok(!result.refused, "one host refusing is not a refusal");
+  assert.ok(seen.every((request) => /^Mozilla\/5\.0/.test(request.agent)), "every request carries the browser header");
+  assert.ok(seen.some((request) => request.url.startsWith("https://query2.finance.yahoo.com/v8/finance/chart/VAS.AX")));
+  assert.equal(plugin.settings.marketCache.quotes["VAS.AX"].price, 109.61);
+});
+
+test("a watchlist ticker is added to the note, priced, and shown without owning it", async () => {
+  const { plugin, files } = await vaultWithPortfolio({ priceSource: "yahoo" });
+  requestUrlHandler = async (options) => {
+    const url = decodeURIComponent(options.url);
+    if (url.includes("VGS.AX")) return { status: 200, json: chartFor("VGS.AX", 159.59, 158) };
+    if (url.includes("VAS.AX")) return { status: 200, json: chartFor("VAS.AX", 109.61, 109.2) };
+    if (url.includes("AAPL")) return { status: 200, json: chartFor("AAPL", 337, 335, "USD") };
+    if (url.includes("AUDUSD=X")) return { status: 200, json: chartFor("AUDUSD=X", 0.71, 0.7, "USD") };
+    return { status: 404, json: null };
+  };
+
+  assert.equal(await plugin.addToWatchlist("vgs.ax"), true);
+  assert.equal(await plugin.addToWatchlist("VGS.AX"), false, "already there");
+  const note = files.get("Utility/Finance/📈 Portfolio.md").content;
+  assert.match(note, /^watchlist: \[VGS\.AX\]$/m);
+  assert.equal(plugin.settings.marketCache.quotes["VGS.AX"].price, 159.59, "fetched straight away");
+
+  const el = new StubEl();
+  await plugin.renderPortfolioBlock("refresh: no", el, { sourcePath: "Utility/Finance/📈 Portfolio.md" });
+  const text = el.allText();
+  assert.match(text, /Watchlist/);
+  assert.match(text, /VGS\.AX/);
+  assert.match(text, /A\$159\.59|\$159\.59/);
+
+  assert.equal(await plugin.removeFromWatchlist("VGS.AX"), true);
+  assert.match(files.get("Utility/Finance/📈 Portfolio.md").content, /^watchlist: $/m);
+});
+
+test("a watchlist written as a block list is replaced cleanly", async () => {
+  const note = PORTFOLIO_NOTE.replace("fx_rates: ", "fx_rates: USD=1.5\nwatchlist:\n  - VGS.AX\n  - NDQ.AX");
+  const { plugin, app, files } = await vaultWithPortfolio({ priceSource: "manual" }, note);
+  // Obsidian's cache reads the block list; the fallback parser can't.
+  app.metadataCache.getFileCache = (file) => (file.path.endsWith("Portfolio.md") ? { frontmatter: { watchlist: ["VGS.AX", "NDQ.AX"] } } : null);
+
+  await plugin.addToWatchlist("MSFT");
+
+  const content = files.get("Utility/Finance/📈 Portfolio.md").content;
+  assert.match(content, /^watchlist: \[VGS\.AX, NDQ\.AX, MSFT\]$/m);
+  assert.doesNotMatch(content, /^\s+- (VGS|NDQ)/m, "no orphaned list lines");
+  assert.match(content, /^fx_rates: USD=1\.5$/m, "the neighbours are untouched");
+});
+
+function cachedMarket(overrides = {}) {
+  const history = [];
+  for (let day = 0; day < 200; day += 1) {
+    const date = new Date(Date.UTC(2026, 2, 1 + day)).toISOString().slice(0, 10);
+    history.push({ date, close: Number((95 + day * 0.07).toFixed(2)) });
+  }
+  return {
+    lastRefresh: new Date().toISOString(),
+    quotes: {
+      "VAS.AX": { price: 109.61, previousClose: 108.5, currency: "AUD", name: "Vanguard Australian Shares", exchange: "ASX", source: "yahoo", fetchedAt: new Date().toISOString() },
+      AAPL: { price: 337, previousClose: 340, currency: "USD", name: "Apple", source: "yahoo", fetchedAt: new Date().toISOString() },
+      "VGS.AX": { price: 159.59, previousClose: 158, currency: "AUD", name: "Vanguard International Shares", source: "yahoo", fetchedAt: new Date().toISOString() },
+    },
+    history: { "VAS.AX": history, "VGS.AX": history },
+    dividends: { "VAS.AX": [{ date: "2026-07-01", amount: 0.52 }] },
+    fx: { USD: 1.5 },
+    fxHistory: {},
+    ...overrides,
+  };
+}
+
+test("a holding's page draws its price, your trades and your average cost, and links to Yahoo", async () => {
+  const { plugin } = await vaultWithPortfolio({ priceSource: "yahoo", marketCache: cachedMarket() });
+  let requests = 0;
+  requestUrlHandler = async () => {
+    requests += 1;
+    return { status: 500 };
+  };
+
+  const modal = plugin.openTickerDetail("VAS.AX");
+  await modal.ready;
+  const text = modal.contentEl.allText();
+
+  assert.equal(requests, 0, "opening a holding never fetches");
+  assert.match(text, /Vanguard Australian Shares/);
+  assert.match(text, /\+.*\(\+1\.02%\) today/);
+  assert.ok(modal.contentEl.find((node) => node.classList.has("finance-ticker-cost-line")), "average cost line");
+  const tradeDots = () => modal.contentEl.findAll((node) => node.classList.has("finance-ticker-trade")).length;
+  assert.equal(tradeDots(), 0, "the 2 March buy is just outside the default six months");
+  assert.ok(modal.contentEl.find((node) => node.attrs["data-kind"] === "dividend"), "the July ex-date is marked");
+  const link = modal.contentEl.find((node) => node.tag === "a");
+  assert.equal(link.attrs.href, "https://finance.yahoo.com/quote/VAS.AX");
+  assert.match(text, /Parcels/);
+  assert.doesNotMatch(text, /watchlist/i, "a held ticker isn't offered for the watchlist");
+
+  await modal.contentEl.click("1Y");
+  assert.equal(tradeDots(), 1, "a year back, the buy is marked");
+
+  const watched = plugin.openTickerDetail("VGS.AX");
+  await watched.ready;
+  assert.ok(watched.contentEl.button("Add to watchlist"));
+  assert.match(watched.contentEl.allText(), /You don't hold any/);
+});
+
+test("dividends you were paid and haven't logged can be logged or dismissed", async () => {
+  const { plugin, files } = await vaultWithPortfolio({ priceSource: "yahoo", marketCache: cachedMarket(), dismissedDividends: [] });
+
+  const el = new StubEl();
+  await plugin.renderPortfolioBlock("refresh: no", el, { sourcePath: "Utility/Finance/📈 Portfolio.md" });
+  assert.match(el.allText(), /Dividends to log \(1\)/);
+  assert.match(el.allText(), /VAS\.AX · ex 2026-07-01 \| \$5\.20/, "10 units held before the ex-date × $0.52");
+
+  const modal = plugin.openLogDividend((await plugin.buildPortfolioModel()).dividendsToLog[0]);
+  await modal.ready;
+  const amount = modal.contentEl.find((node) => node.attrs["aria-label"] === "Amount");
+  assert.equal(amount.value, "5.2");
+  amount.value = "5.31";
+  await modal.contentEl.click("Log dividend");
+  const note = files.get("Daily/2026-07-15.md").content;
+  assert.match(note, /- \$5\.31 #log\/income\/dividend\/vas-ax/);
+  assert.match(note, /VAS\.AX dividend, ex 2026-07-01 \(10 units × \$0\.52 AUD\)/);
+
+  delete plugin.invalidateIndexEntry;
+  plugin._allTransactions = null;
+  assert.equal((await plugin.buildPortfolioModel()).dividendsToLog.length, 0, "logged, so no longer listed");
+
+  plugin.settings.marketCache.dividends["VAS.AX"].push({ date: "2026-09-01", amount: 0.4 });
+  await plugin.dismissDividend("VAS.AX:2026-09-01");
+  assert.equal((await plugin.buildPortfolioModel()).dividendsToLog.length, 0, "dismissed");
+});
+
+test("the hub's Today tab shows the day's move in your shares, and the inbox lists dividends", async () => {
+  const { plugin, app } = await vaultWithPortfolio({ priceSource: "yahoo", marketCache: cachedMarket(), dismissedDividends: [], ...billSettings() });
+  const view = plugin.createHubView({ app });
+  await view.onOpen();
+  const text = view.contentEl.allText();
+  assert.match(text, /Shares today/);
+  assert.match(text, /Biggest move: VAS\.AX \+1\.02%/);
+  assert.match(text, /1 dividend to log/);
+
+  await view.contentEl.click("Inbox");
+  assert.match(view.contentEl.allText(), /Dividends to log \(1\)/);
+  const badge = view.contentEl.find((node) => node.classList.has("finance-hub-badge"));
+  assert.ok(Number(badge.text) >= 1);
+});
+
+test("Log trade from a holding's page starts with its ticker", async () => {
+  const { plugin } = await vaultWithPortfolio({ priceSource: "manual" });
+  const modal = plugin.openLogTrade({ ticker: "AAPL" });
+  await modal.ready;
+  assert.equal(modal.contentEl.find((node) => node.attrs["aria-label"] === "Ticker").value, "AAPL");
+  assert.equal(modal.contentEl.find((node) => node.attrs["aria-label"] === "Currency").value, "USD");
 });

@@ -10,7 +10,9 @@ class StubEl {
     const config = typeof options === "string" ? { cls: options } : options || {};
     this.tag = tag;
     this.children = [];
-    this.classList = new Set(String(config.cls || "").split(/\s+/).filter(Boolean));
+    // Obsidian takes cls as a string or an array (createSvg is usually given one).
+    const classes = Array.isArray(config.cls) ? config.cls : String(config.cls || "").split(/\s+/);
+    this.classList = new Set(classes.filter(Boolean));
     this.text = String(config.text ?? "");
     this.attrs = { ...(config.attr || {}) };
     if (config.type) this.attrs.type = config.type;

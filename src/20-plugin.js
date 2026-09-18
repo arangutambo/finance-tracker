@@ -4821,6 +4821,10 @@ class FinanceTrackerPlugin extends Plugin {
     // Goals and trips that need a decision today: due, done, starting, over.
     await this.renderGoalPrompts(wrapper, { referenceDate });
 
+    // In the hub, the day's move in your shares. The sidebar leaves it out: it
+    // re-renders often, and prices are the hub's business.
+    if (options.inHub) await this.renderMarketToday(wrapper);
+
     // Mini pie chart (sidebar-friendly: SVG centred + compact legend below)
     const hierarchy = core.buildHierarchicalCategoryGroups(spendEntries, "primary");
     if (hierarchy.slices.length) {

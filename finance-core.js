@@ -5614,6 +5614,126 @@ function isoFromUnixSeconds(seconds) {
 }
 
 // query1.finance.yahoo.com/v8/finance/chart/<SYMBOL>?range=…&interval=1d&events=div
+// --- Yahoo Finance requests ------------------------------------------------------
+// Yahoo's price feed is free but unofficial, and it refuses requests that don't
+// look like they come from a browser: without this header every request from
+// the author's Mac got 429, with it they all succeeded. Two hosts serve the same
+// data, so a refusal from one is tried on the other before backing off.
+const YAHOO_HOSTS = ["query1.finance.yahoo.com", "query2.finance.yahoo.com"];
+const YAHOO_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+const YAHOO_TIMEOUT_MS = 8000;
+
+function yahooChartPath(symbol, range = "2y") {
+  return `/v8/finance/chart/${encodeURIComponent(normalizeTicker(symbol))}?range=${range}&interval=1d&events=div`;
+}
+
+function yahooSearchPath(query) {
+  return `/v1/finance/search?q=${encodeURIComponent(String(query || "").trim())}&quotesCount=8&newsCount=0`;
+}
+
+// Currencies Yahoo quotes in a minor unit. The case matters: "GBp" is pence,
+// "GBP" is pounds.
+const YAHOO_MINOR_UNITS = { GBp: ["GBP", 100], GBX: ["GBP", 100], ZAc: ["ZAR", 100], ILA: ["ILS", 100] };
+
+function yahooCurrency(raw) {
+  const code = String(raw || "").trim();
+  const minor = YAHOO_MINOR_UNITS[code];
+  if (minor) return { currency: minor[0], divisor: minor[1] };
+  return { currency: normalizeCurrency(code, ""), divisor: 1 };
+}
+
+function yahooQuoteUrl(ticker) {
+  return `https://finance.yahoo.com/quote/${encodeURIComponent(normalizeTicker(ticker))}`;
+}
+
+// --- Watchlist, holding charts, dividends to log ------------------------------------
+
+// The portfolio note's `watchlist:` property, as a list or a comma-separated line.
+function parseWatchlist(value) {
+  const raw = Array.isArray(value) ? value.join(",") : String(value || "").replace(/^\[|\]$/g, "");
+  const seen = new Set();
+  const tickers = [];
+  for (const piece of raw.split(/[,\s]+/)) {
+    const ticker = normalizeTicker(piece.replace(/^["']|["']$/g, ""));
+    if (!ticker || !/^[A-Z0-9^][A-Z0-9.\-=^]*$/.test(ticker) || seen.has(ticker)) continue;
+    seen.add(ticker);
+    tickers.push(ticker);
+  }
+  return tickers;
+}
+
+// "VAS.AX" → #log/income/dividend/vas-ax
+function dividendTag(ticker) {
+  const slug = normalizeTicker(ticker).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  return `#log/income/dividend/${slug}`;
+}
+
+// Closes within the last `months` of `referenceDate` (all of them for 0).
+function sliceHistory(history, months, referenceDate = todayIsoLocal()) {
+  const points = (history || []).filter((point) => point && point.close > 0 && point.date <= referenceDate);
+  if (!(months > 0)) return points;
+  const cutoff = addMonths(referenceDate, -months);
+  return points.filter((point) => point.date >= cutoff);
+}
+
+function priceChangeOver(history, months, referenceDate = todayIsoLocal()) {
+  const points = sliceHistory(history, months, referenceDate);
+  if (points.length < 2) return null;
+  const from = points[0].close;
+  const to = points[points.length - 1].close;
+  return { from, to, change: Number((to - from).toFixed(4)), pct: from > 0 ? Number((((to - from) / from) * 100).toFixed(2)) : null };
+}
+
+// Dividends Yahoo says a holding paid, that you held units for, and that have
+// no dividend (or reinvestment) logged near them. Units are those held at the
+// close before the ex-date — buying on the ex-date doesn't earn that dividend.
+// The amount is an estimate: withholding, franking and rounding all move it.
+function findUnloggedDividends(options = {}) {
+  const referenceDate = parseIsoDate(options.referenceDate) || todayIsoLocal();
+  const since = addMonths(referenceDate, -(Number(options.lookbackMonths) || 12));
+  const trades = (options.trades || []).slice().sort((left, right) => String(left.date).localeCompare(String(right.date)));
+  const dismissed = new Set(options.dismissed || []);
+  const fx = options.fx || {};
+  const currencies = options.currencies || {};
+  const logged = (options.entries || []).filter(
+    (entry) => entry?.entryType === "income" && normalizeCategoryPath(entry.category || "").startsWith("dividend/")
+  );
+  const out = [];
+  for (const [ticker, events] of Object.entries(options.dividendEvents || {})) {
+    const key = tickerKey(ticker);
+    for (const event of events || []) {
+      const exDate = parseIsoDate(event.date);
+      if (!exDate || exDate > referenceDate || exDate < since || !(event.amount > 0)) continue;
+      const id = `${ticker}:${exDate}`;
+      if (dismissed.has(id)) continue;
+      const units = unitsHeldOn(trades, addDays(exDate, -1)).get(ticker) || 0;
+      if (!(units > 1e-9)) continue;
+      const windowEnd = addDays(exDate, 75);
+      const windowStart = addDays(exDate, -7);
+      const alreadyLogged =
+        logged.some((entry) => tickerKey(entry.category.slice("dividend/".length)) === key && entry.date >= windowStart && entry.date <= windowEnd) ||
+        trades.some((trade) => trade.ticker === ticker && trade.type === "drp" && trade.date >= exDate && trade.date <= windowEnd);
+      if (alreadyLogged) continue;
+      const tradeCurrency = trades.find((trade) => trade.ticker === ticker)?.currency || "AUD";
+      const currency = normalizeCurrency(currencies[ticker] || tradeCurrency);
+      const rate = currency === "AUD" ? 1 : Number(fx[currency]) || null;
+      const native = roundCurrencyAmount(units * event.amount);
+      out.push({
+        id,
+        ticker,
+        exDate,
+        perUnit: event.amount,
+        units: Number(units.toFixed(4)),
+        currency,
+        amountNative: native,
+        amountAud: rate ? roundCurrencyAmount(native * rate) : null,
+        suggestedDate: addDays(exDate, 14) < referenceDate ? addDays(exDate, 14) : referenceDate,
+      });
+    }
+  }
+  return out.sort((left, right) => right.exDate.localeCompare(left.exDate) || left.ticker.localeCompare(right.ticker));
+}
+
 function parseYahooChart(json) {
   const result = json?.chart?.result?.[0];
   if (!result) {
@@ -5621,26 +5741,31 @@ function parseYahooChart(json) {
     return { error: message };
   }
   const meta = result.meta || {};
+  // London quotes in pence ("GBp"), Johannesburg in cents: converted to the major
+  // unit here, so every figure downstream is in pounds and rand.
+  const { currency, divisor } = yahooCurrency(meta.currency);
+  const major = (value) => Number((Number(value) / divisor).toFixed(4));
   const timestamps = result.timestamp || [];
   const closes = result.indicators?.quote?.[0]?.close || [];
   const history = [];
   timestamps.forEach((seconds, index) => {
     const close = Number(closes[index]);
-    if (close > 0) history.push({ date: isoFromUnixSeconds(seconds), close: Number(close.toFixed(4)) });
+    if (close > 0) history.push({ date: isoFromUnixSeconds(seconds), close: major(close) });
   });
   const dividends = Object.values(result.events?.dividends || {})
-    .map((dividend) => ({ date: isoFromUnixSeconds(dividend.date), amount: Number(dividend.amount) }))
+    .map((dividend) => ({ date: isoFromUnixSeconds(dividend.date), amount: major(dividend.amount) }))
     .filter((dividend) => dividend.date && dividend.amount > 0)
     .sort((left, right) => left.date.localeCompare(right.date));
 
-  const price = Number(meta.regularMarketPrice);
+  const price = major(meta.regularMarketPrice);
+  const previousClose = major(meta.chartPreviousClose ?? meta.previousClose);
   return {
     quote: price > 0
       ? {
-          currency: normalizeCurrency(meta.currency || "", ""),
+          currency,
           exchange: meta.exchangeName || meta.fullExchangeName || "",
           name: meta.longName || meta.shortName || meta.symbol || "",
-          previousClose: Number(meta.chartPreviousClose ?? meta.previousClose) || null,
+          previousClose: previousClose > 0 ? previousClose : null,
           price,
           time: isoFromUnixSeconds(meta.regularMarketTime),
           type: meta.instrumentType || "",
@@ -5781,6 +5906,18 @@ module.exports = {
   tickerKey,
   tickerMarket,
   parseTradesTable,
+  YAHOO_HOSTS,
+  YAHOO_USER_AGENT,
+  YAHOO_TIMEOUT_MS,
+  yahooChartPath,
+  yahooSearchPath,
+  yahooCurrency,
+  yahooQuoteUrl,
+  parseWatchlist,
+  dividendTag,
+  sliceHistory,
+  priceChangeOver,
+  findUnloggedDividends,
   parsePriceOverrides,
   heldTwelveMonths,
   buildHoldings,

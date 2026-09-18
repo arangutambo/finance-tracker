@@ -21,6 +21,8 @@ Object.assign(FinanceTrackerPlugin.prototype, {
       "price_overrides: ",
       "# AUD per unit of a foreign currency, e.g. USD=1.51",
       "fx_rates: ",
+      "# Tickers to follow without owning them, e.g. [VGS.AX, NDQ.AX]",
+      "watchlist: ",
       "---",
       "",
       "# 📈 Portfolio",
@@ -36,7 +38,8 @@ Object.assign(FinanceTrackerPlugin.prototype, {
       "Type is buy, sell, drp (dividend reinvestment) or split. For a split, Units is",
       "the ratio: 2 for a 2-for-1, 0.5 for a 1-for-2 consolidation. For a trade in",
       "another currency, AUD cost is what actually left your account, fees included.",
-      "Log dividends in your daily notes as `#log/income/dividend/<ticker>`.",
+      "Dividends are logged in your daily notes as `#log/income/dividend/<ticker>`; with",
+      "prices from Yahoo, the portfolio lists the ones you were paid and haven't logged.",
       "",
       "| Date | Type | Ticker | Units | Price | Fees | Currency | AUD cost | Account | Note |",
       "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | --- | --- |",
@@ -52,9 +55,13 @@ Object.assign(FinanceTrackerPlugin.prototype, {
 
   async loadPortfolio() {
     const file = this.app.vault.getAbstractFileByPath(this.getPortfolioNotePath());
-    if (!(file instanceof TFile)) return { exists: false, trades: [], warnings: [], overrides: {}, fxOverrides: {} };
+    if (!(file instanceof TFile)) return { exists: false, trades: [], warnings: [], overrides: {}, fxOverrides: {}, watchlist: [] };
     const content = await this.app.vault.cachedRead(file);
     const frontmatter = parseFrontmatter(content);
+    // Obsidian's own frontmatter reader understands block lists; ours reads the
+    // one-line form, and covers the moment before the cache catches up.
+    const cached = this.app.metadataCache?.getFileCache?.(file)?.frontmatter;
+    const watchlistValue = cached && "watchlist" in cached ? cached.watchlist : frontmatter.watchlist;
     const { trades, warnings } = core.parseTradesTable(content);
     const fxOverrides = {};
     for (const [currency, rate] of Object.entries(core.parsePriceOverrides(frontmatter.fx_rates || ""))) {
@@ -68,6 +75,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
       warnings,
       overrides: core.parsePriceOverrides(frontmatter.price_overrides || ""),
       fxOverrides,
+      watchlist: core.parseWatchlist(watchlistValue || ""),
     };
   },
 
@@ -98,9 +106,39 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     return { ...this.marketCache().fx, ...(portfolio?.fxOverrides || {}) };
   },
 
-  async requestJson(url) {
-    const response = await requestUrl({ url, method: "GET", throw: false, headers: { Accept: "application/json" } });
-    return { status: response.status, json: response.json, text: response.text };
+  async requestJson(url, headers = {}) {
+    const response = await requestUrl({ url, method: "GET", throw: false, headers: { Accept: "application/json", ...headers } });
+    let json = null;
+    try {
+      json = response.json;
+    } catch (_error) {
+      // A refusal page is HTML, and reading it as JSON throws.
+    }
+    return { status: response.status, json, text: response.text };
+  },
+
+  // One Yahoo request: each host in turn, with a browser's User-Agent and a
+  // timeout. `refused` only when every host refused.
+  async yahooJson(path) {
+    let last = { status: 0, refused: true };
+    for (const host of core.YAHOO_HOSTS) {
+      let response;
+      try {
+        response = await Promise.race([
+          this.requestJson(`https://${host}${path}`, { "User-Agent": core.YAHOO_USER_AGENT }),
+          new Promise((_, reject) => window.setTimeout(() => reject(new Error("timed out")), this._yahooTimeoutMs ?? core.YAHOO_TIMEOUT_MS)),
+        ]);
+      } catch (error) {
+        last = { status: 0, refused: true, error: error.message };
+        continue;
+      }
+      if (response.status === 429 || response.status >= 500 || response.status === 0) {
+        last = { status: response.status, refused: true };
+        continue;
+      }
+      return response;
+    }
+    return last;
   },
 
   // Refreshes prices from the chosen source. Respects the refresh interval and
@@ -121,7 +159,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     }
 
     const portfolio = options.portfolio || (await this.loadPortfolio());
-    const tickers = Array.from(new Set(portfolio.trades.map((trade) => trade.ticker)));
+    const tickers = Array.from(new Set([...portfolio.trades.map((trade) => trade.ticker), ...(portfolio.watchlist || [])]));
     const currencies = Array.from(new Set(portfolio.trades.map((trade) => trade.currency).filter((currency) => currency !== "AUD")));
     if (!tickers.length) return { skipped: "no-trades" };
 
@@ -166,9 +204,9 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     const pause = () => new Promise((resolve) => setTimeout(resolve, this._yahooThrottleMs ?? YAHOO_THROTTLE_MS));
 
     const fetchChart = async (symbol) => {
-      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=2y&interval=1d&events=div`;
-      const response = await this.requestJson(url);
-      if (response.status === 429 || response.status >= 500) return { refused: true, status: response.status };
+      const response = await this.yahooJson(core.yahooChartPath(symbol));
+      if (response.refused) return { refused: true, status: response.status };
+      if (response.status === 404) return { error: `${symbol}: Yahoo doesn't know this ticker` };
       if (response.status >= 400) return { error: `${symbol}: ${response.status}` };
       return core.parseYahooChart(response.json);
     };
@@ -177,7 +215,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
       if (index) await pause();
       const chart = await fetchChart(ticker);
       if (chart.refused) {
-        return { updated, refused: true, error: `Yahoo refused requests (${chart.status}). Cached prices are shown until it recovers.` };
+        return { updated, refused: true, error: `Yahoo refused requests${chart.status ? ` (${chart.status})` : ""}. Cached prices are shown until it recovers.` };
       }
       if (chart.error || !chart.quote) {
         errors.push(chart.error || `${ticker}: no price`);
@@ -194,7 +232,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
       // AUDUSD=X is US dollars per Australian dollar; the portfolio wants the
       // reverse, AUD per unit of the foreign currency.
       const chart = await fetchChart(`AUD${currency}=X`);
-      if (chart.refused) return { updated, refused: true, error: `Yahoo refused requests (${chart.status}).` };
+      if (chart.refused) return { updated, refused: true, error: `Yahoo refused requests${chart.status ? ` (${chart.status})` : ""}.` };
       if (!chart.quote?.price) continue;
       cache.fx[currency] = Number((1 / chart.quote.price).toFixed(6));
       cache.fxHistory[currency] = chart.history.map((point) => ({ date: point.date, audPerUnit: Number((1 / point.close).toFixed(6)) }));
@@ -216,9 +254,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     const blocked = cache.backoffUntil && Date.parse(cache.backoffUntil) > Date.now();
     if (this.settings.priceSource !== "yahoo" || blocked || String(query || "").trim().length < 2) return own;
 
-    const response = await this.requestJson(
-      `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(String(query).trim())}&quotesCount=8&newsCount=0`
-    );
+    const response = await this.yahooJson(core.yahooSearchPath(query));
     if (response.status !== 200) return own;
     const found = core.parseYahooSearch(response.json).filter((result) => !own.some((item) => item.symbol === result.symbol));
     return [...own, ...found];
@@ -252,17 +288,96 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     for (const row of dividends.rows) for (const payment of row.payments) cashflows.push({ date: payment.date, amount: payment.amount });
     if (value.totals.valueAud > 0) cashflows.push({ date: referenceDate, amount: value.totals.valueAud });
 
+    // Tickers followed but not held: price, today, the last month.
+    const held = new Set(value.rows.map((row) => row.ticker));
+    const watchlist = (portfolio.watchlist || []).filter((ticker) => !held.has(ticker)).map((ticker) => {
+      const quote = quotes[ticker] || null;
+      const price = Number(quote?.price);
+      const previous = Number(quote?.previousClose);
+      const history = cache.history[ticker] || [];
+      return {
+        ticker,
+        name: quote?.name || "",
+        currency: quote?.currency || (core.tickerMarket(ticker) === "US" ? "USD" : "AUD"),
+        price: price > 0 ? price : null,
+        dayChangePct: price > 0 && previous > 0 ? Number((((price - previous) / previous) * 100).toFixed(2)) : null,
+        month: core.priceChangeOver(history, 1, referenceDate),
+        spark: core.sliceHistory(history, 1, referenceDate),
+        stale: Boolean(quote?.stale),
+      };
+    });
+
+    const currencies = Object.fromEntries(Object.entries(quotes).map(([ticker, quote]) => [ticker, quote?.currency || ""]));
+    const dividendsToLog = core.findUnloggedDividends({
+      trades: portfolio.trades,
+      dividendEvents: cache.dividends,
+      entries: await this.collectAllTransactions(),
+      fx,
+      currencies,
+      referenceDate,
+      dismissed: this.settings.dismissedDividends || [],
+    });
+
     return {
       cache,
       dividends,
+      dividendsToLog,
       holdings,
       portfolio,
       quotes,
       series,
       source: this.settings.priceSource || "manual",
       value,
+      watchlist,
       xirr: core.computeXirr(cashflows),
     };
+  },
+
+  async addToWatchlist(ticker) {
+    const symbol = core.normalizeTicker(ticker);
+    if (!symbol) throw new Error("type a ticker, like VGS.AX");
+    const file = await this.ensurePortfolioNote();
+    const portfolio = await this.loadPortfolio();
+    if ((portfolio.watchlist || []).includes(symbol)) return false;
+    const content = await this.app.vault.read(file);
+    await _ftModify(this.app, file, setFrontmatterList(content, "watchlist", [...portfolio.watchlist, symbol]));
+    // Fetched straight away, rather than waiting out the refresh interval.
+    if ((this.settings.priceSource || "manual") !== "manual") {
+      await this.refreshPrices({ force: true, portfolio: { ...portfolio, watchlist: [...portfolio.watchlist, symbol] } });
+    }
+    this.refreshDailyBudgetView();
+    return true;
+  },
+
+  async removeFromWatchlist(ticker) {
+    const symbol = core.normalizeTicker(ticker);
+    const file = this.app.vault.getAbstractFileByPath(this.getPortfolioNotePath());
+    if (!(file instanceof TFile)) return false;
+    const portfolio = await this.loadPortfolio();
+    if (!portfolio.watchlist.includes(symbol)) return false;
+    const content = await this.app.vault.read(file);
+    await _ftModify(this.app, file, setFrontmatterList(content, "watchlist", portfolio.watchlist.filter((item) => item !== symbol)));
+    this.refreshDailyBudgetView();
+    return true;
+  },
+
+  // Logs a dividend as income in the day's note, with where the figure came from.
+  async logDividend(item, amount, date) {
+    const value = core.roundCurrencyAmount(amount);
+    if (!(value > 0)) throw new Error("the amount must be more than zero");
+    const lines = [
+      `- ${core.formatCurrency(value, this.settings.defaultCurrency)} ${core.dividendTag(item.ticker)}`,
+      `\t- ${item.ticker} dividend, ex ${item.exDate} (${item.units} units × ${core.formatCurrencyWithCode(item.perUnit, item.currency)})`,
+    ];
+    const file = await this.appendFinanceLines(core.parseIsoDate(date) || core.todayIsoLocal(), lines);
+    this.refreshDailyBudgetView();
+    return file;
+  },
+
+  async dismissDividend(id) {
+    this.settings.dismissedDividends = Array.from(new Set([...(this.settings.dismissedDividends || []), id]));
+    await this.saveSettings();
+    this.refreshDailyBudgetView();
   },
 });
 

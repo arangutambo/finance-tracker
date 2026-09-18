@@ -25,6 +25,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     header.createEl("h3", { text: config.title || "Portfolio" });
     const actions = header.createDiv({ cls: "finance-tracker-header-actions" });
     addAction(actions, "Log trade", () => this.openLogTrade({ onSaved: rerender }), { primary: true, opensModal: true });
+    addAction(actions, "Add to watchlist", () => this.openAddToWatchlist({ onSaved: rerender }), { opensModal: true });
 
     let model = await this.buildPortfolioModel(referenceDate);
     if (!model.portfolio.exists) {
@@ -54,7 +55,13 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     wrapper.createDiv({ cls: "finance-tracker-budget-meta finance-portfolio-source", text: this.describePriceSource(model) });
 
     if (!model.portfolio.trades.length) {
-      wrapper.createDiv({ cls: "finance-tracker-empty", text: "No trades yet. Log one, or add rows to the Trades table below." });
+      wrapper.createDiv({
+        cls: "finance-tracker-empty",
+        text: model.watchlist.length
+          ? "No trades yet. Your watchlist is below; log a trade when you buy."
+          : "No trades yet. Log one, add rows to the Trades table below, or add a ticker to your watchlist to follow it first.",
+      });
+      this.renderWatchlist(wrapper, model, rerender);
       return;
     }
 
@@ -76,6 +83,8 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     ]);
 
     this.renderHoldingsTable(wrapper, model, currency);
+    this.renderDividendsToLog(wrapper, model, rerender);
+    this.renderWatchlist(wrapper, model, rerender);
 
     if (model.value.missing.length) {
       wrapper.createDiv({
@@ -164,7 +173,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     const scroller = section.createDiv({ cls: "finance-portfolio-scroll" });
     const table = scroller.createEl("table", { cls: "finance-tracker-table" });
     const head = table.createEl("thead").createEl("tr");
-    for (const label of ["Holding", "Units", "Avg cost", "Price", "Value", "Gain", "Today", "Weight"]) head.createEl("th", { text: label });
+    for (const label of ["Holding", "Month", "Units", "Avg cost", "Price", "Value", "Gain", "Today", "Weight"]) head.createEl("th", { text: label });
     const body = table.createEl("tbody");
 
     for (const row of model.value.rows) {
@@ -172,6 +181,7 @@ Object.assign(FinanceTrackerPlugin.prototype, {
       const name = tr.createEl("td");
       name.createDiv({ text: row.ticker, cls: "finance-portfolio-ticker" });
       if (row.name && row.name !== row.ticker) name.createDiv({ text: row.name, cls: "finance-tracker-budget-meta" });
+      this.renderSparkline(tr.createEl("td", { cls: "finance-portfolio-spark-cell" }), core.sliceHistory(model.cache.history?.[row.ticker], 1));
       tr.createEl("td", { text: String(Number(row.units.toFixed(4))), cls: "is-numeric" });
       tr.createEl("td", { text: core.formatCurrencyWithCode(row.averageCostNative, row.currency), cls: "is-numeric" });
       const price = tr.createEl("td", { cls: "is-numeric" });
@@ -187,23 +197,128 @@ Object.assign(FinanceTrackerPlugin.prototype, {
       tr.createEl("td", { text: row.dayChangePct === null ? "—" : `${row.dayChangePct}%`, cls: "is-numeric" });
       tr.createEl("td", { text: `${row.weight}%`, cls: "is-numeric" });
 
-      // A holding's parcels, on click: what was bought when, and which have been
-      // held long enough that the CGT discount would apply to a sale.
-      const detail = body.createEl("tr", { cls: "finance-portfolio-detail is-hidden" });
-      const cell = detail.createEl("td", { attr: { colspan: "8" } });
-      for (const parcel of row.parcels) {
-        cell.createDiv({
-          cls: "finance-tracker-budget-meta",
-          text: `${parcel.acquired} · ${Number(parcel.units.toFixed(4))} units · cost ${core.formatCurrency(parcel.costAud, currency)}${
-            parcel.discountEligible ? " · held 12 months+" : ""
-          }`,
-        });
-      }
-      if (row.realisedAud) {
-        cell.createDiv({ cls: "finance-tracker-budget-meta", text: `Realised so far: ${core.formatCurrency(row.realisedAud, currency)}` });
-      }
-      if (row.accounts.length) cell.createDiv({ cls: "finance-tracker-budget-meta", text: `Held with ${row.accounts.join(", ")}` });
-      tr.addEventListener("click", () => detail.toggleClass("is-hidden", !detail.hasClass("is-hidden")));
+      // The holding's own page: chart, trades, parcels.
+      tr.setAttribute("aria-label", `Open ${row.ticker}`);
+      tr.addEventListener("click", () => this.openTickerDetail(row.ticker));
+    }
+  },
+
+  // Today's move across your shares, for the hub's Today tab. Uses the price
+  // refresh the portfolio already does, so its interval and backoff apply.
+  async renderMarketToday(host) {
+    const portfolio = await this.loadPortfolio();
+    if (!portfolio.exists || !portfolio.trades.length) return false;
+    if ((this.settings.priceSource || "manual") !== "manual") {
+      await this.refreshPrices({ portfolio }).catch(() => {});
+    }
+    const model = await this.buildPortfolioModel();
+    const totals = model.value.totals;
+    if (!(totals.valueAud > 0)) return false;
+
+    const card = host.createDiv({ cls: "finance-tracker-chart-card finance-market-today is-clickable" });
+    card.setAttribute("aria-label", "Open the portfolio");
+    card.createEl("h4", { text: "Shares today" });
+    const day = Number(totals.dayChangeAud) || 0;
+    const before = totals.valueAud - day;
+    const pct = before > 0 ? Number(((day / before) * 100).toFixed(2)) : null;
+    renderStatCards(card, [
+      {
+        label: "Today",
+        value: `${day > 0 ? "+" : day < 0 ? "−" : ""}${core.formatCurrency(Math.abs(day), "AUD")}`,
+        hint: pct === null ? "" : `${pct > 0 ? "+" : ""}${pct}%`,
+        cls: day < 0 ? "is-over" : day > 0 ? "is-down" : "",
+      },
+      { label: "Value", value: core.formatCurrency(totals.valueAud, "AUD") },
+    ]);
+    const moved = model.value.rows.filter((row) => row.dayChangePct !== null && row.dayChangePct !== undefined);
+    const bits = [];
+    if (moved.length) {
+      const biggest = moved.reduce((best, row) => (Math.abs(row.dayChangePct) > Math.abs(best.dayChangePct) ? row : best));
+      bits.push(`Biggest move: ${biggest.ticker} ${biggest.dayChangePct > 0 ? "+" : ""}${biggest.dayChangePct}%`);
+    }
+    if (model.dividendsToLog.length) bits.push(`${model.dividendsToLog.length} dividend${model.dividendsToLog.length === 1 ? "" : "s"} to log`);
+    if (model.value.rows.some((row) => row.stale)) bits.push("some prices are old");
+    if (bits.length) card.createDiv({ cls: "finance-tracker-budget-meta", text: bits.join(" · ") });
+    card.addEventListener("click", () => this.activateHubView("portfolio"));
+    return true;
+  },
+
+  // A month of closes as a small line, rising green or falling red.
+  renderSparkline(host, points, options = {}) {
+    if (!points || points.length < 2) {
+      host.createSpan({ cls: "finance-tracker-budget-meta", text: "—" });
+      return null;
+    }
+    const W = options.width || 80;
+    const H = options.height || 22;
+    const closes = points.map((point) => point.close);
+    const min = Math.min(...closes);
+    const span = Math.max(...closes) - min || 1;
+    const coords = closes
+      .map((close, index) => `${((index * W) / (closes.length - 1)).toFixed(1)},${(H - 2 - ((close - min) / span) * (H - 4)).toFixed(1)}`)
+      .join(" ");
+    const svg = host.createSvg("svg", {
+      cls: ["finance-portfolio-spark", closes[closes.length - 1] >= closes[0] ? "is-up" : "is-down"],
+      attr: { viewBox: `0 0 ${W} ${H}`, width: W, height: H, preserveAspectRatio: "none", role: "img", "aria-label": "Price over the last month" },
+    });
+    svg.createSvg("polyline", { attr: { points: coords } });
+    return svg;
+  },
+
+  renderWatchlist(wrapper, model, rerender) {
+    if (!model.watchlist.length) return;
+    const section = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-portfolio-watchlist" });
+    section.createEl("h4", { text: `Watchlist (${model.watchlist.length})` });
+    if (model.source === "manual" && model.watchlist.some((item) => item.price === null)) {
+      section.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: "Watchlist prices come from a price source. Choose Yahoo or a Google Sheet in Settings → Portfolio, or type prices into price_overrides.",
+      });
+    }
+    const list = section.createDiv({ cls: "finance-tracker-budget-list finance-dashboard-rows" });
+    for (const item of model.watchlist) {
+      const row = list.createDiv({ cls: "finance-tracker-budget-card is-clickable finance-portfolio-watch-row" });
+      row.setAttribute("aria-label", `Open ${item.ticker}`);
+      const left = row.createDiv({ cls: "finance-portfolio-watch-name" });
+      left.createDiv({ cls: "finance-portfolio-ticker", text: item.ticker });
+      if (item.name) left.createDiv({ cls: "finance-tracker-budget-meta", text: item.name });
+      this.renderSparkline(row.createDiv({ cls: "finance-portfolio-watch-spark" }), item.spark);
+      const right = row.createDiv({ cls: "finance-portfolio-watch-figures" });
+      const price = right.createDiv({ cls: "ft-row-amount", text: item.price === null ? "—" : core.formatCurrencyWithCode(item.price, item.currency) });
+      if (item.stale) price.createSpan({ cls: "finance-portfolio-stale", text: " old" });
+      const bits = [];
+      if (item.dayChangePct !== null) bits.push(`${item.dayChangePct > 0 ? "+" : ""}${item.dayChangePct}% today`);
+      if (item.month?.pct !== null && item.month?.pct !== undefined) bits.push(`${item.month.pct > 0 ? "+" : ""}${item.month.pct}% this month`);
+      if (bits.length) right.createDiv({ cls: "finance-tracker-budget-meta", text: bits.join(" · ") });
+      row.addEventListener("click", () => this.openTickerDetail(item.ticker, { onChanged: rerender }));
+    }
+  },
+
+  // Dividends Yahoo says you were paid and haven't logged. Each is an estimate
+  // until you confirm the amount that actually arrived.
+  renderDividendsToLog(wrapper, model, rerender) {
+    const items = model.dividendsToLog || [];
+    if (!items.length) return;
+    const section = wrapper.createDiv({ cls: "finance-tracker-chart-card finance-portfolio-dividends-due" });
+    section.createEl("h4", { text: `Dividends to log (${items.length})` });
+    section.createDiv({
+      cls: "finance-tracker-budget-meta",
+      text: "From Yahoo's dividend history and the units you held before each ex-date. Check the amount against what was paid: withholding and rounding change it.",
+    });
+    const list = section.createDiv({ cls: "finance-tracker-budget-list finance-dashboard-rows" });
+    for (const item of items) {
+      const row = list.createDiv({ cls: "finance-tracker-budget-card" });
+      renderRowTitle(row, `${item.ticker} · ex ${item.exDate}`, item.amountAud === null ? core.formatCurrencyWithCode(item.amountNative, item.currency) : core.formatCurrency(item.amountAud, "AUD"));
+      row.createDiv({
+        cls: "finance-tracker-budget-meta",
+        text: `${item.units} units × ${core.formatCurrencyWithCode(item.perUnit, item.currency)} a unit`,
+      });
+      const actions = row.createDiv({ cls: "finance-tracker-header-actions" });
+      addAction(actions, "Log it", () => this.openLogDividend(item, { onSaved: rerender }), { primary: true, opensModal: true });
+      addAction(actions, "Dismiss", async () => {
+        await this.dismissDividend(item.id);
+        await rerender();
+      }, { tooltip: "Don't list this dividend again" });
     }
   },
 
@@ -316,6 +431,24 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     return row;
   },
 
+  openTickerDetail(ticker, options = {}) {
+    const modal = new TickerDetailModal(this.app, this, { ticker, ...options });
+    modal.open();
+    return modal;
+  },
+
+  openAddToWatchlist(options = {}) {
+    const modal = new AddToWatchlistModal(this.app, this, options);
+    modal.open();
+    return modal;
+  },
+
+  openLogDividend(item, options = {}) {
+    const modal = new LogDividendModal(this.app, this, item, options);
+    modal.open();
+    return modal;
+  },
+
   openLogTrade(options = {}) {
     const modal = new LogTradeModal(this.app, this, options);
     modal.open();
@@ -333,6 +466,7 @@ class LogTradeModal extends Modal {
     super(app);
     this.plugin = plugin;
     this.onSaved = options.onSaved;
+    this.presetTicker = options.ticker || "";
   }
 
   async onOpen() {
@@ -359,6 +493,7 @@ class LogTradeModal extends Modal {
       type: "text",
       attr: { placeholder: "VAS.AX or AAPL", "aria-label": "Ticker" },
     });
+    tickerInput.value = this.presetTicker;
     // Suggestions are fetched as you type; a small cache keeps each query to one
     // request, and the list is never allowed to block typing a ticker directly.
     const found = new Map();
@@ -459,7 +594,11 @@ class LogTradeModal extends Modal {
         save.disabled = false;
       }
     });
-    window.setTimeout(() => tickerInput.focus(), 0);
+    if (this.presetTicker) {
+      currencySelect.value = core.tickerMarket(this.presetTicker) === "US" ? "USD" : "AUD";
+      syncCurrency();
+    }
+    window.setTimeout(() => (this.presetTicker ? unitsInput : tickerInput).focus(), 0);
   }
 
   onClose() {

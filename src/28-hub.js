@@ -73,7 +73,8 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     const uncategorised = entries.filter((entry) => core.isUncategorisedEntry(entry)).length;
     const failed = typeof this.failedCaptureFiles === "function" ? this.failedCaptureFiles().length : 0;
     const bills = await this.hubBillsNeedingAttention();
-    return uncategorised + failed + bills.due.length + bills.suggestions.length;
+    const dividends = await this.dividendsToLogForInbox();
+    return uncategorised + failed + bills.due.length + bills.suggestions.length + (dividends ? dividends.dividendsToLog.length : 0);
   },
 
   async renderHubInbox(host, view) {
@@ -103,7 +104,18 @@ Object.assign(FinanceTrackerPlugin.prototype, {
       }
     }
 
+    const dividends = await this.dividendsToLogForInbox();
+    if (dividends) this.renderDividendsToLog(host.createDiv({ cls: "finance-tracker-dashboard" }), dividends, rerender);
+
     await this.renderCategorisationInboxInto(host.createDiv(), { title: "Uncategorised spending" });
+  },
+
+  // The portfolio model, only when there are trades to have earned dividends.
+  async dividendsToLogForInbox() {
+    const portfolio = await this.loadPortfolio();
+    if (!portfolio.exists || !portfolio.trades.length) return null;
+    const model = await this.buildPortfolioModel();
+    return model.dividendsToLog.length ? model : null;
   },
 
   async renderHubBudgets(host, view) {

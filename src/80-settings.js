@@ -538,7 +538,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
         dropdown
           .addOption("manual", "Typed in the portfolio note")
           .addOption("sheet", "A published Google Sheet")
-          .addOption("yahoo", "Yahoo Finance (unofficial)")
+          .addOption("yahoo", "Yahoo Finance (unofficial, with charts and dividends)")
           .setValue(this.plugin.settings.priceSource || "manual")
           .onChange(async (value) => {
             this.plugin.settings.priceSource = value;
@@ -571,7 +571,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
       this.plugin
         .loadPortfolio()
         .then((portfolio) => {
-          const tickers = Array.from(new Set(portfolio.trades.map((trade) => trade.ticker)));
+          const tickers = Array.from(new Set([...portfolio.trades.map((trade) => trade.ticker), ...(portfolio.watchlist || [])]));
           const currencies = Array.from(new Set(portfolio.trades.map((trade) => trade.currency)));
           template.value = core.buildPriceSheetTemplate(tickers.length ? tickers : ["VAS.AX", "AAPL"], currencies.length ? currencies : ["USD"]);
         })
@@ -580,7 +580,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
     if (source === "yahoo") {
       containerEl.createEl("p", {
         cls: "finance-tracker-settings-section-copy",
-        text: "Yahoo's price feed is free but unofficial: it can refuse requests or change without notice. When it refuses, the plugin backs off and keeps showing the last prices it fetched, marked as old.",
+        text: "Yahoo's price feed is free but unofficial. It only answers requests that look like a web browser's, so the plugin's requests say they are one; Yahoo could change that at any time. When it refuses, the plugin tries its second server, then backs off and keeps showing the last prices it fetched, marked as old. Yahoo also gives price history (for the charts) and dividend history (for Dividends to log), which a sheet doesn't.",
       });
     }
     if (source !== "manual") {

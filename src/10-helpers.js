@@ -71,6 +71,8 @@ const DEFAULT_SETTINGS = {
   priceSheetUrl: "",
   priceRefreshMinutes: 60,
   marketCache: {},
+  // Dividends Yahoo reported that you chose not to log, as "TICKER:ex-date".
+  dismissedDividends: [],
   autoLogRecurring: false,
   quickAddUseNoteDate: false,
   tripModeActive: false,
@@ -298,6 +300,36 @@ function serializeExchangeRatePeriods(periods) {
     .map((period) => `${period.start}..${period.end}:${serializeFlatExchangeRates(period.rates || {})}`)
     .filter(Boolean)
     .join("; ");
+}
+
+// Writes a list property as a one-line flow sequence (`key: [A, B]`), removing
+// the key's existing value whether it was a line or an indented block list —
+// Obsidian's Properties editor writes lists as blocks, and replacing only the
+// key's own line would leave orphaned "- item" lines behind.
+function setFrontmatterList(content, key, items) {
+  const text = String(content || "");
+  const line = `${key}: ${items.length ? `[${items.join(", ")}]` : ""}`;
+  const match = text.match(/^---\n([\s\S]*?)\n---/);
+  if (!match) return `---\n${line}\n---\n\n${text}`;
+  const out = [];
+  let found = false;
+  let skipping = false;
+  for (const current of match[1].split("\n")) {
+    if (skipping) {
+      if (/^\s*-\s/.test(current) || /^\s+\S/.test(current)) continue;
+      skipping = false;
+    }
+    const keyMatch = current.match(/^([A-Za-z0-9_-]+)\s*:/);
+    if (keyMatch && keyMatch[1].toLowerCase() === String(key).toLowerCase()) {
+      out.push(line);
+      found = true;
+      skipping = true;
+      continue;
+    }
+    out.push(current);
+  }
+  if (!found) out.push(line);
+  return text.replace(match[0], `---\n${out.join("\n")}\n---`);
 }
 
 function updateFrontmatterValue(content, key, value) {
