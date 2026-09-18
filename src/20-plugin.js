@@ -3824,7 +3824,7 @@ class FinanceTrackerPlugin extends Plugin {
       if (!startDate || !endDate || !calendarEntries.length) {
         section.createDiv({
           cls: "finance-tracker-empty",
-          text: "Add dated planned log entries like `#log/26/japanmidyear/planned/accommodation 2026-06-18 2026-06-22` in your daily notes to populate the calendar.",
+          text: "Add dated planned log entries like “#log/26/japanmidyear/planned/accommodation 2026-06-18 2026-06-22” in your daily notes to populate the calendar.",
         });
         return;
       }
@@ -4320,7 +4320,7 @@ class FinanceTrackerPlugin extends Plugin {
     if (!flatEntries.length && !periodEntries.length) {
       section.createDiv({
         cls: "finance-tracker-empty",
-        text: "No exchange rates configured yet. Add `exchange_rates` or `exchange_rate_periods` to the trip budget frontmatter.",
+        text: "No exchange rates configured yet. Add “exchange_rates” or “exchange_rate_periods” to the trip budget frontmatter.",
       });
       return;
     }
@@ -4621,7 +4621,7 @@ class FinanceTrackerPlugin extends Plugin {
 
     wrapper.createDiv({
       cls: "finance-tracker-budget-meta",
-      text: "This trip has ended, so the dashboard shows the reflection. Add `view: live` to the block to bring the live dashboard back.",
+      text: "This trip has ended, so the dashboard shows the reflection. Add “view: live” to the block to bring the live dashboard back.",
     });
   }
 
@@ -4637,7 +4637,7 @@ class FinanceTrackerPlugin extends Plugin {
       if (!holidayKey) {
         wrapper.createDiv({
           cls: "finance-tracker-empty",
-          text: "Set `trip: 2026/japan` in this code block, or add a `trip_tag` to the budget note frontmatter.",
+          text: "Set “trip: 2026/japan” in this code block, or add a “trip_tag” to the budget note frontmatter.",
         });
         return;
       }
@@ -6708,7 +6708,7 @@ class FinanceTrackerPlugin extends Plugin {
     if (!splits.people.length) {
       wrapper.createDiv({
         cls: "finance-tracker-empty",
-        text: "No split expenses yet. Quick-add with split=2 or owed=Sam:$8, or add a child line like `owes: Sam $8 #log/owed/sam` under any expense.",
+        text: "No split expenses yet. Quick-add with split=2 or owed=Sam:$8, or add a child line like “owes: Sam $8 #log/owed/sam” under any expense.",
       });
       return;
     }
@@ -6785,7 +6785,7 @@ class FinanceTrackerPlugin extends Plugin {
     if (!summary.accounts.length && !hasPortfolio) {
       wrapper.createDiv({
         cls: "finance-tracker-empty",
-        text: "Nothing to add up yet. Snapshot your account balances — a bullet like `- $5,230.00 #log/balance/anz-plus` in today's note — or log a trade.",
+        text: "Nothing to add up yet. Snapshot your account balances — a bullet like “- $5,230.00 #log/balance/anz-plus” in today's note — or log a trade.",
       });
       return;
     }
@@ -6928,7 +6928,7 @@ class FinanceTrackerPlugin extends Plugin {
     // rather than drawing a confident line down from zero.
     const missing = [];
     if (!(inputs.monthlyIncome > 0) && !Number.isFinite(core.parseNumber(config.income))) {
-      missing.push(`no income logged in the last ${inputs.windowDays} days — add \`income:\` to this block, or log income as #log/income/salary`);
+      missing.push(`no income logged in the last ${inputs.windowDays} days — add “income:” to this block, or log income as #log/income/salary`);
     }
     if (!(balances.latestTotal > 0) && !Number.isFinite(core.parseNumber(config.start))) {
       missing.push("no balance snapshots, so the line starts at zero — run Snapshot balances, or add `start:`");

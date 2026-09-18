@@ -383,7 +383,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
 
     containerEl.createEl("p", {
       cls: "finance-tracker-settings-section-copy",
-      text: "Detected bills. Untick Active to pause one — it moves to the Archived section of the recurring payments block, where it can be resumed or removed for good. Auto-log logs it automatically on its due day. Both are stored in the registry table of the recurring payments note.",
+      text: "Detected bills. Untick Active to pause one — it moves to the Archived section of the recurring payments block, where it can be resumed or removed for good. Auto-log logs it automatically on its due day. Both are saved on the bill's own note (or, before you convert to bill notes, in the registry table of the recurring payments note).",
     });
     const recurringListEl = containerEl.createDiv({ cls: "finance-tracker-goal-list" });
     this.renderRecurringList(recurringListEl).catch(() => {});
@@ -410,7 +410,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
     containerEl.createEl("h4", { text: "Runway" });
     containerEl.createEl("p", {
       cls: "finance-tracker-settings-section-copy",
-      text: "How much you need available to be safe for a chosen period, worked out from the bills above. Read-only — there is nothing to fund and nothing to keep in sync. Show it with the Runway block, or at the bottom of the recurring payments note.",
+      text: "How much you need available to be safe for a chosen period, worked out from the bills above. Choose the account it comes out of and runway says whether that account's latest balance covers it. Show it with the Runway block, or at the bottom of the Bills tab.",
     });
 
     new Setting(containerEl)

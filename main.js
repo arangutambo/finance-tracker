@@ -10535,7 +10535,7 @@ class FinanceTrackerPlugin extends Plugin {
       if (!startDate || !endDate || !calendarEntries.length) {
         section.createDiv({
           cls: "finance-tracker-empty",
-          text: "Add dated planned log entries like `#log/26/japanmidyear/planned/accommodation 2026-06-18 2026-06-22` in your daily notes to populate the calendar.",
+          text: "Add dated planned log entries like “#log/26/japanmidyear/planned/accommodation 2026-06-18 2026-06-22” in your daily notes to populate the calendar.",
         });
         return;
       }
@@ -11031,7 +11031,7 @@ class FinanceTrackerPlugin extends Plugin {
     if (!flatEntries.length && !periodEntries.length) {
       section.createDiv({
         cls: "finance-tracker-empty",
-        text: "No exchange rates configured yet. Add `exchange_rates` or `exchange_rate_periods` to the trip budget frontmatter.",
+        text: "No exchange rates configured yet. Add “exchange_rates” or “exchange_rate_periods” to the trip budget frontmatter.",
       });
       return;
     }
@@ -11332,7 +11332,7 @@ class FinanceTrackerPlugin extends Plugin {
 
     wrapper.createDiv({
       cls: "finance-tracker-budget-meta",
-      text: "This trip has ended, so the dashboard shows the reflection. Add `view: live` to the block to bring the live dashboard back.",
+      text: "This trip has ended, so the dashboard shows the reflection. Add “view: live” to the block to bring the live dashboard back.",
     });
   }
 
@@ -11348,7 +11348,7 @@ class FinanceTrackerPlugin extends Plugin {
       if (!holidayKey) {
         wrapper.createDiv({
           cls: "finance-tracker-empty",
-          text: "Set `trip: 2026/japan` in this code block, or add a `trip_tag` to the budget note frontmatter.",
+          text: "Set “trip: 2026/japan” in this code block, or add a “trip_tag” to the budget note frontmatter.",
         });
         return;
       }
@@ -13419,7 +13419,7 @@ class FinanceTrackerPlugin extends Plugin {
     if (!splits.people.length) {
       wrapper.createDiv({
         cls: "finance-tracker-empty",
-        text: "No split expenses yet. Quick-add with split=2 or owed=Sam:$8, or add a child line like `owes: Sam $8 #log/owed/sam` under any expense.",
+        text: "No split expenses yet. Quick-add with split=2 or owed=Sam:$8, or add a child line like “owes: Sam $8 #log/owed/sam” under any expense.",
       });
       return;
     }
@@ -13496,7 +13496,7 @@ class FinanceTrackerPlugin extends Plugin {
     if (!summary.accounts.length && !hasPortfolio) {
       wrapper.createDiv({
         cls: "finance-tracker-empty",
-        text: "Nothing to add up yet. Snapshot your account balances — a bullet like `- $5,230.00 #log/balance/anz-plus` in today's note — or log a trade.",
+        text: "Nothing to add up yet. Snapshot your account balances — a bullet like “- $5,230.00 #log/balance/anz-plus” in today's note — or log a trade.",
       });
       return;
     }
@@ -13639,7 +13639,7 @@ class FinanceTrackerPlugin extends Plugin {
     // rather than drawing a confident line down from zero.
     const missing = [];
     if (!(inputs.monthlyIncome > 0) && !Number.isFinite(core.parseNumber(config.income))) {
-      missing.push(`no income logged in the last ${inputs.windowDays} days — add \`income:\` to this block, or log income as #log/income/salary`);
+      missing.push(`no income logged in the last ${inputs.windowDays} days — add “income:” to this block, or log income as #log/income/salary`);
     }
     if (!(balances.latestTotal > 0) && !Number.isFinite(core.parseNumber(config.start))) {
       missing.push("no balance snapshots, so the line starts at zero — run Snapshot balances, or add `start:`");
@@ -15691,7 +15691,6 @@ Object.assign(FinanceTrackerPlugin.prototype, {
 
   async renderHubGoals(host, view) {
     const toolbar = host.createDiv({ cls: "finance-hub-toolbar" });
-    addAction(toolbar, "Contribute", () => this.openContribute({ onDone: () => view.refresh() }), { primary: true, opensModal: true });
     addAction(toolbar, "Withdraw", () => this.openContribute({ mode: "withdraw", onDone: () => view.refresh() }), { opensModal: true });
     addAction(toolbar, "New goal", () => this.openNewGoal(async () => view.refresh()), {
       opensModal: true,
@@ -18472,8 +18471,8 @@ class ContributeGoalModal extends Modal {
       heading.setText(withdrawing ? "Withdraw from a goal" : "Contribute to a goal");
       copy.setText(
         withdrawing
-          ? "Logs spending paid from the goal, like `- $80.00 #log/spending/goal/roadbike/repairs`. It lowers what the goal has saved and stays out of your home spending."
-          : "Logs a contribution like `- $150.00 #log/income/roadbike`. The goal is an envelope tracked in your notes, so no money has to move between accounts."
+          ? "Logs spending paid from the goal, like “- $80.00 #log/spending/goal/roadbike/repairs”. It lowers what the goal has saved and stays out of your home spending."
+          : "Logs a contribution like “- $150.00 #log/income/roadbike”. The goal is an envelope tracked in your notes, so no money has to move between accounts."
       );
       for (const [key, button] of Object.entries(modeButtons)) {
         button.toggleClass("is-active", key === this.mode);
@@ -18615,7 +18614,7 @@ class BalanceSnapshotModal extends Modal {
     contentEl.createEl("h2", { text: "Snapshot balances" });
     contentEl.createEl("p", {
       cls: "finance-tracker-settings-section-copy",
-      text: "Logs one bullet per account into today's note, like `- $5,230.00 #log/balance/anz-plus`. Accounts you have snapshotted before are pre-filled with their last balance.",
+      text: "Logs one bullet per account into today's note, like “- $5,230.00 #log/balance/anz-plus”. Accounts you have snapshotted before are pre-filled with their last balance.",
     });
 
     const rowsHost = contentEl.createDiv();
@@ -19304,7 +19303,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
 
     containerEl.createEl("p", {
       cls: "finance-tracker-settings-section-copy",
-      text: "Detected bills. Untick Active to pause one — it moves to the Archived section of the recurring payments block, where it can be resumed or removed for good. Auto-log logs it automatically on its due day. Both are stored in the registry table of the recurring payments note.",
+      text: "Detected bills. Untick Active to pause one — it moves to the Archived section of the recurring payments block, where it can be resumed or removed for good. Auto-log logs it automatically on its due day. Both are saved on the bill's own note (or, before you convert to bill notes, in the registry table of the recurring payments note).",
     });
     const recurringListEl = containerEl.createDiv({ cls: "finance-tracker-goal-list" });
     this.renderRecurringList(recurringListEl).catch(() => {});
@@ -19331,7 +19330,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
     containerEl.createEl("h4", { text: "Runway" });
     containerEl.createEl("p", {
       cls: "finance-tracker-settings-section-copy",
-      text: "How much you need available to be safe for a chosen period, worked out from the bills above. Read-only — there is nothing to fund and nothing to keep in sync. Show it with the Runway block, or at the bottom of the recurring payments note.",
+      text: "How much you need available to be safe for a chosen period, worked out from the bills above. Choose the account it comes out of and runway says whether that account's latest balance covers it. Show it with the Runway block, or at the bottom of the Bills tab.",
     });
 
     new Setting(containerEl)

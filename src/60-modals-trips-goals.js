@@ -738,8 +738,8 @@ class ContributeGoalModal extends Modal {
       heading.setText(withdrawing ? "Withdraw from a goal" : "Contribute to a goal");
       copy.setText(
         withdrawing
-          ? "Logs spending paid from the goal, like `- $80.00 #log/spending/goal/roadbike/repairs`. It lowers what the goal has saved and stays out of your home spending."
-          : "Logs a contribution like `- $150.00 #log/income/roadbike`. The goal is an envelope tracked in your notes, so no money has to move between accounts."
+          ? "Logs spending paid from the goal, like “- $80.00 #log/spending/goal/roadbike/repairs”. It lowers what the goal has saved and stays out of your home spending."
+          : "Logs a contribution like “- $150.00 #log/income/roadbike”. The goal is an envelope tracked in your notes, so no money has to move between accounts."
       );
       for (const [key, button] of Object.entries(modeButtons)) {
         button.toggleClass("is-active", key === this.mode);
@@ -881,7 +881,7 @@ class BalanceSnapshotModal extends Modal {
     contentEl.createEl("h2", { text: "Snapshot balances" });
     contentEl.createEl("p", {
       cls: "finance-tracker-settings-section-copy",
-      text: "Logs one bullet per account into today's note, like `- $5,230.00 #log/balance/anz-plus`. Accounts you have snapshotted before are pre-filled with their last balance.",
+      text: "Logs one bullet per account into today's note, like “- $5,230.00 #log/balance/anz-plus”. Accounts you have snapshotted before are pre-filled with their last balance.",
     });
 
     const rowsHost = contentEl.createDiv();
