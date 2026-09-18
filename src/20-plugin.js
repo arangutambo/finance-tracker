@@ -144,7 +144,7 @@ class FinanceTrackerPlugin extends Plugin {
 
     this.addCommand({
       id: "finance-tracker-log-recurring",
-      name: "Log due recurring payments",
+      name: "Log due bills",
       callback: () => this.logDueRecurringPayments({ notify: true }),
     });
 
@@ -156,13 +156,13 @@ class FinanceTrackerPlugin extends Plugin {
 
     this.addCommand({
       id: "finance-tracker-start-trip",
-      name: "Start trip",
+      name: "Start trip mode",
       callback: () => this.startTrip(),
     });
 
     this.addCommand({
       id: "finance-tracker-end-trip",
-      name: "End trip",
+      name: "End trip mode",
       callback: () => this.endTrip(),
     });
 
@@ -182,6 +182,12 @@ class FinanceTrackerPlugin extends Plugin {
       id: "finance-tracker-contribute-goal",
       name: "Contribute to a goal",
       callback: () => this.openContribute(),
+    });
+
+    this.addCommand({
+      id: "finance-tracker-withdraw-goal",
+      name: "Withdraw from a goal",
+      callback: () => this.openContribute({ mode: "withdraw" }),
     });
 
     this.addCommand({
