@@ -2660,11 +2660,15 @@ const YAHOO_CHART_FIXTURE = {
           instrumentType: "ETF",
           longName: "Vanguard Australian Shares Index ETF",
           regularMarketPrice: 103.42,
-          chartPreviousClose: 102.9,
+          // For a two-year chart this is the close two years ago — never
+          // yesterday's.
+          chartPreviousClose: 88.1,
           regularMarketTime: 1789621200,
+          gmtoffset: 36000,
         },
-        timestamp: [1789362000, 1789448400, 1789534800],
-        indicators: { quote: [{ close: [102.5, null, 103.42] }] },
+        // Like the real feed: one bar a day, the last one today's.
+        timestamp: [1789362000, 1789448400, 1789534800, 1789600000],
+        indicators: { quote: [{ close: [102.5, null, 102.9, 103.42] }] },
         events: { dividends: { 1782820800: { amount: 1.0327, date: 1782820800 } } },
       },
     ],
@@ -2675,10 +2679,11 @@ const YAHOO_CHART_FIXTURE = {
 test("parseYahooChart reads the quote, closes and dividends", () => {
   const parsed = core.parseYahooChart(YAHOO_CHART_FIXTURE);
   assert.equal(parsed.quote.price, 103.42);
-  assert.equal(parsed.quote.previousClose, 102.9);
+  assert.equal(parsed.quote.previousClose, 102.9, "yesterday's bar, not chartPreviousClose");
   assert.equal(parsed.quote.currency, "AUD");
   assert.equal(parsed.quote.type, "ETF");
-  assert.equal(parsed.history.length, 2, "a missing close is skipped, not read as zero");
+  assert.equal(parsed.history.length, 3, "a missing close is skipped, not read as zero");
+  assert.equal(parsed.history[parsed.history.length - 1].date, parsed.quote.time, "dated on the exchange's calendar");
   assert.equal(parsed.dividends.length, 1);
   assert.equal(parsed.dividends[0].amount, 1.0327);
 
@@ -3101,9 +3106,9 @@ test("London prices quoted in pence become pounds", () => {
     chart: {
       result: [
         {
-          meta: { symbol: "VUSA.L", currency: "GBp", regularMarketPrice: 9150, chartPreviousClose: 9100, longName: "Vanguard S&P 500" },
-          timestamp: [1789362000],
-          indicators: { quote: [{ close: [9100] }] },
+          meta: { symbol: "VUSA.L", currency: "GBp", regularMarketPrice: 9150, chartPreviousClose: 7000, regularMarketTime: 1789621200, gmtoffset: 3600, longName: "Vanguard S&P 500" },
+          timestamp: [1789362000, 1789600000],
+          indicators: { quote: [{ close: [9100, 9150] }] },
           events: { dividends: { a: { date: 1789362000, amount: 25 } } },
         },
       ],

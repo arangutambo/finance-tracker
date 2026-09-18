@@ -5745,20 +5745,34 @@ function parseYahooChart(json) {
   // unit here, so every figure downstream is in pounds and rand.
   const { currency, divisor } = yahooCurrency(meta.currency);
   const major = (value) => Number((Number(value) / divisor).toFixed(4));
+  // Dates on the exchange's own calendar: a New York close at 4pm on the 17th
+  // is the 17th, not the 18th as it would be read in Brisbane.
+  const offset = Number(meta.gmtoffset);
+  const toDate = (seconds) =>
+    Number.isFinite(offset) && Number.isFinite(Number(seconds))
+      ? new Date((Number(seconds) + offset) * 1000).toISOString().slice(0, 10)
+      : isoFromUnixSeconds(seconds);
   const timestamps = result.timestamp || [];
   const closes = result.indicators?.quote?.[0]?.close || [];
   const history = [];
   timestamps.forEach((seconds, index) => {
     const close = Number(closes[index]);
-    if (close > 0) history.push({ date: isoFromUnixSeconds(seconds), close: major(close) });
+    if (close > 0) history.push({ date: toDate(seconds), close: major(close) });
   });
   const dividends = Object.values(result.events?.dividends || {})
-    .map((dividend) => ({ date: isoFromUnixSeconds(dividend.date), amount: major(dividend.amount) }))
+    .map((dividend) => ({ date: toDate(dividend.date), amount: major(dividend.amount) }))
     .filter((dividend) => dividend.date && dividend.amount > 0)
     .sort((left, right) => left.date.localeCompare(right.date));
 
   const price = major(meta.regularMarketPrice);
-  const previousClose = major(meta.chartPreviousClose ?? meta.previousClose);
+  // Yesterday's close is the last bar before the trading day of the current
+  // price. Not chartPreviousClose: for a two-year chart that is the close two
+  // years ago, which made "today" the gain since then.
+  const tradeDate = toDate(meta.regularMarketTime);
+  const earlier = tradeDate ? history.filter((point) => point.date < tradeDate) : [];
+  const previousClose = earlier.length
+    ? earlier[earlier.length - 1].close
+    : major(meta.regularMarketPreviousClose ?? meta.previousClose ?? NaN);
   return {
     quote: price > 0
       ? {
@@ -5767,7 +5781,7 @@ function parseYahooChart(json) {
           name: meta.longName || meta.shortName || meta.symbol || "",
           previousClose: previousClose > 0 ? previousClose : null,
           price,
-          time: isoFromUnixSeconds(meta.regularMarketTime),
+          time: tradeDate,
           type: meta.instrumentType || "",
         }
       : null,

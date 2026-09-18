@@ -1574,8 +1574,9 @@ function chartFor(symbol, price, previousClose, currency = "AUD") {
     chart: {
       result: [
         {
-          meta: { symbol, currency, regularMarketPrice: price, chartPreviousClose: previousClose, instrumentType: "ETF", longName: `${symbol} name`, regularMarketTime: 1789621200 },
-          timestamp: [1789362000, 1789534800],
+          meta: { symbol, currency, regularMarketPrice: price, chartPreviousClose: 1, instrumentType: "ETF", longName: `${symbol} name`, regularMarketTime: 1789621200, gmtoffset: 36000 },
+          // Yesterday's bar, then today's — as the real feed sends them.
+          timestamp: [1789534800, 1789600000],
           indicators: { quote: [{ close: [previousClose, price] }] },
           events: {},
         },

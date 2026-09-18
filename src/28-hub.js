@@ -26,9 +26,12 @@ Object.assign(FinanceTrackerPlugin.prototype, {
     if (!leaf) {
       leaf = workspace.getLeaf(true);
       await leaf.setViewState({ type: FINANCE_HUB_VIEW, active: true, state: tab ? { tab } : {} });
-    } else if (tab && typeof leaf.view?.showTab === "function") {
-      await leaf.view.showTab(tab);
     }
+    // Obsidian may create the view before handing it the state, or not load a
+    // background tab at all until it's shown, so the tab is set explicitly
+    // once the view exists — "Open finance hub: portfolio" opened on Today.
+    if (typeof leaf.loadIfDeferred === "function") await leaf.loadIfDeferred();
+    if (tab && typeof leaf.view?.showTab === "function" && leaf.view.tab !== tab) await leaf.view.showTab(tab);
     workspace.revealLeaf(leaf);
     return leaf;
   },
