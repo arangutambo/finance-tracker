@@ -4717,6 +4717,22 @@ const core = (() => {
   }
 
   // The next date this bill falls due, strictly after `fromDate`.
+  // The first date on or after `date` that a calendar rule falls on. Only for
+  // rules tied to the calendar; an after-last bill needs a payment or a first due
+  // date to count from.
+  function firstBillDueOnOrAfter(bill, date) {
+    const from = parseIsoDate(date);
+    const rule = bill?.dueRule || { type: "after-last" };
+    if (!from || rule.type === "after-last" || !CADENCE_MONTHS[normalizeCadence(bill?.cadence)]) return "";
+    let month = from.slice(0, 7);
+    for (let step = 0; step < 14; step += 1) {
+      const candidate = rule.type === "day-of-month" ? clampDayOfMonth(month, rule.day) : nthWeekdayOfMonth(month, rule.ordinal, rule.weekday);
+      if (candidate && candidate >= from) return candidate;
+      month = addMonths(`${month}-01`, 1).slice(0, 7);
+    }
+    return "";
+  }
+
   function billDueAfter(bill, fromDate) {
     const anchor = parseIsoDate(fromDate);
     const cadence = normalizeCadence(bill?.cadence);
@@ -4816,7 +4832,12 @@ const core = (() => {
         anchor = bill.nextDueOverride;
       }
     }
-    const derived = anchor ? billDueAfter(bill, anchor) : "";
+    // A new bill with a calendar rule ("the 14th", "the first Monday") and no
+    // payment yet is due on the rule's next date. It used to have no due date at
+    // all until something was paid, so a bill just added sat under "Later" with
+    // nothing due.
+    const firstDue = !anchor && !bill.nextDueOverride ? firstBillDueOnOrAfter(bill, bill.startDate && bill.startDate > referenceDate ? bill.startDate : referenceDate) : "";
+    const derived = anchor ? billDueAfter(bill, anchor) : firstDue;
     const nextDue = overrideStillStands ? bill.nextDueOverride : derived || bill.nextDueOverride || "";
 
     const changePending = bill.nextAmount > 0 && bill.changeDate && bill.changeDate > referenceDate;
@@ -7129,6 +7150,12 @@ class FinanceTrackerPlugin extends Plugin {
             : result.error || `Updated ${result.updated || 0} price${result.updated === 1 ? "" : "s"}.`
         );
       },
+    });
+
+    this.addCommand({
+      id: "finance-tracker-add-bill",
+      name: "Add a bill",
+      callback: () => this.openAddBill({ onSaved: () => this.refreshDailyBudgetView() }),
     });
 
     this.addCommand({
@@ -13264,15 +13291,23 @@ class FinanceTrackerPlugin extends Plugin {
     const header = wrapper.createDiv({ cls: "finance-tracker-header" });
     header.createEl("h3", { text: config.title || "Recurring payments" });
     const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
-    addAction(headerActions, "Log all due", async () => {
-      await this.logDueRecurringPayments({ notify: true });
-      await this.renderRecurringBlock(source, el, ctx);
-    }, { primary: true, errorPrefix: "Logging due payments" });
+    // A new vault has no bills yet, and adding one is how it gets its first:
+    // without this button the only way in was to hand-type a tagged payment.
+    addAction(headerActions, "Add bill", () => this.openAddBill({ onSaved: () => this.renderRecurringBlock(source, el, ctx) }), {
+      primary: !recurring.items.length,
+      opensModal: true,
+    });
+    if (recurring.items.length) {
+      addAction(headerActions, "Log all due", async () => {
+        await this.logDueRecurringPayments({ notify: true });
+        await this.renderRecurringBlock(source, el, ctx);
+      }, { primary: true, errorPrefix: "Logging due payments" });
+    }
 
     if (!recurring.items.length) {
       wrapper.createDiv({
         cls: "finance-tracker-empty",
-        text: `No recurring payments found yet. Tag one like #log/spending/${prefix}/monthly/spotify and it will appear here.`,
+        text: `No bills yet. Add one, and it gets its own note with its due date and amount. A payment tagged like #log/spending/${prefix}/monthly/spotify is picked up too.`,
       });
       return;
     }

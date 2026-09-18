@@ -238,6 +238,12 @@ class FinanceTrackerPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: "finance-tracker-add-bill",
+      name: "Add a bill",
+      callback: () => this.openAddBill({ onSaved: () => this.refreshDailyBudgetView() }),
+    });
+
+    this.addCommand({
       id: "finance-tracker-convert-bills",
       name: "Convert recurring payments to bill notes",
       callback: () => this.openBillMigration(),
@@ -6370,15 +6376,23 @@ class FinanceTrackerPlugin extends Plugin {
     const header = wrapper.createDiv({ cls: "finance-tracker-header" });
     header.createEl("h3", { text: config.title || "Recurring payments" });
     const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
-    addAction(headerActions, "Log all due", async () => {
-      await this.logDueRecurringPayments({ notify: true });
-      await this.renderRecurringBlock(source, el, ctx);
-    }, { primary: true, errorPrefix: "Logging due payments" });
+    // A new vault has no bills yet, and adding one is how it gets its first:
+    // without this button the only way in was to hand-type a tagged payment.
+    addAction(headerActions, "Add bill", () => this.openAddBill({ onSaved: () => this.renderRecurringBlock(source, el, ctx) }), {
+      primary: !recurring.items.length,
+      opensModal: true,
+    });
+    if (recurring.items.length) {
+      addAction(headerActions, "Log all due", async () => {
+        await this.logDueRecurringPayments({ notify: true });
+        await this.renderRecurringBlock(source, el, ctx);
+      }, { primary: true, errorPrefix: "Logging due payments" });
+    }
 
     if (!recurring.items.length) {
       wrapper.createDiv({
         cls: "finance-tracker-empty",
-        text: `No recurring payments found yet. Tag one like #log/spending/${prefix}/monthly/spotify and it will appear here.`,
+        text: `No bills yet. Add one, and it gets its own note with its due date and amount. A payment tagged like #log/spending/${prefix}/monthly/spotify is picked up too.`,
       });
       return;
     }

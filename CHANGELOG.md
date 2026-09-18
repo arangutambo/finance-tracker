@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.1
+
+**Adding your first bill works in a new vault.**
+
+- **Fixed: a new vault had no way to add a bill.** The Bills tab only said to tag a
+  payment by hand. It now has **Add bill** from the start, and there's an **Add a
+  bill** command.
+- **Fixed: a bill added with a calendar rule had no due date until it was paid.**
+  "The 14th of each month" is now due on the next 14th straight away, so it counts
+  toward what's due in the next 30 days and toward runway.
+
 ## 1.0.0
 
 **Shares that keep themselves up to date.**

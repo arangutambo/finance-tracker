@@ -1,7 +1,7 @@
 {
   "id": "finance-tracker",
   "name": "Finance Tracker",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "minAppVersion": "1.0.0",
   "description": "Log spending as tags in your daily notes and get budgets, bills, savings goals, trips, weekly reviews and a share portfolio back, all in one finance hub. Capture from Apple Shortcuts or quick add.",
   "author": "Antoine Jhaddad",

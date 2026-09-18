@@ -3189,3 +3189,18 @@ test("dividends to log: held before the ex-date, not already logged, not reinves
   assert.deepEqual(reinvested.map((item) => item.id), ["AAPL:2026-08-11"], "a reinvestment counts, and a dismissal sticks");
   assert.equal(reinvested[0].amountAud, null, "no exchange rate, no AUD estimate");
 });
+
+test("a new bill with a calendar rule is due on the rule's next date, before any payment", () => {
+  const base = { id: "spotify", name: "Spotify", aliases: [], cadence: "monthly", amount: 12.99, amountModel: "fixed", reminderDays: 3, active: true, autoLog: false, nextAmount: null, changeDate: null, endDate: null, paymentsLeft: null, nextDueOverride: null, skipped: [], startDate: null, currency: "AUD" };
+  const day14 = core.computeBillState({ ...base, dueRule: { type: "day-of-month", day: 14 } }, [], { referenceDate: "2026-09-18" });
+  assert.equal(day14.nextDue, "2026-10-14");
+  assert.equal(day14.status, "upcoming");
+  const onTheDay = core.computeBillState({ ...base, dueRule: { type: "day-of-month", day: 18 } }, [], { referenceDate: "2026-09-18" });
+  assert.equal(onTheDay.nextDue, "2026-09-18", "today counts");
+  const firstMonday = core.computeBillState({ ...base, dueRule: { type: "nth-weekday", ordinal: 1, weekday: 1 } }, [], { referenceDate: "2026-09-18" });
+  assert.equal(firstMonday.nextDue, "2026-10-05");
+  const afterLast = core.computeBillState({ ...base, dueRule: { type: "after-last" } }, [], { referenceDate: "2026-09-18" });
+  assert.equal(afterLast.nextDue, "", "an after-last bill still needs a payment or a first due date");
+  const paid = core.computeBillState({ ...base, dueRule: { type: "day-of-month", day: 14 } }, [{ date: "2026-09-14", amount: 12.99 }], { referenceDate: "2026-09-18" });
+  assert.equal(paid.nextDue, "2026-10-14", "once paid, the schedule follows the payment as before");
+});

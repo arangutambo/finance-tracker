@@ -2388,3 +2388,22 @@ test("Log trade from a holding's page starts with its ticker", async () => {
   assert.equal(modal.contentEl.find((node) => node.attrs["aria-label"] === "Ticker").value, "AAPL");
   assert.equal(modal.contentEl.find((node) => node.attrs["aria-label"] === "Currency").value, "USD");
 });
+
+
+test("a brand-new vault's bills view offers Add bill, and the first bill switches it to bill notes", async () => {
+  const { plugin, files } = makePlugin(billSettings());
+  delete plugin.invalidateIndexEntry;
+
+  const el = new StubEl();
+  await plugin.renderRecurringBlock("", el, { sourcePath: "" });
+  assert.match(el.allText(), /No bills yet/);
+  assert.ok(el.button("Add bill"), "there is a way to add the first bill");
+  assert.ok(!el.button("Log all due"), "nothing to log yet");
+
+  await plugin.addBill({ name: "Spotify", cadence: "monthly", amount: 12.99, dueRule: { type: "day-of-month", day: 14 } });
+  assert.ok([...files.keys()].some((path) => /Bills\/spotify\.md$/i.test(path)));
+  const after = new StubEl();
+  await plugin.renderRecurringBlock("", after, { sourcePath: "" });
+  assert.match(after.allText(), /Spotify/);
+  assert.match(after.allText(), /Running bills \| 1/);
+});
