@@ -105,8 +105,69 @@ const obsidianStub = {
     registerInterval() {}
     registerEvent() {}
   },
-  PluginSettingTab: class {},
-  Setting: class {},
+  PluginSettingTab: class {
+    constructor(app, plugin) {
+      this.app = app;
+      this.plugin = plugin;
+      this.containerEl = new StubEl();
+    }
+  },
+  // Enough of Obsidian's Setting to render the settings tab: each control is
+  // recorded as a node, so a test can read names and drive values.
+  Setting: class {
+    constructor(containerEl) {
+      this.settingEl = containerEl.createDiv({ cls: "setting-item" });
+      this.nameEl = this.settingEl.createDiv({ cls: "setting-item-name" });
+      this.descEl = this.settingEl.createDiv({ cls: "setting-item-description" });
+    }
+    setName(value) { this.nameEl.setText(value); return this; }
+    setDesc(value) { this.descEl.setText(value); return this; }
+    setHeading() { return this; }
+    addText(build) {
+      const inputEl = this.settingEl.createEl("input", { type: "text" });
+      const control = {
+        inputEl,
+        setPlaceholder(value) { inputEl.attrs.placeholder = value; return control; },
+        setValue(value) { inputEl.value = value; return control; },
+        getValue() { return inputEl.value; },
+        onChange(handler) { control.handler = handler; inputEl.addEventListener("input", () => handler(inputEl.value)); return control; },
+      };
+      build(control);
+      return this;
+    }
+    addToggle(build) {
+      const toggleEl = this.settingEl.createEl("input", { type: "checkbox" });
+      const control = {
+        setValue(value) { toggleEl.checked = Boolean(value); return control; },
+        onChange(handler) { toggleEl.addEventListener("change", () => handler(toggleEl.checked)); return control; },
+      };
+      build(control);
+      return this;
+    }
+    addDropdown(build) {
+      const selectEl = this.settingEl.createEl("select");
+      const control = {
+        selectEl,
+        options: [],
+        addOption(value, label) { control.options.push([value, label]); selectEl.createEl("option", { text: label, attr: { value } }); return control; },
+        setValue(value) { selectEl.value = value; return control; },
+        onChange(handler) { selectEl.addEventListener("change", () => handler(selectEl.value)); return control; },
+      };
+      build(control);
+      return this;
+    }
+    addButton(build) {
+      const buttonEl = this.settingEl.createEl("button");
+      const control = {
+        setButtonText(value) { buttonEl.setText(value); return control; },
+        setCta() { return control; },
+        setDisabled(value) { buttonEl.disabled = value; return control; },
+        onClick(handler) { buttonEl.addEventListener("click", handler); return control; },
+      };
+      build(control);
+      return this;
+    }
+  },
   TFile: StubTFile,
   normalizePath: (value) => String(value).replace(/\/+/g, "/").replace(/^\/|\/$/g, ""),
   requestUrl: (options) => requestUrlHandler(options),
@@ -2125,4 +2186,23 @@ test("fetching a trip rate makes one request and explains a currency it can't ge
   await assert.rejects(plugin.fetchExchangeRate("FJD", "AUD"), /doesn't publish a rate for FJD/);
   await assert.rejects(plugin.fetchExchangeRate("¥", "AUD"), /three-letter/);
   assert.equal(urls.length, 2, "an invalid code never reaches the network");
+});
+
+
+test("the settings tab renders every section, in the hub's order", async () => {
+  const { plugin } = makePlugin({ ...billSettings(), priceSource: "sheet", runwayAccount: "" });
+  plugin.isCaptureMethodEnabled = () => true;
+  plugin.captureOverlapReport = () => [];
+  const tab = plugin.createSettingTab();
+  tab.display();
+  await new Promise((resolve) => setTimeout(resolve, 20)); // the async lists
+
+  const headings = tab.containerEl.findAll((node) => node.tag === "h3").map((node) => node.text);
+  assert.deepEqual(headings, ["General", "Capture", "Categories", "Budgets and reviews", "Bills and runway", "Goals and trips", "Portfolio", "Files and setup"]);
+  const links = tab.containerEl.findAll((node) => node.classList.has("finance-settings-nav-link")).map((node) => node.text);
+  assert.deepEqual(links, headings, "a jump link for each section");
+  const names = tab.containerEl.findAll((node) => node.classList.has("setting-item-name")).map((node) => node.text);
+  for (const name of ["Default currency", "Week starts on", "Learn categories from past notes", "Budget check period", "Sort bills by", "Runway period", "Account", "Price source", "Sheet link", "Budgets folder"]) {
+    assert.ok(names.includes(name), `${name} is still there`);
+  }
 });

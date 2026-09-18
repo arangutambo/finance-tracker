@@ -2,7 +2,7 @@ class FinanceTrackerPlugin extends Plugin {
   async onload() {
     await this.loadSettings();
 
-    this.addSettingTab(new FinanceTrackerSettingTab(this.app, this));
+    this.addSettingTab(this.createSettingTab());
 
     this.addCommand({
       id: "finance-tracker-export-csv",
@@ -300,6 +300,10 @@ class FinanceTrackerPlugin extends Plugin {
         }, 3000);
       }
     });
+  }
+
+  createSettingTab() {
+    return new FinanceTrackerSettingTab(this.app, this);
   }
 
   async setupCaptureInbox() {

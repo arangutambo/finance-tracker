@@ -11,11 +11,15 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
     containerEl.createEl("h2", { text: "Finance Tracker" });
     containerEl.createEl("p", {
       cls: "finance-tracker-settings-intro",
-      text: "Configure capture, dashboards, trips, goals, and recurring payments.",
+      text: "Settings follow the finance hub's areas. Everything here can also be changed later without losing anything you've logged.",
     });
 
+    // Jump links to each section, filled in once they exist: the tab is long,
+    // and on a phone scrolling to Portfolio took a while.
+    const nav = containerEl.createDiv({ cls: "finance-settings-nav" });
+    const sections = [];
     const addSection = (title, description) => {
-      containerEl.createEl("h3", { text: title });
+      sections.push(containerEl.createEl("h3", { text: title }));
       if (description) {
         containerEl.createEl("p", {
           cls: "finance-tracker-settings-section-copy",
@@ -36,7 +40,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
       return details;
     };
 
-    addSection("Capture", "Where spending is written, and how captured transactions are logged.");
+    addSection("General", "Applies everywhere: totals, dashboards, the sidebar and the hub.");
 
     this.renderVaultStatus(containerEl).catch(() => {});
 
@@ -49,6 +53,25 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         })
       );
+
+    new Setting(containerEl)
+      .setName("Week starts on")
+      .setDesc("Used when the plugin calculates week and fortnight ranges.")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("monday", "Monday")
+          .addOption("sunday", "Sunday")
+          .setValue(this.plugin.settings.weekStartsOn || DEFAULT_SETTINGS.weekStartsOn)
+          .onChange(async (value) => {
+            this.plugin.settings.weekStartsOn = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    const hubActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
+    addAction(hubActions, "Open finance hub", () => this.plugin.activateHubView(), { primary: true, opensModal: true });
+
+    addSection("Capture", "How transactions get into your daily notes.");
 
     new Setting(containerEl)
       .setName("Quick add uses the open daily note's date")
@@ -70,10 +93,11 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
         })
       );
 
-    addSection(
-      "Capture methods",
-      "Every method below can run at the same time. Quick add and hand-typed bullets always work and are not listed."
-    );
+    containerEl.createEl("h4", { text: "Capture methods" });
+    containerEl.createEl("p", {
+      cls: "finance-tracker-settings-section-copy",
+      text: "Every method below can run at the same time. Quick add and hand-typed bullets always work and are not listed.",
+    });
 
     for (const method of core.CAPTURE_METHODS) {
       new Setting(containerEl)
@@ -252,50 +276,29 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
         })
       );
 
-    addSection("Dashboard", "Defaults for the dashboard block and the sidebar.");
+    addSection(
+      "Categories",
+      "Merchant → category rules. A rule matches a capture's merchant exactly, or as a whole chunk inside it, so \"woolworths\" also covers \"Woolworths/cnr Brisbane H\". Add or edit one below, or tick \"Remember this merchant\" when you categorise a transaction; remove one here if it guesses wrong."
+    );
 
     new Setting(containerEl)
-      .setName("Default grouping")
-      .setDesc("Choose whether charts default to top-level or full category paths.")
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOption("primary", "Primary category")
-          .addOption("full", "Full category path")
-          .setValue(this.plugin.settings.dashboardDefaultGroupBy)
-          .onChange(async (value) => {
-            this.plugin.settings.dashboardDefaultGroupBy = value;
-            await this.plugin.saveSettings();
-          })
+      .setName("Learn categories from past notes")
+      .setDesc(
+        "When no rule above matches, file the capture the way the same merchant was filed last time in your daily notes. Categorising a merchant by hand once is then enough to catch every later capture from it, with nothing to remember to tick. Rules above always win over history."
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.learnCategoriesFromHistory !== false).onChange(async (value) => {
+          this.plugin.settings.learnCategoriesFromHistory = value;
+          await this.plugin.saveSettings();
+        })
       );
 
-    new Setting(containerEl)
-      .setName("Payment calendar range")
-      .setDesc("How far ahead the recurring block's payment calendar looks. The buttons above the calendar switch it for one session.")
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOption("1", "1 month")
-          .addOption("3", "3 months")
-          .addOption("12", "12 months")
-          .setValue(String(this.plugin.settings.paymentCalendarMonths || DEFAULT_SETTINGS.paymentCalendarMonths))
-          .onChange(async (value) => {
-            this.plugin.settings.paymentCalendarMonths = value;
-            await this.plugin.saveSettings();
-          })
-      );
+    this.renderMerchantMapList(containerEl.createDiv({ cls: "finance-tracker-goal-list" })).catch(() => {});
 
-    new Setting(containerEl)
-      .setName("Week starts on")
-      .setDesc("Used when the plugin calculates week and fortnight ranges.")
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOption("monday", "Monday")
-          .addOption("sunday", "Sunday")
-          .setValue(this.plugin.settings.weekStartsOn || DEFAULT_SETTINGS.weekStartsOn)
-          .onChange(async (value) => {
-            this.plugin.settings.weekStartsOn = value;
-            await this.plugin.saveSettings();
-          })
-      );
+    addSection(
+      "Budgets and reviews",
+      "Budgets live in a table in the budgets note. Weekly and monthly finance-dashboard blocks show every review section; show: and hide: in a block choose which."
+    );
 
     new Setting(containerEl)
       .setName("Budget check period")
@@ -315,128 +318,29 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
           })
       );
 
+    new Setting(containerEl)
+      .setName("Default grouping")
+      .setDesc("Choose whether charts default to top-level or full category paths.")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("primary", "Primary category")
+          .addOption("full", "Full category path")
+          .setValue(this.plugin.settings.dashboardDefaultGroupBy)
+          .onChange(async (value) => {
+            this.plugin.settings.dashboardDefaultGroupBy = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
     const budgetActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
     addAction(budgetActions, "Open budgets note", () => this.plugin.openBudgetNote(), {
       primary: true,
       errorPrefix: "Opening budgets note",
     });
 
-    const filesAdvanced = addAdvanced("Advanced: file locations", "Set for you by first-time setup.");
-
-    new Setting(filesAdvanced)
-      .setName("Budgets folder")
-      .setDesc("Folder where the default budget, trip budgets, and the recurring payments note live.")
-      .addText((text) =>
-        text.setPlaceholder("Utility/Budgets").setValue(this.plugin.settings.budgetsFolderPath).onChange(async (value) => {
-          this.plugin.settings.budgetsFolderPath = value.trim() || DEFAULT_SETTINGS.budgetsFolderPath;
-          await this.plugin.saveSettings();
-        })
-      );
-
-    new Setting(filesAdvanced)
-      .setName("Budget archive folder")
-      .setDesc("Trips and goals are moved here when you archive them.")
-      .addText((text) =>
-        text.setPlaceholder("Utility/Budgets/Archive").setValue(this.plugin.settings.budgetArchiveFolderPath).onChange(async (value) => {
-          this.plugin.settings.budgetArchiveFolderPath = value.trim() || DEFAULT_SETTINGS.budgetArchiveFolderPath;
-          await this.plugin.saveSettings();
-        })
-      );
-
-    new Setting(filesAdvanced)
-      .setName("Recurring payments note")
-      .setDesc("Filename of the bill-management note, inside the budgets folder.")
-      .addText((text) =>
-        text
-          .setPlaceholder(DEFAULT_SETTINGS.recurringNoteName)
-          .setValue(this.plugin.settings.recurringNoteName)
-          .onChange(async (value) => {
-            this.plugin.settings.recurringNoteName = value.trim() || DEFAULT_SETTINGS.recurringNoteName;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(filesAdvanced)
-      .setName("Budgets note name")
-      .setDesc("Filename of the default budget note, inside the budgets folder.")
-      .addText((text) =>
-        text
-          .setPlaceholder(DEFAULT_SETTINGS.defaultBudgetNoteName)
-          .setValue(this.plugin.settings.defaultBudgetNoteName)
-          .onChange(async (value) => {
-            this.plugin.settings.defaultBudgetNoteName = value.trim() || DEFAULT_SETTINGS.defaultBudgetNoteName;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    const merchantAdvanced = addAdvanced(
-      "Advanced: merchant map",
-      "Merchant → category rules. A rule matches a capture's merchant exactly, or as a whole chunk inside it, so \"woolworths\" also covers \"Woolworths/cnr Brisbane H\". Add or edit one below, or tick \"Remember this merchant\" when you categorise a transaction; remove one here if it guesses wrong."
-    );
-
-    new Setting(merchantAdvanced)
-      .setName("Learn categories from past notes")
-      .setDesc(
-        "When no rule above matches, file the capture the way the same merchant was filed last time in your daily notes. Categorising a merchant by hand once is then enough to catch every later capture from it, with nothing to remember to tick. Rules above always win over history."
-      )
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.learnCategoriesFromHistory !== false).onChange(async (value) => {
-          this.plugin.settings.learnCategoriesFromHistory = value;
-          await this.plugin.saveSettings();
-        })
-      );
-
-    this.renderMerchantMapList(merchantAdvanced.createDiv({ cls: "finance-tracker-goal-list" })).catch(() => {});
-
-    // Trips: the notes, plus trip mode, in one place. Trip mode used to be its
-    // own section further down, which read as a separate feature rather than a
-    // switch belonging to the trip you just picked.
     addSection(
-      "Trips",
-      "Save for several trips at once — each note below can be active simultaneously. Spending counts as trip spending automatically when the note date falls inside a trip's start and end dates. Archiving a finished trip freezes its savings steps and spending record into the note."
-    );
-
-    const tripActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
-    addAction(tripActions, "Select or create a trip", () => {
-      new HolidayBudgetModal(this.app, this.plugin, async () => this.display()).open();
-    }, { primary: true, opensModal: true });
-    addAction(tripActions, "Archive finished trips", async () => {
-      await this.plugin.archiveFinishedHolidays({ notify: true });
-      this.display();
-    }, { errorPrefix: "Archiving trips" });
-    addAction(
-      tripActions,
-      this.plugin.settings.tripModeActive ? "End trip mode" : "Start trip mode",
-      async () => {
-        if (this.plugin.settings.tripModeActive) await this.plugin.endTrip();
-        else await this.plugin.startTrip();
-        this.display();
-      },
-      { errorPrefix: "Trip mode" }
-    );
-
-    containerEl.createEl("p", {
-      cls: "finance-tracker-settings-section-copy",
-      text: this.plugin.settings.tripModeActive
-        ? `Trip mode is on — quick add and URL captures default to this trip's tag and currency: ${this.plugin.settings.activeTripGoalPath || this.plugin.settings.activeHolidayBudgetPath}`
-        : "Trip mode is off. Turn it on while you are away and quick add will default to the trip's tag and currency.",
-    });
-
-    const goalListEl = containerEl.createDiv({ cls: "finance-tracker-goal-list" });
-    this.renderGoalList(goalListEl, "holiday").catch(() => {});
-
-    addSection("Savings goals", "Create standalone savings goal notes for things like a house deposit or rainy day fund. Any goal with a target amount and a due date shows sinking-fund math automatically.");
-    const savingsActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
-    addAction(savingsActions, "Create savings goal", () => {
-      this.plugin.openNewGoal(async () => this.display());
-    }, { primary: true, opensModal: true });
-
-    const savingsGoalListEl = containerEl.createDiv({ cls: "finance-tracker-goal-list" });
-    this.renderGoalList(savingsGoalListEl, "savings").catch(() => {});
-
-    addSection(
-      "Recurring payments",
-      "Recurring bills are detected from tags whose subtag encodes the cadence, like #log/spending/subscriptions/monthly/spotify."
+      "Bills and runway",
+      "Bills are the notes in the Bills folder, matched to payments tagged like #log/spending/subscriptions/monthly/spotify. Until you convert, they are detected from those tags."
     );
 
     new Setting(containerEl)
@@ -488,10 +392,26 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
       primary: true,
       errorPrefix: "Opening recurring payments note",
     });
-    addSection(
-      "Runway",
-      "How much you need available to be safe for a chosen period, worked out from the bills above. Read-only — there is nothing to fund and nothing to keep in sync. Show it with the Runway block, or at the bottom of the recurring payments note."
-    );
+    new Setting(containerEl)
+      .setName("Payment calendar range")
+      .setDesc("How far ahead the recurring block's payment calendar looks. The buttons above the calendar switch it for one session.")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("1", "1 month")
+          .addOption("3", "3 months")
+          .addOption("12", "12 months")
+          .setValue(String(this.plugin.settings.paymentCalendarMonths || DEFAULT_SETTINGS.paymentCalendarMonths))
+          .onChange(async (value) => {
+            this.plugin.settings.paymentCalendarMonths = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    containerEl.createEl("h4", { text: "Runway" });
+    containerEl.createEl("p", {
+      cls: "finance-tracker-settings-section-copy",
+      text: "How much you need available to be safe for a chosen period, worked out from the bills above. Read-only — there is nothing to fund and nothing to keep in sync. Show it with the Runway block, or at the bottom of the recurring payments note.",
+    });
 
     new Setting(containerEl)
       .setName("Runway period")
@@ -554,6 +474,55 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
 
     const runwayStatus = containerEl.createDiv({ cls: "finance-tracker-vault-status" });
     this.renderRunwayStatus(runwayStatus).catch(() => {});
+
+    addSection("Goals and trips", "Savings goals are envelopes tracked in your notes. Any goal with a target and a due date shows what to set aside each week, and prompts you when it's due or done. The finance hub's Goals & trips tab does all of this too.");
+    containerEl.createEl("h4", { text: "Savings goals" });
+    const savingsActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
+    addAction(savingsActions, "New goal", () => {
+      this.plugin.openNewGoal(async () => this.display());
+    }, { primary: true, opensModal: true });
+
+    const savingsGoalListEl = containerEl.createDiv({ cls: "finance-tracker-goal-list" });
+    this.renderGoalList(savingsGoalListEl, "savings").catch(() => {});
+
+    // Trips: the notes, plus trip mode, in one place. Trip mode used to be its
+    // own section further down, which read as a separate feature rather than a
+    // switch belonging to the trip you just picked.
+    containerEl.createEl("h4", { text: "Trips" });
+    containerEl.createEl("p", {
+      cls: "finance-tracker-settings-section-copy",
+      text:
+      "Save for several trips at once — each note below can be active simultaneously. Spending counts as trip spending automatically when the note date falls inside a trip's start and end dates. Archiving a finished trip freezes its savings steps and spending record into the note.",
+    });
+
+    const tripActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
+    addAction(tripActions, "New or existing trip", () => {
+      new HolidayBudgetModal(this.app, this.plugin, async () => this.display()).open();
+    }, { primary: true, opensModal: true });
+    addAction(tripActions, "Archive finished trips", async () => {
+      await this.plugin.archiveFinishedHolidays({ notify: true });
+      this.display();
+    }, { errorPrefix: "Archiving trips" });
+    addAction(
+      tripActions,
+      this.plugin.settings.tripModeActive ? "End trip mode" : "Start trip mode",
+      async () => {
+        if (this.plugin.settings.tripModeActive) await this.plugin.endTrip();
+        else await this.plugin.startTrip();
+        this.display();
+      },
+      { errorPrefix: "Trip mode" }
+    );
+
+    containerEl.createEl("p", {
+      cls: "finance-tracker-settings-section-copy",
+      text: this.plugin.settings.tripModeActive
+        ? `Trip mode is on — quick add and URL captures default to this trip's tag and currency: ${this.plugin.settings.activeTripGoalPath || this.plugin.settings.activeHolidayBudgetPath}`
+        : "Trip mode is off. Turn it on while you are away and quick add will default to the trip's tag and currency.",
+    });
+
+    const goalListEl = containerEl.createDiv({ cls: "finance-tracker-goal-list" });
+    this.renderGoalList(goalListEl, "holiday").catch(() => {});
 
     addSection(
       "Portfolio",
@@ -630,11 +599,64 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
     const portfolioActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
     addAction(portfolioActions, "Open portfolio", () => this.plugin.openPortfolioNote(), { primary: true, errorPrefix: "Opening the portfolio" });
 
-    addSection("Setup", "Re-run the guided setup to create any missing starter notes. Existing notes are never overwritten.");
+    addSection("Files and setup", "Where the plugin keeps its notes, and the guided setup, which creates any starter notes that are missing and never overwrites one.");
     const setupActions = containerEl.createDiv({ cls: "finance-tracker-settings-actions" });
     addAction(setupActions, "Set up finance notes", () => new SetupWizardModal(this.app, this.plugin).open(), {
       opensModal: true,
     });
+    const filesAdvanced = addAdvanced("Advanced: file locations", "Set for you by first-time setup.");
+
+    new Setting(filesAdvanced)
+      .setName("Budgets folder")
+      .setDesc("Folder where the default budget, trip budgets, and the recurring payments note live.")
+      .addText((text) =>
+        text.setPlaceholder("Utility/Budgets").setValue(this.plugin.settings.budgetsFolderPath).onChange(async (value) => {
+          this.plugin.settings.budgetsFolderPath = value.trim() || DEFAULT_SETTINGS.budgetsFolderPath;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(filesAdvanced)
+      .setName("Budget archive folder")
+      .setDesc("Trips and goals are moved here when you archive them.")
+      .addText((text) =>
+        text.setPlaceholder("Utility/Budgets/Archive").setValue(this.plugin.settings.budgetArchiveFolderPath).onChange(async (value) => {
+          this.plugin.settings.budgetArchiveFolderPath = value.trim() || DEFAULT_SETTINGS.budgetArchiveFolderPath;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(filesAdvanced)
+      .setName("Recurring payments note")
+      .setDesc("Filename of the bill-management note, inside the budgets folder.")
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_SETTINGS.recurringNoteName)
+          .setValue(this.plugin.settings.recurringNoteName)
+          .onChange(async (value) => {
+            this.plugin.settings.recurringNoteName = value.trim() || DEFAULT_SETTINGS.recurringNoteName;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(filesAdvanced)
+      .setName("Budgets note name")
+      .setDesc("Filename of the default budget note, inside the budgets folder.")
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_SETTINGS.defaultBudgetNoteName)
+          .setValue(this.plugin.settings.defaultBudgetNoteName)
+          .onChange(async (value) => {
+            this.plugin.settings.defaultBudgetNoteName = value.trim() || DEFAULT_SETTINGS.defaultBudgetNoteName;
+            await this.plugin.saveSettings();
+          })
+      );
+
+
+    for (const heading of sections) {
+      const link = nav.createEl("button", { cls: "finance-settings-nav-link", text: heading.textContent || heading.text || "" });
+      link.addEventListener("click", () => heading.scrollIntoView?.({ behavior: "smooth", block: "start" }));
+    }
   }
 
   // The three note-format settings are each a text box where a wrong value
