@@ -1836,3 +1836,24 @@
 /* ---- Settings jump links ---- */
 .finance-settings-nav { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 16px; }
 .finance-settings-nav-link { font-size: var(--font-ui-small); padding: 2px 10px; }
+
+/* ---- Phone widths ----
+   The plugin isn't desktop-only, so everything above has to fit about 375px.
+   Rows keep their label beside the field until there's no room, then stack;
+   long grids scroll inside their card rather than pushing the page sideways. */
+.finance-edit-row input,
+.finance-edit-row select { flex: 1 1 auto; min-width: 0; }
+.finance-edit-row label { flex: 0 0 auto; }
+
+@media (max-width: 480px) {
+  .finance-edit-row { flex-wrap: wrap; gap: 0.3em; }
+  .finance-edit-row label { width: 100%; }
+  .finance-tracker-summary { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
+  .finance-tracker-summary-value { font-size: 1.1em; }
+  .finance-tracker-year-grid { min-width: 520px; }
+  .finance-tracker-chart-card:has(.finance-tracker-year-grid) { overflow-x: auto; }
+  .finance-prompt .finance-tracker-header-actions button,
+  .finance-hub-toolbar button { flex: 1 1 auto; }
+  .finance-settings-nav-link { flex: 1 1 auto; }
+  .finance-runway-balance { padding: 8px 10px; }
+}
