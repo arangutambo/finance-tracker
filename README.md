@@ -24,9 +24,10 @@ That is the whole data format. Everything below is built from it.
   none of them does until you ask:
   - **GitHub gist capture** talks to GitHub, using your own gist and token.
   - **Share prices**, if you choose a price source other than typing them in:
-    a Google Sheet you publish, or Yahoo Finance's unofficial price feed. Only
-    the tickers you hold are sent, and only when the portfolio is opened or
-    refreshed.
+    a Google Sheet you publish, or Yahoo Finance's unofficial price feed (whose
+    requests identify as a web browser, since Yahoo refuses anything else). Only
+    the tickers you hold or watch are sent, and only when the portfolio or the
+    hub's Today tab is opened, or you refresh.
   - **Trip exchange rates**, only when you press **Fetch current rate**: one
     request to [Frankfurter](https://frankfurter.dev) for the European Central
     Bank's reference rate between the two currencies.
@@ -109,12 +110,12 @@ One view for everything beyond logging, in tabs:
 
 | Tab | What's there |
 | --- | --- |
-| **Today** | The Daily budget panel: today, this period, left per day, budgets, bills due. |
+| **Today** | The Daily budget panel (today, this period, left per day, budgets, bills due), goal and trip prompts, and your shares' move today. |
 | **Inbox** | Bills that are overdue or due soon (with **Mark paid**), payments that look recurring but belong to no bill, every uncategorised entry grouped by merchant, and captures that failed. The tab's badge counts all of them. |
 | **Budgets** | This week or month (whichever periods your budgets use): budget bars, uncategorised callout, daily spend and the category donut. |
 | **Bills** | The full bills list: overdue, due soon, later, the payment calendar and suggestions. |
 | **Goals & trips** | Every goal with **Contribute**, **New goal**, trip mode, and each trip's dates. |
-| **Portfolio** | The portfolio dashboard, with **Log trade**. |
+| **Portfolio** | Holdings with sparklines, dividends to log, your watchlist, and a page for each ticker. |
 | **Reviews** | A week, month, quarter or year with every dashboard section. Step back and forward with **‹ ›**; **Copy as text** copies a frozen review to paste into a note. |
 
 Every tab has its own command (**Open finance hub: bills**, and so on), so any
@@ -944,7 +945,7 @@ since.
 
 ## Accounts & portfolio
 
-Commands: **Snapshot balances** · **Open portfolio** · **Log a trade** · **Refresh share prices**
+Commands: **Snapshot balances** · **Open portfolio** · **Log a trade** · **Refresh share prices** · the hub's Portfolio tab
 
 > Everything here is arithmetic on your own records. It is **not financial or tax
 > advice**, and the capital-gains flag is a reminder to check, not a ruling.
@@ -984,18 +985,46 @@ writes a row for you.
   actually left your account, brokerage included. Leave it out and the cost is
   estimated at the current exchange rate, and flagged.
 - **Dividends** go in your daily notes as income, so they count everywhere income
-  counts: `- $12.40 #log/income/dividend/vas-ax`.
+  counts: `- $12.40 #log/income/dividend/vas-ax`. With prices from Yahoo you rarely
+  type these yourself — see *Dividends to log* below.
 - **Buying shares is a transfer, not spending.** Trades never enter a daily
   note, so they never touch a budget.
 
-The `finance-portfolio` block (already in the note) shows:
+The `finance-portfolio` block (already in the note, and the hub's Portfolio
+tab) shows:
 
 - value, cost base, gain, today's move, realised gains, twelve months of
   dividends and an annualised return;
-- holdings, first in first out, with brokerage in the cost base — tap one for
-  its parcels, and which have been held twelve months;
+- holdings, first in first out, with brokerage in the cost base, each with a
+  sparkline of its last month;
+- **Dividends to log** and your **watchlist** (below);
 - allocation by market and holding, value against cost over time, dividends
   with yield on cost, and every trade.
+
+**A holding's page.** Tap a holding, or a watchlist ticker, for its price over
+1M, 3M, 6M, 1Y or 2Y with your buys and sells marked as dots, your average cost
+as a dashed line and ex-dividend dates as ticks underneath; then your units,
+value, gain, parcels (flagging those held twelve months), recent dividends,
+**Log trade** already filled in with the ticker, and **Open on Yahoo Finance**.
+It draws from prices already fetched, so opening it never makes a request.
+
+**Watchlist.** Follow a share or ETF without owning it: **Add to watchlist** (it
+searches as you type) saves it in the note's `watchlist` property, e.g.
+`watchlist: [VGS.AX, NDQ.AX]`, which you can also edit by hand. Each ticker shows
+its price, today's move, the last month's change and a sparkline.
+
+**Dividends to log.** Yahoo publishes each holding's dividends: the ex-date and
+the amount per unit. The portfolio works out how many units you held the day
+before each ex-date (buying on the ex-date doesn't earn that dividend), and lists
+any dividend in the last twelve months with nothing logged near it, and no
+reinvestment either, as *VAS.AX · ex 2026-07-01 · 20 units × $0.49 = $9.80*.
+**Log it** opens it with that estimate and a paid-on date to confirm or correct
+(withholding and rounding change the real figure), then logs it as income in
+that day's note. **Dismiss** stops listing it. They also appear in the hub's
+Inbox.
+
+**Today** in the hub shows a *Shares today* card: the day's move in dollars and
+percent, the biggest mover, and any dividends to log.
 
 ### Where prices come from
 
@@ -1005,12 +1034,13 @@ Settings → **Portfolio** → **Price source**:
 | --- | --- | --- |
 | **Typed in** (default) | none | Put prices in the note's properties: `price_overrides: VAS.AX=103.42, AAPL=229.10` and `fx_rates: USD=1.51`. Always works. |
 | **A published Google Sheet** | Google | Free, reliable, and yours. Settings gives you a template to paste into a new sheet — a row per ticker, `GOOGLEFINANCE` formulas already written — then publish it as CSV and paste the link. |
-| **Yahoo Finance** | Yahoo | Free and covers the ASX, but **unofficial**: it can refuse requests or change without notice. |
+| **Yahoo Finance** | Yahoo | Free, covers the ASX, US and London (prices in pence become pounds), and the only source with **price history** (the charts) and **dividend history** (*Dividends to log*). **Unofficial**: Yahoo only answers requests that look like a web browser's, so the plugin's requests identify as one. It could stop working without notice. |
 
 However prices arrive, they are cached, so the portfolio still shows offline or
-while a source is refusing — with old prices marked as old. A source that
-refuses is backed off (2 minutes, doubling, up to six hours), and prices you type
-in always win. Prices are only fetched when the portfolio block is opened or you
+while a source is refusing — with old prices marked as old. Yahoo has two
+servers, and a refusal from one is tried on the other; a source that refuses
+outright is backed off (2 minutes, doubling, up to six hours), and prices you
+type in always win. Prices are only fetched when the portfolio block is opened or you
 run **Refresh share prices**; there is no background polling.
 
 There is no way to use the Stocks app on a Mac or iPhone: it has no API, and its

@@ -1,6 +1,24 @@
 # Changelog
 
-## Unreleased (planned 0.9.0)
+## 1.0.0
+
+**Shares that keep themselves up to date.**
+
+- **Yahoo prices work.** Yahoo refuses requests that don't look like a browser's —
+  every request from the author's Mac was refused — so the plugin's requests now
+  identify as one, try Yahoo's second server when the first refuses, and time out
+  after eight seconds. London prices quoted in pence become pounds.
+- **Fixed: "today" was the gain over two years.** Yesterday's close is now the last
+  daily bar before the current trading day, dated on the exchange's own calendar.
+- **A page for each holding**: its price over 1M to 2Y with your trades marked,
+  your average cost as a line and ex-dividend dates as ticks, plus parcels, recent
+  dividends, Log trade and a link to Yahoo Finance.
+- **Watchlist**: follow tickers you don't own, with price, today, the month and a
+  sparkline. Holdings get a month sparkline too.
+- **Dividends to log**: from Yahoo's dividend history and the units you held
+  before each ex-date, dividends with nothing logged are listed in the portfolio
+  and the inbox, ready to log with the estimate or dismiss.
+- **Shares today** on the hub's Today tab: the day's move and the biggest mover.
 
 **A home for everything beyond logging: the finance hub.**
 

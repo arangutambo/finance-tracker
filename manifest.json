@@ -1,9 +1,9 @@
 {
   "id": "finance-tracker",
   "name": "Finance Tracker",
-  "version": "0.8.0",
+  "version": "1.0.0",
   "minAppVersion": "1.0.0",
-  "description": "Log spending as tags in your daily notes, then turn them into pace-aware budget, recurring-bill, split-expense, trip, forecast, net-worth, and savings dashboards. Capture via Apple Shortcuts or a quick-add modal.",
+  "description": "Log spending as tags in your daily notes and get budgets, bills, savings goals, trips, weekly reviews and a share portfolio back, all in one finance hub. Capture from Apple Shortcuts or quick add.",
   "author": "Antoine Jhaddad",
   "authorUrl": "https://github.com/arangutambo",
   "isDesktopOnly": false
