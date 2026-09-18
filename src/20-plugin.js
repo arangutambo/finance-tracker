@@ -3092,7 +3092,9 @@ class FinanceTrackerPlugin extends Plugin {
       .filter((entry) => entry.goalKey === goalDefinition.goalKey && entry.isGoalContribution && core.parseIsoDate(entry.date))
       .map((entry) => entry.date)
       .sort();
-    summary.sinkingFund = summary.targetAmount > 0 && goalDefinition.dueDate
+    // An archived goal is finished business: no set-aside, no pace. The
+    // archived Japan trip went on reporting "$7,926 a week, behind pace".
+    summary.sinkingFund = summary.targetAmount > 0 && goalDefinition.dueDate && !goalDefinition.archivedDate
       ? core.computeSinkingFund({
           anchorDate: contributionDates[0] || "",
           currentSaved: summary.currentSaved,
@@ -4414,6 +4416,7 @@ class FinanceTrackerPlugin extends Plugin {
         goalDefinition = {
           activeSavingsGoal: holiday.activeSavingsGoal,
           allocatedExpenses: holiday.allocatedExpenses,
+          archivedDate: holiday.archivedDate || "",
           carryMissedSavings: holiday.carryMissedSavings,
           currency: holiday.currency,
           dueDate: holiday.savingsDueDate,

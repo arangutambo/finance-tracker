@@ -2206,3 +2206,13 @@ test("the settings tab renders every section, in the hub's order", async () => {
     assert.ok(names.includes(name), `${name} is still there`);
   }
 });
+
+
+test("an archived goal's dashboard stops asking for a weekly set-aside", async () => {
+  const note = IPHONE_GOAL.replace("active: true", "active: false\narchived: 2026-09-20");
+  const { plugin, app } = await vaultWithGoal(note);
+  await app.vault.create("Utility/Budgets/Archive/iPhone.md", note);
+  const el = new StubEl();
+  await plugin.renderSavingsDashboard("", el, { sourcePath: "Utility/Budgets/Archive/iPhone.md" });
+  assert.doesNotMatch(el.allText(), /Set aside \/ week|Behind pace|Nothing saved yet/);
+});
