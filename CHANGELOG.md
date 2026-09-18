@@ -1,5 +1,108 @@
 # Changelog
 
+## Unreleased (planned 0.9.0)
+
+**A home for everything beyond logging: the finance hub.**
+
+- **The finance hub** (ribbon wallet icon, **Open finance hub**) puts Today, Inbox,
+  Budgets, Bills, Goals & trips, Portfolio and Reviews in one view, each tab with its
+  own command. The Inbox tab's badge counts what's waiting. The Daily budget sidebar
+  stays, with a **Hub** button.
+- **Blocks keep themselves current.** Every finance block open in a note, the hub
+  and the sidebar refresh once when a daily note, budget, goal, bill or the portfolio
+  note changes, including changes synced from another device. A block you're typing
+  into waits until you click away.
+
+**Categorising is one pass through an inbox, not a daily chore.**
+
+- **Categorisation inbox**: every uncategorised entry, whatever its date, grouped by
+  merchant, with a suggested category and where it came from, and one tap to file
+  them all. Failed captures are listed with Retry and Dismiss.
+- **Suggestions learn from your notes**: merchant rules, then how the same shop was
+  filed before, then shops with the same root ("SQ * Milk N Mochi Pty Ltd" and
+  "Milk N Mochi" are one shop). Quick add's preview now shows the guess it will use.
+- **Merchant rules can be added, edited and tested in settings**, not only removed.
+  The `Merchant Map.md` import, gated off since 0.7, runs again, and your own rules
+  win over the file.
+- **Rename or split a category** rewrites it across daily notes, the budgets table
+  and merchant rules, or splits it by merchant, behind a preview.
+- **Edit transaction** gains a category picker with search, a date that moves the
+  entry to that day's note, and "apply to the other N from this shop".
+- **Fixed: trips filed under `#log/archive/<year>/<trip>/…` counted as home
+  spending.** **Convert legacy trip tags** rewrites them to the current trip format.
+
+**Bills are notes.**
+
+- **One note per bill** in `Utility/Budgets/Bills/`, with its terms as properties:
+  cadence, due rule (after the last payment, a day of the month, or the nth weekday),
+  amount, aliases, reminder days, price changes, end date. **Convert recurring
+  payments to bill notes** builds them from the old tags and registry, merging
+  duplicate wordings, behind a preview.
+- **The Bills list** groups bills as Overdue, Due soon, Later this month and Later,
+  with **Mark paid** and a menu for push, skip, edit, merge, pause and end. Skips are
+  recorded on the bill instead of as $0 lines. Payments no bill claims are offered as
+  **Track**, **Add to a bill** or **Ignore**.
+- **Captures are matched to bills** by merchant alias, with an Undo.
+- **Tidy up recurring payments** removes same-day duplicate charges (the author had
+  $570 of triple-logged gym payments), old $0 skip lines and leftover registry rows.
+- **Fixed: bills you had removed still counted** toward cost per month, cost per
+  year and everything downstream of them.
+- **Fixed: the forecast used every bill ever detected** and started from $0 without
+  saying so; it now uses live bills and says which inputs are missing.
+
+**Shares and ETFs.**
+
+- **A portfolio** from a Trades table in `📈 Portfolio.md`: holdings (first in, first
+  out, brokerage in the cost base), gains, dividends (`#log/income/dividend/<ticker>`)
+  with yield on cost, an annualised return, value against cost over time, and a
+  12-month-held flag. **Log a trade** has ticker search. Not financial or tax advice.
+- **Prices are a choice**: typed into the note (the default, no network), a Google
+  Sheet you publish (settings give you the template), or Yahoo Finance's unofficial
+  feed, which backs off when it refuses and keeps showing the last prices, marked old.
+- **Net worth becomes Accounts & portfolio**: balance snapshots plus the portfolio.
+  Snapshot balances suggests the accounts you already use.
+
+**Reviews that answer more than "how much".**
+
+- **`finance-dashboard` sections**: income and savings rate, an uncategorised callout,
+  category changes against the previous period, top merchants, largest transactions,
+  bills paid and still due, trip spending (never in home totals), and portfolio
+  activity. Weekly and monthly dashboards show them all, existing notes included;
+  `show:` and `hide:` choose them and their order.
+- **Insert weekly review** and **Insert monthly review** paste a frozen review of
+  the note's own week or month. Yearly and quarterly reviews use the note's date too.
+- **Fixed: "vs previous month" compared a 31-day stretch**, not the previous calendar
+  month. A finished week's budget bars no longer say "keep to $X/day".
+
+**Goals and trips that speak up.**
+
+- **Prompts** when a goal is due soon, due, or at its target, and when a trip starts,
+  ends with trip mode still on, or is over: each leads into contributing, a new due
+  date, trip mode or archiving (after a confirmation), and can wait until tomorrow.
+- **Fixed: a goal with nothing saved called itself "on track"** (the author's iPhone
+  goal, $0 of $2,000, due the next day).
+- **Goal keys and trip tags are made from the name** and shown as the tag they'll
+  produce, kept unique; the old "Goal key" and "Trip tracking tag" fields are under
+  Advanced. New trips ask for their currency instead of every note being born with
+  yen rates. A goal without a due date is no longer due the day it's created.
+- **Withdraw from a goal**, alongside Contribute, with goal autocomplete.
+- **Runway against a real balance**: choose the account it comes out of and runway
+  says covered (with how many days it lasts) or short by how much, and when.
+- **Fetch current rate** on trip exchange rates: the European Central Bank's
+  reference rate, one request, only when pressed.
+
+**Everything else.**
+
+- Settings follow the hub's areas, with jump links. Command names match the buttons
+  (**Log due bills**, **Start trip mode**); ids are unchanged, so hotkeys survive.
+- Money fields ask a phone for a decimal keyboard; forms, stat cards and the
+  12-month grid fit a phone.
+- CSV export adds `entry_type`, `my_share`, `trip` and `goal` columns at the end.
+- Labels are sentence case, and messages no longer show raw markdown backticks.
+- Fixed: two entries on the same line could overwrite each other when edited.
+- `main.js` is now generated from `finance-core.js` and `src/` by a dependency-free
+  script; `npm test` fails if it drifts.
+
 ## 0.8.0
 
 **Bills know which cycles a price change actually applies to.**
