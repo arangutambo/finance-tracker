@@ -1222,6 +1222,12 @@ const core = (() => {
       "transaction",
       "source",
       "file_path",
+      // Added at the end so a spreadsheet reading columns by position still
+      // works. Without entry_type, income and balance rows looked like spending.
+      "entry_type",
+      "my_share",
+      "trip",
+      "goal",
     ];
 
     const escapeCell = (value) => {
@@ -1243,6 +1249,10 @@ const core = (() => {
       entry.transaction || "",
       entry.source || "",
       entry.filePath || "",
+      entry.entryType || "spending",
+      Number.isFinite(entry.myShare) ? formatPlainNumber(entry.myShare) : "",
+      entry.holidayKey || "",
+      entry.goalKey || "",
     ]);
 
     return [headers, ...rows].map((row) => row.map(escapeCell).join(",")).join("\n");
@@ -9017,7 +9027,7 @@ class FinanceTrackerPlugin extends Plugin {
       "| Groceries | food/groceries | 120 | week | AUD |",
       "| Restaurants | food/restaurants | 80 | week | AUD |",
       "| Transport | transport | 60 | week | AUD |",
-      "| Subscriptions | subscription | 40 | month | AUD |",
+      "| Subscriptions | subscriptions | 40 | month | AUD |",
       "| All Spending | all | 450 | week | AUD |",
       "",
       "## Notes",
@@ -9439,7 +9449,7 @@ class FinanceTrackerPlugin extends Plugin {
       "",
       "- **Log now** logs the bill dated today, whenever you actually click it — the due-date",
       "  schedule stays anchored to its cadence regardless, even if you log it a few days late.",
-      "- **Skip cycle** logs a $0 entry on the due day — the schedule moves on, the amount is remembered.",
+      "- **Skip** records the skipped cycle on the bill — the schedule moves on, and no $0 line is written.",
       "- A price change is just the next logged amount; the plugin always uses the latest —",
       "  or use **Edit** in manage mode to schedule a future change with an exact date, or",
       "  correct the next due date directly.",
@@ -9449,8 +9459,8 @@ class FinanceTrackerPlugin extends Plugin {
       "  from there you can **Resume** it or **Remove completely** so it's never tracked again.",
       "- A bill that stops on its own — a fixed-term contract, an instalment plan —",
       "  gets an **End Date** or **Payments Left** in the registry and retires itself.",
-      "- **Runway** below is the savings side: how much of your outgoings you want covered",
-      "  at all times. Logging a bill draws it down automatically; top it up with Contribute.",
+      "- **Runway** below is how much to keep available for the period set in Settings → Runway,",
+      "  worked out from these bills. Choose an account there to see whether its balance covers it.",
       "",
       "```finance-recurring",
       "manage: true",
@@ -9521,10 +9531,11 @@ class FinanceTrackerPlugin extends Plugin {
       "# 🎯 Goals",
       "",
       "Savings goals are virtual envelopes: log a contribution with the",
-      "**Contribute to savings goal** command (or a bullet like",
+      "**Contribute to a goal** command (or a bullet like",
       "`- $150.00 #log/income/roadbike`) and nothing needs to move between real",
-      "bank accounts. Create goals with **Create savings goal**; trips with",
-      "**Select or create trip**.",
+      "bank accounts. Create goals with **Create savings goal**, and trips with",
+      "**Start trip** → type a new trip's name. The finance hub's Goals & trips tab",
+      "has all of these too.",
       "",
       "If several goals live inside one savings account, add",
       "`account: <your-account>` to the block below and take balance snapshots —",
@@ -11049,24 +11060,24 @@ class FinanceTrackerPlugin extends Plugin {
     const cardData = goal.goalType === "holiday"
       ? [
         { label: "Target", value: core.formatCurrency(summary.targetAmount, currency) },
-        { label: "Current Account Balance", value: core.formatCurrency(summary.currentAccountBalance, currency) },
-        { label: "Paid Planned expenses", value: core.formatCurrency(summary.paidPlannedExpenses, currency) },
-        { label: "Saved Progress", value: core.formatCurrency(summary.savedProgress, currency) },
+        { label: "In the account", value: core.formatCurrency(summary.currentAccountBalance, currency) },
+        { label: "Planned costs paid", value: core.formatCurrency(summary.paidPlannedExpenses, currency) },
+        { label: "Saved progress", value: core.formatCurrency(summary.savedProgress, currency) },
         { label: summary.amountRemainingLabel, value: core.formatCurrency(summary.amountRemaining, currency) },
         { label: "Saved %", value: summary.targetAmount > 0 ? `${summary.proportionSaved}%` : "0%" },
-        { label: "Required This Period", value: core.formatCurrency(summary.requiredPerPeriod, currency) },
-        { label: "This Period", value: core.formatCurrency(summary.currentPeriodContribution, currency) },
+        { label: "Needed this period", value: core.formatCurrency(summary.requiredPerPeriod, currency) },
+        { label: "This period", value: core.formatCurrency(summary.currentPeriodContribution, currency) },
         { label: "Avg accommodation / day", value: core.formatCurrency(extras.averageAccommodationPerDay || 0, currency) },
-        { label: "Maximum Spent / Night", value: extras.maximumAccommodationPerNight ? core.formatCurrency(extras.maximumAccommodationPerNight, currency) : "Not set" },
-        { label: "Minimum Spent / Night", value: extras.minimumAccommodationPerNight ? core.formatCurrency(extras.minimumAccommodationPerNight, currency) : "Not set" },
+        { label: "Most per night", value: extras.maximumAccommodationPerNight ? core.formatCurrency(extras.maximumAccommodationPerNight, currency) : "Not set" },
+        { label: "Least per night", value: extras.minimumAccommodationPerNight ? core.formatCurrency(extras.minimumAccommodationPerNight, currency) : "Not set" },
       ]
       : [
         { label: "Target", value: core.formatCurrency(summary.targetAmount, currency) },
-        { label: "Current Saved", value: core.formatCurrency(summary.currentSaved, currency) },
+        { label: "Saved so far", value: core.formatCurrency(summary.currentSaved, currency) },
         { label: summary.amountRemainingLabel, value: core.formatCurrency(summary.amountRemaining, currency) },
         { label: "Saved %", value: summary.targetAmount > 0 ? `${summary.proportionSaved}%` : "0%" },
-        { label: "Required This Period", value: core.formatCurrency(summary.requiredPerPeriod, currency) },
-        { label: "This Period", value: core.formatCurrency(summary.currentPeriodContribution, currency) },
+        { label: "Needed this period", value: core.formatCurrency(summary.requiredPerPeriod, currency) },
+        { label: "This period", value: core.formatCurrency(summary.currentPeriodContribution, currency) },
       ];
     if (summary.sinkingFund) {
       const fund = summary.sinkingFund;
@@ -11367,7 +11378,7 @@ class FinanceTrackerPlugin extends Plugin {
 
       const header = wrapper.createDiv({ cls: "finance-tracker-header" });
       header.createEl("h3", {
-        text: config.title || `${toTitleFromHolidayKey(holidayKey)} Holiday Dashboard`,
+        text: config.title || `${toTitleFromHolidayKey(holidayKey)} trip`,
       });
 
       const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
@@ -11536,7 +11547,7 @@ class FinanceTrackerPlugin extends Plugin {
         this.renderBudgets(wrapper, progress, currency, {
           compact: true,
           hideEmptyState: true,
-          title: `${core.titleCaseSegment(sectionPeriod)} Budgets`,
+          title: `${core.titleCaseSegment(sectionPeriod)} budgets`,
         });
       }
     }
@@ -17056,7 +17067,7 @@ class EditRecurringItemModal extends Modal {
 
     const amountRow = contentEl.createDiv({ cls: "finance-edit-row" });
     amountRow.createEl("label", { text: "Amount" });
-    const amountInput = amountRow.createEl("input", { type: "number", attr: { step: "0.01" } });
+    const amountInput = amountRow.createEl("input", { type: "number", attr: { inputmode: "decimal", step: "0.01" } });
     amountInput.value = String(item.lastAmount ?? "");
 
     const nextDueRow = contentEl.createDiv({ cls: "finance-edit-row" });
@@ -17087,7 +17098,7 @@ class EditRecurringItemModal extends Modal {
 
     const nextAmountRow = scheduleFields.createDiv({ cls: "finance-edit-row" });
     nextAmountRow.createEl("label", { text: "New amount" });
-    const nextAmountInput = nextAmountRow.createEl("input", { type: "number", attr: { step: "0.01" } });
+    const nextAmountInput = nextAmountRow.createEl("input", { type: "number", attr: { inputmode: "decimal", step: "0.01" } });
     nextAmountInput.value = String(item.nextAmount ?? "");
 
     const changeDateRow = scheduleFields.createDiv({ cls: "finance-edit-row" });
@@ -17115,7 +17126,7 @@ class EditRecurringItemModal extends Modal {
 
     const paymentsRow = termFields.createDiv({ cls: "finance-edit-row" });
     paymentsRow.createEl("label", { text: "Payments left" });
-    const paymentsInput = paymentsRow.createEl("input", { type: "number", attr: { step: "1", min: "0" } });
+    const paymentsInput = paymentsRow.createEl("input", { type: "number", attr: { inputmode: "numeric", step: "1", min: "0" } });
     paymentsInput.value = Number.isFinite(item.paymentsLeft) && item.paymentsLeft !== null ? String(item.paymentsLeft) : "";
 
     // Live schedule preview. A price change is easy to mis-set by a few days —
@@ -17283,7 +17294,7 @@ class EditRecurringItemModal extends Modal {
     dueSelect.value = bill.dueRule?.type || "after-last";
 
     const dayRow = row("Day");
-    const dayInput = dayRow.createEl("input", { type: "number", attr: { min: "1", max: "31", "aria-label": "Day of month" } });
+    const dayInput = dayRow.createEl("input", { type: "number", attr: { inputmode: "numeric", min: "1", max: "31", "aria-label": "Day of month" } });
     dayInput.value = bill.dueRule?.type === "day-of-month" ? String(bill.dueRule.day) : "";
 
     const weekdayRow = row("Which");
@@ -17309,7 +17320,7 @@ class EditRecurringItemModal extends Modal {
 
     const reminderInput = row("Remind me").createEl("input", {
       type: "number",
-      attr: { min: "0", max: "60", "aria-label": "Reminder days" },
+      attr: { min: "0", max: "60", inputmode: "numeric", "aria-label": "Reminder days" },
     });
     reminderInput.value = String(bill.reminderDays ?? 3);
     contentEl.createEl("p", { cls: "finance-edit-hint", text: "Days before the due date this bill moves into Due soon." });
@@ -17363,7 +17374,7 @@ class LogVariableBillModal extends Modal {
 
     const amountRow = contentEl.createDiv({ cls: "finance-edit-row" });
     amountRow.createEl("label", { text: "Amount" });
-    const amountInput = amountRow.createEl("input", { type: "number", attr: { step: "0.01" } });
+    const amountInput = amountRow.createEl("input", { type: "number", attr: { inputmode: "decimal", step: "0.01" } });
     amountInput.value = String(item.averageAmount ?? item.lastAmount ?? "");
 
     const buttons = contentEl.createDiv({ cls: "finance-edit-buttons" });
@@ -17503,7 +17514,7 @@ class AddBillModal extends Modal {
     dueSelect.value = "after-last";
 
     const dayRow = row("Day");
-    const dayInput = dayRow.createEl("input", { type: "number", attr: { min: "1", max: "31", placeholder: "26", "aria-label": "Day of month" } });
+    const dayInput = dayRow.createEl("input", { type: "number", attr: { inputmode: "numeric", min: "1", max: "31", placeholder: "26", "aria-label": "Day of month" } });
     const weekdayRow = row("Which");
     const ordinalSelect = weekdayRow.createEl("select", { attr: { "aria-label": "Which weekday" } });
     for (const [value, label] of [["1", "First"], ["2", "Second"], ["3", "Third"], ["4", "Fourth"], ["-1", "Last"]]) {
@@ -19271,7 +19282,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
 
     const merchantAdvanced = addAdvanced(
       "Advanced: merchant map",
-      "Merchant → category rules. A rule matches a capture's merchant exactly, or as a whole chunk inside it, so \"woolworths\" also covers \"Woolworths/cnr Brisbane H\". Add one with the \"Remember this merchant → category\" checkbox when editing a transaction; remove one here if it guesses wrong."
+      "Merchant → category rules. A rule matches a capture's merchant exactly, or as a whole chunk inside it, so \"woolworths\" also covers \"Woolworths/cnr Brisbane H\". Add or edit one below, or tick \"Remember this merchant\" when you categorise a transaction; remove one here if it guesses wrong."
     );
 
     new Setting(merchantAdvanced)
@@ -19366,6 +19377,8 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
         dropdown
           .addOption("dueDate", "Due date (overdue first)")
           .addOption("monthlyCostDesc", "Cost per month (highest first)")
+          .addOption("amountDesc", "Amount (highest first)")
+          .addOption("amountAsc", "Amount (lowest first)")
           .addOption("nameAsc", "Name (A–Z)")
           .setValue(this.plugin.settings.recurringSortOrder || "dueDate")
           .onChange(async (value) => {

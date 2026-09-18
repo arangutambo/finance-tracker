@@ -2316,7 +2316,7 @@ class FinanceTrackerPlugin extends Plugin {
       "| Groceries | food/groceries | 120 | week | AUD |",
       "| Restaurants | food/restaurants | 80 | week | AUD |",
       "| Transport | transport | 60 | week | AUD |",
-      "| Subscriptions | subscription | 40 | month | AUD |",
+      "| Subscriptions | subscriptions | 40 | month | AUD |",
       "| All Spending | all | 450 | week | AUD |",
       "",
       "## Notes",
@@ -2738,7 +2738,7 @@ class FinanceTrackerPlugin extends Plugin {
       "",
       "- **Log now** logs the bill dated today, whenever you actually click it — the due-date",
       "  schedule stays anchored to its cadence regardless, even if you log it a few days late.",
-      "- **Skip cycle** logs a $0 entry on the due day — the schedule moves on, the amount is remembered.",
+      "- **Skip** records the skipped cycle on the bill — the schedule moves on, and no $0 line is written.",
       "- A price change is just the next logged amount; the plugin always uses the latest —",
       "  or use **Edit** in manage mode to schedule a future change with an exact date, or",
       "  correct the next due date directly.",
@@ -2748,8 +2748,8 @@ class FinanceTrackerPlugin extends Plugin {
       "  from there you can **Resume** it or **Remove completely** so it's never tracked again.",
       "- A bill that stops on its own — a fixed-term contract, an instalment plan —",
       "  gets an **End Date** or **Payments Left** in the registry and retires itself.",
-      "- **Runway** below is the savings side: how much of your outgoings you want covered",
-      "  at all times. Logging a bill draws it down automatically; top it up with Contribute.",
+      "- **Runway** below is how much to keep available for the period set in Settings → Runway,",
+      "  worked out from these bills. Choose an account there to see whether its balance covers it.",
       "",
       "```finance-recurring",
       "manage: true",
@@ -2820,10 +2820,11 @@ class FinanceTrackerPlugin extends Plugin {
       "# 🎯 Goals",
       "",
       "Savings goals are virtual envelopes: log a contribution with the",
-      "**Contribute to savings goal** command (or a bullet like",
+      "**Contribute to a goal** command (or a bullet like",
       "`- $150.00 #log/income/roadbike`) and nothing needs to move between real",
-      "bank accounts. Create goals with **Create savings goal**; trips with",
-      "**Select or create trip**.",
+      "bank accounts. Create goals with **Create savings goal**, and trips with",
+      "**Start trip** → type a new trip's name. The finance hub's Goals & trips tab",
+      "has all of these too.",
       "",
       "If several goals live inside one savings account, add",
       "`account: <your-account>` to the block below and take balance snapshots —",
@@ -4348,24 +4349,24 @@ class FinanceTrackerPlugin extends Plugin {
     const cardData = goal.goalType === "holiday"
       ? [
         { label: "Target", value: core.formatCurrency(summary.targetAmount, currency) },
-        { label: "Current Account Balance", value: core.formatCurrency(summary.currentAccountBalance, currency) },
-        { label: "Paid Planned expenses", value: core.formatCurrency(summary.paidPlannedExpenses, currency) },
-        { label: "Saved Progress", value: core.formatCurrency(summary.savedProgress, currency) },
+        { label: "In the account", value: core.formatCurrency(summary.currentAccountBalance, currency) },
+        { label: "Planned costs paid", value: core.formatCurrency(summary.paidPlannedExpenses, currency) },
+        { label: "Saved progress", value: core.formatCurrency(summary.savedProgress, currency) },
         { label: summary.amountRemainingLabel, value: core.formatCurrency(summary.amountRemaining, currency) },
         { label: "Saved %", value: summary.targetAmount > 0 ? `${summary.proportionSaved}%` : "0%" },
-        { label: "Required This Period", value: core.formatCurrency(summary.requiredPerPeriod, currency) },
-        { label: "This Period", value: core.formatCurrency(summary.currentPeriodContribution, currency) },
+        { label: "Needed this period", value: core.formatCurrency(summary.requiredPerPeriod, currency) },
+        { label: "This period", value: core.formatCurrency(summary.currentPeriodContribution, currency) },
         { label: "Avg accommodation / day", value: core.formatCurrency(extras.averageAccommodationPerDay || 0, currency) },
-        { label: "Maximum Spent / Night", value: extras.maximumAccommodationPerNight ? core.formatCurrency(extras.maximumAccommodationPerNight, currency) : "Not set" },
-        { label: "Minimum Spent / Night", value: extras.minimumAccommodationPerNight ? core.formatCurrency(extras.minimumAccommodationPerNight, currency) : "Not set" },
+        { label: "Most per night", value: extras.maximumAccommodationPerNight ? core.formatCurrency(extras.maximumAccommodationPerNight, currency) : "Not set" },
+        { label: "Least per night", value: extras.minimumAccommodationPerNight ? core.formatCurrency(extras.minimumAccommodationPerNight, currency) : "Not set" },
       ]
       : [
         { label: "Target", value: core.formatCurrency(summary.targetAmount, currency) },
-        { label: "Current Saved", value: core.formatCurrency(summary.currentSaved, currency) },
+        { label: "Saved so far", value: core.formatCurrency(summary.currentSaved, currency) },
         { label: summary.amountRemainingLabel, value: core.formatCurrency(summary.amountRemaining, currency) },
         { label: "Saved %", value: summary.targetAmount > 0 ? `${summary.proportionSaved}%` : "0%" },
-        { label: "Required This Period", value: core.formatCurrency(summary.requiredPerPeriod, currency) },
-        { label: "This Period", value: core.formatCurrency(summary.currentPeriodContribution, currency) },
+        { label: "Needed this period", value: core.formatCurrency(summary.requiredPerPeriod, currency) },
+        { label: "This period", value: core.formatCurrency(summary.currentPeriodContribution, currency) },
       ];
     if (summary.sinkingFund) {
       const fund = summary.sinkingFund;
@@ -4666,7 +4667,7 @@ class FinanceTrackerPlugin extends Plugin {
 
       const header = wrapper.createDiv({ cls: "finance-tracker-header" });
       header.createEl("h3", {
-        text: config.title || `${toTitleFromHolidayKey(holidayKey)} Holiday Dashboard`,
+        text: config.title || `${toTitleFromHolidayKey(holidayKey)} trip`,
       });
 
       const headerActions = header.createDiv({ cls: "finance-tracker-header-actions" });
@@ -4835,7 +4836,7 @@ class FinanceTrackerPlugin extends Plugin {
         this.renderBudgets(wrapper, progress, currency, {
           compact: true,
           hideEmptyState: true,
-          title: `${core.titleCaseSegment(sectionPeriod)} Budgets`,
+          title: `${core.titleCaseSegment(sectionPeriod)} budgets`,
         });
       }
     }

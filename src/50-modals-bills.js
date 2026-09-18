@@ -22,7 +22,7 @@ class EditRecurringItemModal extends Modal {
 
     const amountRow = contentEl.createDiv({ cls: "finance-edit-row" });
     amountRow.createEl("label", { text: "Amount" });
-    const amountInput = amountRow.createEl("input", { type: "number", attr: { step: "0.01" } });
+    const amountInput = amountRow.createEl("input", { type: "number", attr: { inputmode: "decimal", step: "0.01" } });
     amountInput.value = String(item.lastAmount ?? "");
 
     const nextDueRow = contentEl.createDiv({ cls: "finance-edit-row" });
@@ -53,7 +53,7 @@ class EditRecurringItemModal extends Modal {
 
     const nextAmountRow = scheduleFields.createDiv({ cls: "finance-edit-row" });
     nextAmountRow.createEl("label", { text: "New amount" });
-    const nextAmountInput = nextAmountRow.createEl("input", { type: "number", attr: { step: "0.01" } });
+    const nextAmountInput = nextAmountRow.createEl("input", { type: "number", attr: { inputmode: "decimal", step: "0.01" } });
     nextAmountInput.value = String(item.nextAmount ?? "");
 
     const changeDateRow = scheduleFields.createDiv({ cls: "finance-edit-row" });
@@ -81,7 +81,7 @@ class EditRecurringItemModal extends Modal {
 
     const paymentsRow = termFields.createDiv({ cls: "finance-edit-row" });
     paymentsRow.createEl("label", { text: "Payments left" });
-    const paymentsInput = paymentsRow.createEl("input", { type: "number", attr: { step: "1", min: "0" } });
+    const paymentsInput = paymentsRow.createEl("input", { type: "number", attr: { inputmode: "numeric", step: "1", min: "0" } });
     paymentsInput.value = Number.isFinite(item.paymentsLeft) && item.paymentsLeft !== null ? String(item.paymentsLeft) : "";
 
     // Live schedule preview. A price change is easy to mis-set by a few days —
@@ -249,7 +249,7 @@ class EditRecurringItemModal extends Modal {
     dueSelect.value = bill.dueRule?.type || "after-last";
 
     const dayRow = row("Day");
-    const dayInput = dayRow.createEl("input", { type: "number", attr: { min: "1", max: "31", "aria-label": "Day of month" } });
+    const dayInput = dayRow.createEl("input", { type: "number", attr: { inputmode: "numeric", min: "1", max: "31", "aria-label": "Day of month" } });
     dayInput.value = bill.dueRule?.type === "day-of-month" ? String(bill.dueRule.day) : "";
 
     const weekdayRow = row("Which");
@@ -275,7 +275,7 @@ class EditRecurringItemModal extends Modal {
 
     const reminderInput = row("Remind me").createEl("input", {
       type: "number",
-      attr: { min: "0", max: "60", "aria-label": "Reminder days" },
+      attr: { min: "0", max: "60", inputmode: "numeric", "aria-label": "Reminder days" },
     });
     reminderInput.value = String(bill.reminderDays ?? 3);
     contentEl.createEl("p", { cls: "finance-edit-hint", text: "Days before the due date this bill moves into Due soon." });
@@ -329,7 +329,7 @@ class LogVariableBillModal extends Modal {
 
     const amountRow = contentEl.createDiv({ cls: "finance-edit-row" });
     amountRow.createEl("label", { text: "Amount" });
-    const amountInput = amountRow.createEl("input", { type: "number", attr: { step: "0.01" } });
+    const amountInput = amountRow.createEl("input", { type: "number", attr: { inputmode: "decimal", step: "0.01" } });
     amountInput.value = String(item.averageAmount ?? item.lastAmount ?? "");
 
     const buttons = contentEl.createDiv({ cls: "finance-edit-buttons" });

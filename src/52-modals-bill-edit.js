@@ -112,7 +112,7 @@ class AddBillModal extends Modal {
     dueSelect.value = "after-last";
 
     const dayRow = row("Day");
-    const dayInput = dayRow.createEl("input", { type: "number", attr: { min: "1", max: "31", placeholder: "26", "aria-label": "Day of month" } });
+    const dayInput = dayRow.createEl("input", { type: "number", attr: { inputmode: "numeric", min: "1", max: "31", placeholder: "26", "aria-label": "Day of month" } });
     const weekdayRow = row("Which");
     const ordinalSelect = weekdayRow.createEl("select", { attr: { "aria-label": "Which weekday" } });
     for (const [value, label] of [["1", "First"], ["2", "Second"], ["3", "Third"], ["4", "Fourth"], ["-1", "Last"]]) {

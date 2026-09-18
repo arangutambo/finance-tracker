@@ -3069,3 +3069,18 @@ test("exchange rate requests and responses", () => {
   });
   assert.equal(core.parseExchangeRateResponse({ message: "not found" }, "AUD"), null);
 });
+
+test("CSV export says what kind of entry each row is", () => {
+  const csv = core.buildCsv([
+    { date: "2026-09-01", amount: 3000, entryType: "income", category: "salary", goalKey: "salary" },
+    { date: "2026-09-02", amount: 120, myShare: 60, entryType: "spending", category: "food/restaurants" },
+    { date: "2026-09-03", amount: 5230, entryType: "balance", category: "balance" },
+    { date: "2026-10-02", amount: 45, entryType: "holiday-spending", category: "food", holidayKey: "2026/japan" },
+  ]);
+  const [header, ...rows] = csv.split("\n");
+  assert.match(header, /,file_path,entry_type,my_share,trip,goal$/, "new columns go last, so old column positions still hold");
+  assert.match(rows[0], /,income,,,salary$/);
+  assert.match(rows[1], /,spending,60,,$/);
+  assert.match(rows[2], /,balance,,,$/);
+  assert.match(rows[3], /,holiday-spending,,2026\/japan,$/);
+});

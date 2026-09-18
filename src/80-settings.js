@@ -371,7 +371,7 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
 
     const merchantAdvanced = addAdvanced(
       "Advanced: merchant map",
-      "Merchant → category rules. A rule matches a capture's merchant exactly, or as a whole chunk inside it, so \"woolworths\" also covers \"Woolworths/cnr Brisbane H\". Add one with the \"Remember this merchant → category\" checkbox when editing a transaction; remove one here if it guesses wrong."
+      "Merchant → category rules. A rule matches a capture's merchant exactly, or as a whole chunk inside it, so \"woolworths\" also covers \"Woolworths/cnr Brisbane H\". Add or edit one below, or tick \"Remember this merchant\" when you categorise a transaction; remove one here if it guesses wrong."
     );
 
     new Setting(merchantAdvanced)
@@ -466,6 +466,8 @@ class FinanceTrackerSettingTab extends PluginSettingTab {
         dropdown
           .addOption("dueDate", "Due date (overdue first)")
           .addOption("monthlyCostDesc", "Cost per month (highest first)")
+          .addOption("amountDesc", "Amount (highest first)")
+          .addOption("amountAsc", "Amount (lowest first)")
           .addOption("nameAsc", "Name (A–Z)")
           .setValue(this.plugin.settings.recurringSortOrder || "dueDate")
           .onChange(async (value) => {

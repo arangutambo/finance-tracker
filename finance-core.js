@@ -1219,6 +1219,12 @@ function buildCsv(entries) {
     "transaction",
     "source",
     "file_path",
+    // Added at the end so a spreadsheet reading columns by position still
+    // works. Without entry_type, income and balance rows looked like spending.
+    "entry_type",
+    "my_share",
+    "trip",
+    "goal",
   ];
 
   const escapeCell = (value) => {
@@ -1240,6 +1246,10 @@ function buildCsv(entries) {
     entry.transaction || "",
     entry.source || "",
     entry.filePath || "",
+    entry.entryType || "spending",
+    Number.isFinite(entry.myShare) ? formatPlainNumber(entry.myShare) : "",
+    entry.holidayKey || "",
+    entry.goalKey || "",
   ]);
 
   return [headers, ...rows].map((row) => row.map(escapeCell).join(",")).join("\n");
